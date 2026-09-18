@@ -7,6 +7,7 @@ import {
   armLongRunWaitNow,
   cancelLongRunNow,
   captureExecutionTicket,
+  deferLongRunWaitNow,
   ensureRecoveryWorkNow,
   executionEpochFor,
   leaseLongRunWorkNow,
@@ -129,6 +130,30 @@ describe('durable long-run authority', () => {
     const cancelledGeneration = executionEpochFor(SESSION)!.generation;
     expect(await cancelLongRunNow(SESSION, CHAT_A, 'manual_stop')).toBe(true);
     expect(executionEpochFor(SESSION)!.generation).toBe(cancelledGeneration);
+  });
+
+  it('resets the consecutive monitor failure budget after a healthy pending observation', async () => {
+    const wait = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-monitor',
+      kind: 'github_run',
+      repository: 'MurphyHoops/UEOT',
+      runId: 35352566122
+    });
+    const ticket = captureExecutionTicket(SESSION, CHAT_A)!;
+
+    for (let index = 0; index < 5; index++) {
+      expect(await deferLongRunWaitNow(
+        SESSION, wait.id, ticket, Date.now() + 1_000, `transient-${index}`
+      )).toBe(true);
+    }
+    expect(longRunStatus(SESSION).wait?.attempts).toBe(5);
+
+    expect(await deferLongRunWaitNow(
+      SESSION, wait.id, ticket, Date.now() + 30_000, null
+    )).toBe(true);
+    expect(longRunStatus(SESSION).wait).toMatchObject({ attempts: 0, lastError: null });
   });
 
   it('moves work and wait with A to B and fences the stale A epoch', async () => {
