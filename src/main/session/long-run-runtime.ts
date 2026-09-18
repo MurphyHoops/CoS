@@ -7,6 +7,7 @@
  */
 
 import { runCommand } from '../exec.js';
+import { agentInfoForOwnedConversation } from '../agents.js';
 import { goalSwitchFor } from '../goal.js';
 import { logInfo, logWarn } from '../logger.js';
 import { backgroundExecObligations, execOwner } from '../codex/ownership.js';
@@ -173,7 +174,7 @@ async function dispatchWork(work: WorkObligation, now: number): Promise<void> {
   if (recovery && !['healthy', 'recovered', 'recovery_failed'].includes(recovery.phase)) return;
 
   if (work.reason === 'recovery_resume') {
-    if (!goalSwitchFor(work.conversationId).enabled) return;
+    if (!goalSwitchFor(work.conversationId).enabled && !agentInfoForOwnedConversation(work.conversationId)) return;
     // The Emergency Resume bootstrap itself is already an executing continuation. Give it one
     // bounded probation window to produce certified progress before filing a second message.
     if (now - work.createdAt < RECOVERY_CONTINUATION_GRACE_MS) return;
