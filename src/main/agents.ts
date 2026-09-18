@@ -1654,7 +1654,10 @@ export function stageWorkerContinuation(
   const info = agentInfoForOwnedConversation(conversationId);
   if (!info || info.role !== 'worker' || !info.primeConversationId || !info.runId) return null;
   if (info.state === 'active' || info.state === 'invited' || info.state === 'detached') return null;
-  if (!/^[0-9a-f-]{8,64}$/i.test(stableMessageId)) {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(stableMessageId)) {
+    // The final execution fence deliberately reserves full v4 UUIDs for app-owned long-run
+    // authority. Accepting a looser internal id here would create a broker row that downstream
+    // delivery code classifies as ordinary/unmanaged and therefore cannot revoke by epoch.
     throw new AgentError('Invalid durable worker-continuation message id.');
   }
   const staged = stageMessagesInternal(
