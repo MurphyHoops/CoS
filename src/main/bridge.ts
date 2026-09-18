@@ -6098,9 +6098,15 @@ function grantActivity(conversationId: string, sessionId: string, at = Date.now(
   const ownership = turn ?? (previous?.sessionId === sessionId ? previous : { turnId: null, model: 'unknown' as const });
   if (ownership.model === 'pro' && (isChatBlocked(conversationId) || stopRequestedFor(conversationId))) return;
   const evidenceAt = previous?.sessionId === sessionId && previous.turnId === ownership.turnId ? Math.max(previous.evidenceAt, at) : at;
-  const mcpBacked = ownership.mcpBacked || (previous?.sessionId === sessionId && previous.turnId === ownership.turnId && previous.mcpBacked);
+  const sameTurn = previous?.sessionId === sessionId && previous.turnId === ownership.turnId;
+  const mcpBacked = ownership.mcpBacked || (sameTurn && previous?.mcpBacked);
+  // Activity is a projection, not recovery authority. A reloaded document commonly reports the
+  // same still-open provider turn again; keep the spent soft-recovery marker across that replay
+  // instead of silently refunding the one-reload budget.
+  const selfHealingSoft = sameTurn ? previous?.selfHealingSoft : undefined;
   activeUntil.set(conversationId, { sessionId, evidenceAt, until: evidenceAt + (ownership.model === 'pro' ? PRO_SILENCE_MS : window), turnId: ownership.turnId, model: ownership.model,
-    ...(mcpBacked ? { mcpBacked: true } : {}) });
+    ...(mcpBacked ? { mcpBacked: true } : {}),
+    ...(selfHealingSoft ? { selfHealingSoft } : {}) });
   awaitingReturn.delete(conversationId);
   armSilenceSweep();
   void considerAutomaticCompaction(conversationId, sessionId);
@@ -6836,7 +6842,15 @@ async function noteRecoveryObservations(
     await cancelSelfHealingForStopNow(sessionId, conversationId);
   }
   const successfulTerminal = activity.terminal && (!ended || ended.outcome === 'completed');
-  if (sessionId && activity.meaningful && (activity.working || successfulTerminal)) {
+  const softProbation = recorded?.recovery?.phase === 'soft_recovery' &&
+    recorded.recovery.previousConversationId === conversationId &&
+    recorded.recovery.replacementConversationId === null;
+  // During the bounded post-reload probation, "the old turn is working again" is evidence but not
+  // a recovery certificate: provider/Fiber replay can produce exactly that signal and then stall
+  // again. A canonical completed terminal may retire soft recovery; otherwise the one-reload
+  // budget remains spent and the durable deadline still escalates to Emergency Resume.
+  const recoveryCertified = softProbation ? successfulTerminal : (activity.working || successfulTerminal);
+  if (sessionId && activity.meaningful && recoveryCertified) {
     await noteSelfHealingProgress(
       sessionId,
       conversationId,
@@ -7192,24 +7206,37 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
   const spent: string[] = [];
   const compacting = new Set(pendingContinuations().map((entry) => entry.from));
   for (const [conversationId, grant] of activeUntil) {
-    if (grant.selfHealingSoft) {
-      if (grant.until > now) continue;
+    // The session WAL, not this in-memory activity projection, owns the post-reload budget.
+    // Reconstructing from it also closes the restart/reload race where the page reports the same
+    // open turn and grantActivity() refreshes the ordinary silence clock. Provider activity may
+    // prove liveness, but it cannot extend this deadline without a certified recovery transition.
+    if (grant.selfHealingSoft || getConfig().multiAgent.selfHealingSessions) {
       const session = await getSession(grant.sessionId);
       const recovery = session?.recovery;
-      if (
+      const durableSoft =
         session?.conversationId === conversationId &&
         session.lastTurnOutcome !== 'stopped' &&
         recovery?.phase === 'soft_recovery' &&
-        recovery.failureEpisodeId === grant.selfHealingSoft.episodeId &&
-        recovery.recoveryGeneration === grant.selfHealingSoft.generation &&
         recovery.previousConversationId === conversationId &&
-        recovery.replacementConversationId === null
-      ) {
+        recovery.replacementConversationId === null;
+      if (durableSoft) {
+        grant.selfHealingSoft = {
+          episodeId: recovery.failureEpisodeId,
+          generation: recovery.recoveryGeneration
+        };
+        const dueAt = (recovery.lastRecoveryAt ?? recovery.updatedAt) + SELF_HEAL_POST_RELOAD_MS;
+        grant.until = Math.min(grant.until, dueAt);
+        if (now < dueAt) {
+          deferred = true;
+          continue;
+        }
         spent.push(conversationId);
-      } else if (activeUntil.get(conversationId) === grant) {
-        activeUntil.delete(conversationId);
+        continue;
       }
-      continue;
+      // A genuinely certified completion may already have retired the WAL while this projection
+      // still carries its old marker. Drop only the marker; the ordinary open-turn watch, if any,
+      // remains valid and continues through the normal path below.
+      if (grant.selfHealingSoft) delete grant.selfHealingSoft;
     }
     if (compacting.has(conversationId)) continue;
     if (grant.until > now) continue;
