@@ -132,16 +132,36 @@ describe('durable long-run authority', () => {
       CHAT_A,
       Date.now() + 1_001,
       sourceTurnId,
-      'mcp'
+      'mcp',
+      sourceRequestId
+    )).toBe(false);
+    // A rejected/late source workflow is not continuation progress merely because recorder turn
+    // state has already moved on. Unknown request identity also fails closed for MCP evidence.
+    expect(await noteLongRunProgressNow(
+      SESSION,
+      CHAT_A,
+      Date.now() + 1_002,
+      'turn-continuation',
+      'mcp',
+      sourceRequestId
+    )).toBe(false);
+    expect(await noteLongRunProgressNow(
+      SESSION,
+      CHAT_A,
+      Date.now() + 1_003,
+      'turn-continuation',
+      'mcp',
+      null
     )).toBe(false);
     expect(longRunStatus(SESSION).work?.state).toBe('queued');
 
     expect(await noteLongRunProgressNow(
       SESSION,
       CHAT_A,
-      Date.now() + 1_002,
+      Date.now() + 1_004,
       'turn-continuation',
-      'mcp'
+      'mcp',
+      'wfr-continuation'
     )).toBe(true);
     expect(longRunStatus(SESSION).work?.state).toBe('fulfilled');
   });
