@@ -127,15 +127,13 @@ describe('durable long-run authority', () => {
     const ticket = captureExecutionTicket(SESSION, CHAT_A)!;
     expect(await resolveLongRunWaitNow(SESSION, wait.id, ticket, 'timer resolved')).toBe(true);
 
-    // Resolution may beat provider-turn completion. The source executor stays fenced until a
-    // distinct continuation turn becomes durable, otherwise an immediately-resolved CI/timer
-    // can hand authority back to the same polling turn we deliberately cut.
+    // Resolution may beat recorder/browser turn projection. Exact request identity is the
+    // provider-turn boundary: the retired source request stays fenced, while a distinct request
+    // may begin the continuation even if activeTurnId still briefly names the source.
     expect(anyLongRunWaitActive()).toBe(true);
     expect(longRunWaitBlocksTools(SESSION, CHAT_A, sourceTurnId, sourceRequestId)).toBe(true);
-    // Either durable identity still naming the source keeps it fenced.
-    expect(longRunWaitBlocksTools(SESSION, CHAT_A, sourceTurnId, 'wfr-continuation')).toBe(true);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, sourceTurnId, 'wfr-continuation')).toBe(false);
     expect(longRunWaitBlocksTools(SESSION, CHAT_A, 'turn-continuation', sourceRequestId)).toBe(true);
-    // Only a distinct workflow executing in a distinct provider turn is the continuation.
     expect(longRunWaitBlocksTools(SESSION, CHAT_A, 'turn-continuation', 'wfr-continuation')).toBe(false);
 
     const leased = await leaseLongRunWorkNow(SESSION, CHAT_A);
@@ -147,7 +145,7 @@ describe('durable long-run authority', () => {
       leased!.work.inputId!
     )).toBe(true);
     expect(longRunWaitBlocksTools(SESSION, CHAT_A, sourceTurnId, sourceRequestId)).toBe(true);
-    expect(longRunWaitBlocksTools(SESSION, CHAT_A, sourceTurnId, 'wfr-continuation')).toBe(true);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, sourceTurnId, 'wfr-continuation')).toBe(false);
     expect(longRunWaitBlocksTools(SESSION, CHAT_A, 'turn-continuation', sourceRequestId)).toBe(true);
     expect(longRunWaitBlocksTools(SESSION, CHAT_A, 'turn-continuation', 'wfr-continuation')).toBe(false);
 
@@ -190,7 +188,7 @@ describe('durable long-run authority', () => {
       SESSION,
       CHAT_A,
       Date.now() + 1_004,
-      'turn-continuation',
+      sourceTurnId,
       'mcp',
       'wfr-continuation'
     )).toBe(true);
@@ -200,7 +198,7 @@ describe('durable long-run authority', () => {
     expect(longRunWaitBlocksTools(
       SESSION,
       CHAT_A,
-      'turn-continuation',
+      sourceTurnId,
       'wfr-continuation'
     )).toBe(false);
   });
