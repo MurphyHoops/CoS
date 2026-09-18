@@ -1,0 +1,159 @@
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { initDurableStore, resetDurableForTests } from '../src/main/durable.js';
+import {
+  armLongRunWaitNow,
+  cancelLongRunNow,
+  captureExecutionTicket,
+  ensureRecoveryWorkNow,
+  executionEpochFor,
+  leaseLongRunWorkNow,
+  longRunStatus,
+  markLongRunWorkQueuedNow,
+  moveLongRunStateNow,
+  noteLongRunProgressNow,
+  resetLongRunStateForTests,
+  resolveLongRunWaitNow,
+  restoreLongRunState,
+  snapshotLongRunState
+} from '../src/main/session/long-run.js';
+
+let directory: string;
+const SESSION = 'session-one';
+const CHAT_A = 'conversation-a';
+const CHAT_B = 'conversation-b';
+
+beforeEach(async () => {
+  resetLongRunStateForTests();
+  resetDurableForTests();
+  directory = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-long-run-'));
+  initDurableStore(directory);
+});
+
+afterEach(async () => {
+  resetLongRunStateForTests();
+  resetDurableForTests();
+  await fs.rm(directory, { recursive: true, force: true });
+});
+
+describe('durable long-run authority', () => {
+  it('turns a resolved external wait into one stable continuation obligation', async () => {
+    const wait = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-wait-source',
+      kind: 'github_run',
+      repository: 'MurphyHoops/UEOT',
+      runId: 35352566122,
+      description: 'wait for CI'
+    });
+    expect(executionEpochFor(SESSION)).toMatchObject({ conversationId: CHAT_A, generation: 1 });
+    expect(longRunStatus(SESSION)).toMatchObject({
+      wait: { id: wait.id, state: 'waiting' },
+      work: { state: 'waiting', reason: 'wait_resolved' }
+    });
+
+    const ticket = captureExecutionTicket(SESSION, CHAT_A)!;
+    expect(await resolveLongRunWaitNow(SESSION, wait.id, ticket, 'CI completed with success')).toBe(true);
+    expect(longRunStatus(SESSION).work).toMatchObject({ state: 'owed', reason: 'wait_resolved' });
+
+    const first = await leaseLongRunWorkNow(SESSION, CHAT_A);
+    const second = await leaseLongRunWorkNow(SESSION, CHAT_A);
+    expect(first?.work.inputId).toBeTruthy();
+    expect(second?.work.inputId).toBe(first?.work.inputId);
+    expect(await markLongRunWorkQueuedNow(
+      SESSION,
+      first!.work.id,
+      first!.ticket,
+      first!.work.inputId!
+    )).toBe(true);
+    expect(longRunStatus(SESSION).work?.state).toBe('queued');
+  });
+
+  it('moves work and wait with A to B and fences the stale A epoch', async () => {
+    const wait = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-a',
+      kind: 'timer',
+      dueAt: Date.now() + 10_000
+    });
+    const stale = captureExecutionTicket(SESSION, CHAT_A)!;
+
+    expect(await moveLongRunStateNow(SESSION, CHAT_A, CHAT_B)).toBe(true);
+    expect(executionEpochFor(SESSION)).toMatchObject({ conversationId: CHAT_B, generation: 2 });
+    expect(longRunStatus(SESSION).wait).toMatchObject({
+      id: wait.id,
+      conversationId: CHAT_B,
+      epochGeneration: 2
+    });
+    expect(await resolveLongRunWaitNow(SESSION, wait.id, stale, 'stale A tried to resolve')).toBe(false);
+
+    const current = captureExecutionTicket(SESSION, CHAT_B)!;
+    expect(await resolveLongRunWaitNow(SESSION, wait.id, current, 'B resolved it')).toBe(true);
+  });
+
+  it('restores a dispatching obligation with the same input id after restart', async () => {
+    const wait = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-source',
+      kind: 'timer',
+      dueAt: Date.now() + 1_000
+    });
+    const ticket = captureExecutionTicket(SESSION, CHAT_A)!;
+    await resolveLongRunWaitNow(SESSION, wait.id, ticket, 'timer complete');
+    const leased = await leaseLongRunWorkNow(SESSION, CHAT_A);
+    const inputId = leased!.work.inputId;
+    const snapshot = snapshotLongRunState();
+
+    resetLongRunStateForTests();
+    restoreLongRunState(snapshot);
+    const replay = await leaseLongRunWorkNow(SESSION, CHAT_A);
+    expect(replay?.work.inputId).toBe(inputId);
+    expect(replay?.ticket).toEqual(leased?.ticket);
+  });
+
+  it('does not let recovery continuation debt overwrite an active wait', async () => {
+    await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-source',
+      kind: 'github_run',
+      repository: 'MurphyHoops/UEOT',
+      runId: 35352566122
+    });
+    const before = longRunStatus(SESSION);
+    const work = await ensureRecoveryWorkNow(SESSION, CHAT_A, 'recovery:episode:1');
+    const after = longRunStatus(SESSION);
+    expect(work?.id).toBe(before.work?.id);
+    expect(after.wait?.id).toBe(before.wait?.id);
+    expect(after.work?.reason).toBe('wait_resolved');
+  });
+
+  it('requires certified MCP progress to satisfy recovery continuation debt', async () => {
+    const work = await ensureRecoveryWorkNow(SESSION, CHAT_A, 'recovery:episode:1');
+    expect(work?.state).toBe('owed');
+    expect(await noteLongRunProgressNow(SESSION, CHAT_A, Date.now() + 1, 'turn-recovered', 'terminal')).toBe(false);
+    expect(longRunStatus(SESSION).work?.state).toBe('owed');
+    expect(await noteLongRunProgressNow(SESSION, CHAT_A, Date.now() + 2, 'turn-recovered', 'mcp')).toBe(true);
+    expect(longRunStatus(SESSION).work?.state).toBe('fulfilled');
+  });
+
+  it('Stop revokes wait and continuation authority by advancing the epoch', async () => {
+    await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-source',
+      kind: 'timer',
+      dueAt: Date.now() + 10_000
+    });
+    const before = captureExecutionTicket(SESSION, CHAT_A)!;
+    expect(await cancelLongRunNow(SESSION, CHAT_A, 'manual_stop')).toBe(true);
+    expect(executionEpochFor(SESSION)?.generation).toBe(before.generation + 1);
+    expect(longRunStatus(SESSION).wait?.state).toBe('cancelled');
+    expect(longRunStatus(SESSION).work?.state).toBe('cancelled');
+  });
+});
