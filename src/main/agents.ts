@@ -2532,7 +2532,16 @@ export interface WorkerRevival {
   conversationId: string;
   runId: string;
   text: string;
+  /** Rows the browser may still type in this revival attempt. */
   messageIds: string[];
+  /**
+   * Rows that still define the wake's execution authority.
+   *
+   * This also includes browser-owned/offered rows that must never be typed a second time.
+   * Keeping authority separate from payload prevents an already-delivered wake from looking
+   * empty/stale while still letting cancelled long-run UUIDs fence an in-flight claim.
+   */
+  authorityMessageIds?: string[];
 }
 
 let reviveRequest: ((revivals: WorkerRevival[]) => void) | null = null;
@@ -2561,18 +2570,34 @@ export function pendingWorkerRevivals(): WorkerRevival[] {
   for (const run of runs.values()) for (const agent of run.agents.values()) {
     if (agent.info.state !== 'waking' || !agent.info.conversationId) continue;
     const plan = planRevivalText(agent);
-    // A restored waking worker may contain only a revoked long-run continuation whose ExecutionEpoch
-    // moved while the process was down. Do not open a tab merely to have /commands/redeem reject an
-    // empty/stale wake; the long-run supervisor removes the provably-unsent broker row and returns
-    // the worker to sleeping on its first reconciliation pass.
-    if (plan.messageIds.length === 0) continue;
+    const publishable = new Set(plan.messageIds);
+    const authorityMessageIds = agent.queue
+      .filter((message) =>
+        message.ackedAt === null &&
+        !unpublishedMessages.has(message) &&
+        (
+          publishable.has(message.id) ||
+          message.offeredViaRevival === true ||
+          // Between browser claim and durable redeem/ACK the payload is not publishable again,
+          // but these exact rows still decide whether Stop/progress revoked the in-flight wake.
+          (agent.info.state === 'waking' && !agent.info.revivable)
+        )
+      )
+      .map((message) => message.id);
+
+    // A restored pre-claim worker may contain only a revoked long-run continuation whose epoch
+    // moved while the process was down. With no publishable or browser-owned authority row there
+    // is no wake to transport. By contrast, a delivered wake legitimately has messageIds=[]:
+    // its text is already in ChatGPT and the existing command must survive until worker liveness.
+    if (plan.messageIds.length === 0 && authorityMessageIds.length === 0) continue;
     out.push({
       id: agent.info.id,
       conversationId: agent.info.conversationId,
       runId: run.runId,
       primeConversationId: run.primeConversationId,
       text: plan.text,
-      messageIds: plan.messageIds
+      messageIds: plan.messageIds,
+      authorityMessageIds
     });
   }
   return out;
