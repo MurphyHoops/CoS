@@ -263,6 +263,8 @@
   "Allow tools, including computer use, file editing and JavaScript, without chat attribution. Sub-agents and other chat-owned actions still need an identified chat. Activity appears as Unattributed.": "允许在未确定聊天归属时使用工具，包括电脑操作、文件编辑和 JavaScript。子代理及其他依赖聊天归属的操作仍需识别聊天。活动显示为“未归属”。",
   "Recover other chats’ tabs": "恢复其他聊天的标签页",
   "Restore missing or unresponsive work chats. Goal and Loop chats recover automatically.": "恢复缺失或无响应的工作聊天。目标和循环聊天会自动恢复。",
+  "Self-healing sessions": "会话自愈",
+  "After one bounded same-chat recovery, move a stuck Goal, Prime or worker session to a fresh ChatGPT conversation and reconcile local state before continuing.": "同一聊天经过一次受限恢复仍无响应时，将卡住的目标、主智能体或子智能体会话迁移到新的 ChatGPT 对话，并在继续前核对本地状态。",
   "Clear swarm": "清除智能体组",
   "Message ChatGPT": "给 ChatGPT 发消息",
   "Add photos & files": "添加照片和文件",

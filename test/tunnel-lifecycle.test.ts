@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const fixture = vi.hoisted(() => {
   type Listener = (...args: any[]) => void;
   const children: any[] = [];
+  const files = new Map<string, string>();
 
   const emitter = () => {
     const listeners = new Map<string, Listener[]>();
@@ -25,11 +26,11 @@ const fixture = vi.hoisted(() => {
     };
   };
 
-  const spawn = vi.fn(() => {
+  const makeChild = (pid = 10_000 + children.length) => {
     const events = emitter();
     const child: any = {
       ...events,
-      pid: 10_000 + children.length,
+      pid,
       exitCode: null,
       signalCode: null,
       stdout: emitter(),
@@ -37,6 +38,16 @@ const fixture = vi.hoisted(() => {
       kill: vi.fn()
     };
     children.push(child);
+    return child;
+  };
+
+  const spawn = vi.fn((_file?: string, args: string[] = []) => {
+    const child = makeChild();
+    const pidAt = args.indexOf('--pid.file');
+    const pidFile = pidAt >= 0 ? args[pidAt + 1] : undefined;
+    if (typeof pidFile === 'string') {
+      files.set(pidFile, String(child.pid));
+    }
     return child;
   });
 
@@ -55,7 +66,7 @@ const fixture = vi.hoisted(() => {
     child.emit('close', 0);
   });
 
-  return { children, spawn, health, termination, terminate };
+  return { children, files, makeChild, spawn, health, termination, terminate };
 });
 
 vi.mock('node:child_process', () => ({ spawn: fixture.spawn }));
@@ -71,19 +82,34 @@ vi.mock('node:fs', async (importOriginal) => {
     default: actual,
     promises: {
       ...actual.promises,
+      mkdir: async () => undefined,
       mkdtemp: async (prefix: string) => `${prefix}fixture`,
-      rm: async (_path: string, options?: { recursive?: boolean }) => {
-        if (!options?.recursive) fixture.health.url = null;
+      rm: async (target: string, options?: { recursive?: boolean }) => {
+        if (options?.recursive) {
+          for (const key of [...fixture.files.keys()]) {
+            if (
+              key === target ||
+              key.startsWith(`${target}/`) ||
+              key.startsWith(`${target}\\`)
+            ) fixture.files.delete(key);
+          }
+          fixture.health.url = null;
+          return;
+        }
+        fixture.files.delete(target);
+        if (/[\\/]health\.url$/.test(target)) fixture.health.url = null;
       },
-      readFile: async () => {
-        if (fixture.health.url) return fixture.health.url;
+      readFile: async (target: string) => {
+        const saved = fixture.files.get(target);
+        if (saved !== undefined) return saved;
+        if (/[\\/]health\.url$/.test(target) && fixture.health.url) return fixture.health.url;
         throw Object.assign(new Error('ENOENT: no such file'), { code: 'ENOENT' });
       }
     }
   };
 });
 
-const { startTunnel } = await import('../src/main/tunnel/index.js');
+const { openAiTunnelLeasePaths, startTunnel } = await import('../src/main/tunnel/index.js');
 
 const settings = {
   kind: 'openai' as const,
@@ -94,6 +120,7 @@ const settings = {
 
 beforeEach(() => {
   fixture.children.length = 0;
+  fixture.files.clear();
   fixture.spawn.mockClear();
   fixture.terminate.mockClear();
   fixture.health.url = null;
@@ -104,6 +131,107 @@ beforeEach(() => {
 });
 
 describe('OpenAI tunnel process ownership', () => {
+  it('retires an exact orphaned client left by a crashed app before launching one replacement', async () => {
+    vi.useFakeTimers();
+    const label = 'core';
+    const lease = openAiTunnelLeasePaths(settings.tunnelId, label);
+    const orphan = fixture.makeChild(42_424);
+    fixture.files.set(lease.pidFile, String(orphan.pid));
+    fixture.health.url = 'http://127.0.0.1:34567';
+    const oldLocalUrl = 'http://127.0.0.1:1111/mcp/core/old-secret';
+    const newLocalUrl = 'http://127.0.0.1:2222/mcp/core/new-secret';
+    const reports: any[] = [];
+
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | 0) => {
+      if (signal !== 0) return true;
+      const child = fixture.children.find((entry) => entry.pid === pid);
+      if (child && child.exitCode === null && child.signalCode === null) return true;
+      throw Object.assign(new Error('no such process'), { code: 'ESRCH' });
+    }) as typeof process.kill);
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const text = String(input);
+      const url = new URL(text);
+      if (text === oldLocalUrl) throw Object.assign(new Error('connection refused'), { code: 'ECONNREFUSED' });
+      if (url.origin === 'http://127.0.0.1:34567' && url.pathname === '/api/status') {
+        return Response.json({
+          control_plane_tunnel_id: settings.tunnelId,
+          mcp_server_url: oldLocalUrl
+        });
+      }
+      if (url.pathname === '/readyz') return new Response('ok');
+      if (url.pathname === '/metrics') {
+        return new Response('commands_poll_last_successful_timestamp_seconds 0\ncommands_poll_errors_total 0\n');
+      }
+      if (url.pathname === '/api/status') return Response.json({ uptime_seconds: 1, channels: [] });
+      return new Response('missing', { status: 404 });
+    }));
+
+    try {
+      const handle = await startTunnel({
+        localUrl: newLocalUrl,
+        settings,
+        apiKey: 'sk-tunnel-test',
+        label,
+        report: (report) => reports.push(report)
+      });
+
+      expect(fixture.terminate).toHaveBeenCalledWith(orphan.pid);
+      expect(orphan.exitCode).toBe(0);
+      // startTunnel intentionally schedules launch without awaiting it. Let that continuation
+      // cross its first async boundary before asserting that the one replacement was spawned.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fixture.spawn).toHaveBeenCalledTimes(1);
+
+      fixture.health.url = 'http://127.0.0.1:45678';
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(reports.some((report) => report.state === 'connected')).toBe(true);
+      await handle.stop();
+    } finally {
+      killSpy.mockRestore();
+    }
+  });
+
+  it('never steals the exact tunnel from another still-live CoS server', async () => {
+    const label = 'core';
+    const lease = openAiTunnelLeasePaths(settings.tunnelId, label);
+    const owner = fixture.makeChild(43_434);
+    fixture.files.set(lease.pidFile, String(owner.pid));
+    fixture.health.url = 'http://127.0.0.1:34567';
+    const oldLocalUrl = 'http://127.0.0.1:1111/mcp/core/live-secret';
+
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | 0) => {
+      if (signal !== 0) return true;
+      if (pid === owner.pid && owner.exitCode === null) return true;
+      throw Object.assign(new Error('no such process'), { code: 'ESRCH' });
+    }) as typeof process.kill);
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const text = String(input);
+      const url = new URL(text);
+      if (url.origin === 'http://127.0.0.1:34567' && url.pathname === '/api/status') {
+        return Response.json({
+          control_plane_tunnel_id: settings.tunnelId,
+          mcp_server_url: oldLocalUrl
+        });
+      }
+      if (text === oldLocalUrl) return new Response('method not allowed', { status: 405 });
+      return new Response('missing', { status: 404 });
+    }));
+
+    try {
+      await expect(startTunnel({
+        localUrl: 'http://127.0.0.1:2222/mcp/core/new-secret',
+        settings,
+        apiKey: 'sk-tunnel-test',
+        label,
+        report: () => undefined
+      })).rejects.toThrow(/already owns this tunnel/i);
+      expect(fixture.terminate).not.toHaveBeenCalled();
+      expect(fixture.spawn).not.toHaveBeenCalled();
+    } finally {
+      killSpy.mockRestore();
+    }
+  });
+
   it('classifies structured control-plane context together with its network error', async () => {
     vi.useFakeTimers();
     const reports: any[] = [];

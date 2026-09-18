@@ -1,0 +1,365 @@
+/**
+ * Local long-run supervisor.
+ *
+ * The model may register a durable external wait and finish its turn.  This process owns the
+ * polling afterwards, then publishes one stable continuation through the existing input outbox
+ * or, for a worker, through the existing durable agent-revival broker. No provider turn has to
+ * remain open merely to poll CI or a long-running local process.
+ */
+
+import { runCommand } from '../exec.js';
+import {
+  agentInfoForOwnedConversation,
+  persistCriticalSwarmNow,
+  requestWorkerRevivals,
+  retireWorkerContinuationIfUnsent,
+  stageWorkerContinuation
+} from '../agents.js';
+import { goalSwitchFor } from '../goal.js';
+import { getConfig } from '../config.js';
+import { logInfo, logWarn } from '../logger.js';
+import { backgroundExecObligations, execOwner } from '../codex/ownership.js';
+import { enqueueInput } from './input.js';
+import { getSession } from './store.js';
+import {
+  captureExecutionTicket,
+  deferLongRunWaitNow,
+  dispatchableLongRunWork,
+  dueLongRunWaits,
+  executionTicketCurrent,
+  leaseLongRunWorkNow,
+  markLongRunWorkQueuedNow,
+  resolveLongRunWaitNow,
+  snapshotLongRunState,
+  type ExecutionTicket,
+  type LongRunWaitContract,
+  type WorkObligation
+} from './long-run.js';
+
+const LONG_RUN_POLL_MS = 5_000;
+const RECOVERY_CONTINUATION_GRACE_MS = 90_000;
+const WAIT_PENDING_MS = 30_000;
+const WAIT_RETRY_BASE_MS = 5_000;
+const WAIT_RETRY_MAX_MS = 60_000;
+const WAIT_FAILURE_LIMIT = 6;
+
+let timer: NodeJS.Timeout | null = null;
+let pollInFlight: Promise<void> | null = null;
+let stopped = true;
+
+function retryDelay(attempts: number): number {
+  return Math.min(WAIT_RETRY_MAX_MS, WAIT_RETRY_BASE_MS * 2 ** Math.min(4, Math.max(0, attempts)));
+}
+
+function waitResultText(wait: LongRunWaitContract, detail: string): string {
+  if (wait.kind === 'github_run') return `GitHub Actions run ${wait.runId} for ${wait.repository}: ${detail}`;
+  if (wait.kind === 'process') return `Background process session ${wait.processId}: ${detail}`;
+  return `Timer wait completed: ${detail}`;
+}
+
+async function inspectGithubRun(wait: LongRunWaitContract): Promise<
+  { kind: 'pending' } | { kind: 'resolved'; result: string; failed: boolean } | { kind: 'error'; error: string }
+> {
+  const result = await runCommand(
+    'gh',
+    ['run', 'view', String(wait.runId), '--repo', wait.repository!, '--json', 'status,conclusion'],
+    process.cwd(),
+    10_000
+  );
+  if (result.timedOut) return { kind: 'error', error: 'GitHub status check timed out.' };
+  if (result.exitCode !== 0) {
+    const detail = (result.stderr || result.stdout || 'gh run view failed').trim().slice(0, 500);
+    return { kind: 'error', error: detail };
+  }
+  try {
+    const row = JSON.parse(result.stdout) as { status?: string; conclusion?: string | null };
+    if (row.status !== 'completed') return { kind: 'pending' };
+    const conclusion = row.conclusion || 'unknown';
+    return {
+      kind: 'resolved',
+      result: waitResultText(wait, `completed with conclusion ${conclusion}`),
+      failed: conclusion !== 'success'
+    };
+  } catch {
+    return { kind: 'error', error: 'GitHub status response was not valid JSON.' };
+  }
+}
+
+function inspectProcess(wait: LongRunWaitContract):
+  { kind: 'pending' } | { kind: 'resolved'; result: string; failed: boolean } {
+  const state = backgroundExecObligations(wait.sessionId);
+  if (state.running.includes(wait.processId!)) return { kind: 'pending' };
+  const exited = state.exitedUnread.find((row) => row.processId === wait.processId);
+  if (exited) {
+    return {
+      kind: 'resolved',
+      result: waitResultText(wait, `exited with code ${exited.exitCode ?? 'unknown'}; its retained output will be delivered by the normal exec result channel`),
+      failed: exited.exitCode !== 0
+    };
+  }
+  const owner = execOwner(wait.processId!);
+  return {
+    kind: 'resolved',
+    result: waitResultText(
+      wait,
+      owner && owner !== wait.sessionId
+        ? 'is no longer owned by this durable session; reconcile state before acting'
+        : 'is no longer retained by this CoS process; reconcile files/process state before deciding whether any command needs to run again'
+    ),
+    failed: true
+  };
+}
+
+async function inspectWait(wait: LongRunWaitContract, ticket: ExecutionTicket, now: number): Promise<void> {
+  if (!executionTicketCurrent(ticket)) return;
+
+  if (wait.kind === 'timer') {
+    if ((wait.dueAt ?? Number.MAX_SAFE_INTEGER) > now) {
+      await deferLongRunWaitNow(wait.sessionId, wait.id, ticket, wait.dueAt!, null);
+      return;
+    }
+    await resolveLongRunWaitNow(wait.sessionId, wait.id, ticket, waitResultText(wait, 'deadline reached'), false);
+    return;
+  }
+
+  let verdict:
+    | { kind: 'pending' }
+    | { kind: 'resolved'; result: string; failed: boolean }
+    | { kind: 'error'; error: string };
+  if (wait.kind === 'github_run') verdict = await inspectGithubRun(wait);
+  else verdict = inspectProcess(wait);
+
+  if (!executionTicketCurrent(ticket)) return;
+  if (verdict.kind === 'pending') {
+    await deferLongRunWaitNow(wait.sessionId, wait.id, ticket, now + WAIT_PENDING_MS, null);
+    return;
+  }
+  if (verdict.kind === 'resolved') {
+    await resolveLongRunWaitNow(wait.sessionId, wait.id, ticket, verdict.result, verdict.failed);
+    logInfo(`long-run: wait ${wait.id} resolved for session ${wait.sessionId}`);
+    return;
+  }
+
+  if (wait.attempts + 1 >= WAIT_FAILURE_LIMIT) {
+    await resolveLongRunWaitNow(
+      wait.sessionId,
+      wait.id,
+      ticket,
+      `Local wait monitor could not verify the external condition after ${WAIT_FAILURE_LIMIT} attempts: ${verdict.error}. Reconcile it manually once, then continue the durable task.`,
+      true
+    );
+    logWarn(`long-run: wait ${wait.id} monitor failed closed after ${WAIT_FAILURE_LIMIT} attempts`);
+    return;
+  }
+  await deferLongRunWaitNow(
+    wait.sessionId,
+    wait.id,
+    ticket,
+    now + retryDelay(wait.attempts),
+    verdict.error
+  );
+}
+
+function continuationText(work: WorkObligation): string {
+  if (work.reason === 'recovery_resume') {
+    return (
+      `[[CLF-CONTINUE:${work.id}]]\n` +
+      'The durable Goal/task remains active after executor recovery. Continue autonomously from current durable state. ' +
+      'Reconcile completed tool receipts, git/files/processes, CI and worker state before mutations. ' +
+      'Do not repeat completed or ambiguous side effects. Proceed from the first still-needed action.'
+    );
+  }
+  const result = work.result ?? 'The local wait condition changed.';
+  return (
+    `[[CLF-WAIT-RESOLVED:${work.id}]]\n` +
+    `${result}\n\n` +
+    'Continue the same durable task from the first still-needed action. Reconcile current state before mutations and do not repeat completed or ambiguous side effects.'
+  );
+}
+
+async function dispatchWork(work: WorkObligation, now: number): Promise<void> {
+  const session = await getSession(work.sessionId);
+  if (!session?.conversationId || session.conversationId !== work.conversationId) return;
+  const recovery = session.recovery;
+  // recovery_failed can still mean an ambiguous native Send with admission fences restored on
+  // restart. It is not authority to start another provider message. Only a healthy/recovered
+  // executor may receive autonomous long-run work; the recovery subsystem owns every failed
+  // transaction until it is explicitly reconciled or superseded.
+  if (recovery && recovery.phase !== 'healthy' && recovery.phase !== 'recovered') return;
+
+  if (work.reason === 'recovery_resume') {
+    if (!goalSwitchFor(work.conversationId).enabled && !agentInfoForOwnedConversation(work.conversationId)) return;
+    // The Emergency Resume bootstrap itself is already an executing continuation. Give it one
+    // bounded probation window to produce certified progress before filing a second message.
+    if (now - work.createdAt < RECOVERY_CONTINUATION_GRACE_MS) return;
+  }
+
+  const leased = await leaseLongRunWorkNow(work.sessionId, work.conversationId);
+  if (!leased?.work.inputId || !executionTicketCurrent(leased.ticket)) return;
+  const inputId = leased.work.inputId;
+  const text = continuationText(leased.work);
+  const agent = agentInfoForOwnedConversation(work.conversationId);
+
+  if (agent?.role === 'worker') {
+    // Turning multi-agent mode off is an explicit user authority boundary. Keep the durable debt
+    // parked rather than waking a worker through an internal path the public broker has disabled.
+    if (!getConfig().multiAgent.enabled) return;
+    // Worker chats have their own durable wake transaction and configured slot limit. Never
+    // bypass that broker by dropping an ordinary after-turn browser input into a sleeping worker.
+    // The long-run input UUID is reused as the broker message id, closing the crash window where
+    // the swarm fsync succeeds but this work ledger has not yet recorded queued.
+    let staged: ReturnType<typeof stageWorkerContinuation>;
+    try {
+      staged = stageWorkerContinuation(work.conversationId, inputId, text);
+    } catch (error) {
+      // These are ordinary broker backpressure states, not faults. The five-second supervisor
+      // loop simply leaves the same stable obligation parked until the slot/transaction clears.
+      const detail = error instanceof Error ? error.message : String(error);
+      if (!/NO_FREE_SLOT|REVIVE_IN_PROGRESS|FINISH_IN_PROGRESS|OWNER_TRANSITION_IN_PROGRESS|switched off/i.test(detail)) {
+        logWarn(`long-run: worker continuation for ${work.sessionId} will retry — ${detail}`);
+      }
+      return;
+    }
+    // An active/detached worker is still executing the turn that registered the wait, or has not
+    // yet crossed its ordinary sleep lifecycle. Certified progress can satisfy the debt meanwhile;
+    // otherwise a later poll reaches the same worker after it becomes sleeping.
+    if (!staged) return;
+
+    let accepted = false;
+    try {
+      if (!(await persistCriticalSwarmNow())) {
+        throw new Error('the worker broker has no immediate durable persistence sink');
+      }
+      staged.commit();
+      accepted = true;
+    } catch (error) {
+      if (!accepted) staged.rollback();
+      logWarn(
+        `long-run: worker continuation durability for ${work.sessionId} will retry — ${error instanceof Error ? error.message : String(error)}`
+      );
+      return;
+    }
+
+    // A rebind/cancel that won while the swarm fsync was in flight invalidates the old executor.
+    // The broker row is already durable under the stable UUID; do not wake the old chat. A later
+    // pass under the new epoch finds that same row and safely resumes from there.
+    if (!executionTicketCurrent(leased.ticket)) return;
+    const current = await getSession(work.sessionId);
+    if (!current?.conversationId || current.conversationId !== work.conversationId) return;
+    const currentRecovery = current.recovery;
+    if (currentRecovery && currentRecovery.phase !== 'healthy' && currentRecovery.phase !== 'recovered') return;
+
+    if (await markLongRunWorkQueuedNow(work.sessionId, leased.work.id, leased.ticket, inputId)) {
+      // Browser publication happens only after both durable authorities agree: the worker inbox
+      // is fsynced and this execution epoch has recorded the stable continuation as queued.
+      if (staged.waking.length > 0) requestWorkerRevivals(staged.waking, staged.runId);
+      logInfo(`long-run: queued ${leased.work.reason} worker continuation for session ${work.sessionId}`);
+    }
+    return;
+  }
+
+  // A session known to be a worker whose broker lineage is temporarily unavailable must fail
+  // closed. Treating it as an ordinary chat would bypass worker-slot and revival authority.
+  if (session.origin?.kind === 'worker') return;
+
+  try {
+    await enqueueInput({
+      id: inputId,
+      sessionId: work.sessionId,
+      text,
+      authoredSource: 'none',
+      mode: 'after-turn',
+      afterTurn: true,
+      dueAt: Date.now(),
+      model: null,
+      reasoningEffort: null
+    }, undefined, leased.work.id);
+  } catch (error) {
+    // The obligation stays dispatching with the same stable input id. A later pass retries the
+    // idempotent enqueue; if the outbox already committed before a lost response it returns the
+    // exact existing row rather than creating another message.
+    logWarn(`long-run: continuation enqueue for ${work.sessionId} will retry — ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  if (!executionTicketCurrent(leased.ticket)) return;
+  if (await markLongRunWorkQueuedNow(work.sessionId, leased.work.id, leased.ticket, inputId)) {
+    logInfo(`long-run: queued ${leased.work.reason} continuation for session ${work.sessionId}`);
+  }
+}
+
+async function reconcileRevokedWorkerContinuations(): Promise<void> {
+  let retiredAny = false;
+  for (const work of snapshotLongRunState().obligations) {
+    if (!work.inputId || (work.state !== 'fulfilled' && work.state !== 'cancelled')) continue;
+    const retired = retireWorkerContinuationIfUnsent(
+      work.conversationId,
+      work.inputId,
+      `long-run obligation ${work.id} is ${work.state}`
+    );
+    if (retired === 'retired') retiredAny = true;
+  }
+  if (!retiredAny) return;
+  try {
+    if (!(await persistCriticalSwarmNow())) {
+      logWarn('long-run: revoked worker-continuation cleanup has no immediate durable broker sink');
+    }
+  } catch (error) {
+    // The execution fence already makes stale rows non-deliverable. A failed hygiene fsync may
+    // resurrect them after restart, but they remain stale and a later supervisor pass retries
+    // cleanup rather than converting persistence failure into duplicate work.
+    logWarn(
+      `long-run: could not persist revoked worker-continuation cleanup — ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+export async function pollLongRunRuntime(now = Date.now()): Promise<void> {
+  await reconcileRevokedWorkerContinuations();
+  for (const wait of dueLongRunWaits(now)) {
+    const ticket = captureExecutionTicket(wait.sessionId, wait.conversationId);
+    if (!ticket || ticket.generation !== wait.epochGeneration) continue;
+    try {
+      await inspectWait(wait, ticket, now);
+    } catch (error) {
+      logWarn(`long-run: wait ${wait.id} check failed — ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  for (const work of dispatchableLongRunWork()) {
+    try {
+      await dispatchWork(work, now);
+    } catch (error) {
+      logWarn(`long-run: work ${work.id} dispatch failed — ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
+function runPoll(): void {
+  if (stopped || pollInFlight) return;
+  pollInFlight = pollLongRunRuntime().finally(() => {
+    pollInFlight = null;
+  });
+}
+
+export function startLongRunRuntime(): void {
+  if (!stopped) return;
+  stopped = false;
+  runPoll();
+  timer = setInterval(runPoll, LONG_RUN_POLL_MS);
+  timer.unref?.();
+}
+
+export async function stopLongRunRuntime(): Promise<void> {
+  stopped = true;
+  if (timer) clearInterval(timer);
+  timer = null;
+  const running = pollInFlight;
+  if (running) await running.catch(() => {});
+}
+
+export function resetLongRunRuntimeForTests(): void {
+  stopped = true;
+  if (timer) clearInterval(timer);
+  timer = null;
+  pollInFlight = null;
+}

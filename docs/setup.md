@@ -55,13 +55,19 @@ History is stored locally, with recording on and 30-day retention by default. Cr
 
 **Compact & Resume** asks for a handoff, starts a fresh provider conversation and rebinds that same session. Task and worker history move with it. Automatic compaction uses configured local estimates and eligible live work; Pro models never auto-compact.
 
+**Self-healing sessions** is an optional recovery layer for Goal, Prime and worker executors. It first performs the existing bounded same-chat browser recovery. If that executor still does not make canonical progress, CoS performs an **Emergency Resume**: it freezes the failed conversation's authority, opens one replacement conversation and rebinds the same durable local session to it. Unlike Compact & Resume, Emergency Resume never asks the failed conversation to write a handoff. The replacement receives a locally generated recovery brief and must reconcile durable tool receipts, running processes, files, Git state, session history, tests and worker state before continuing.
+
+Emergency Resume is deliberately conservative around side effects. A turn is considered safe to retry only when every relevant local tool call is explicitly proven read-only and no dispatch is ambiguous. A shell/browser/plugin/write operation, an unknown tool, or an MCP result that may have been lost after a mutation is treated as potentially completed and is **not** blindly replayed. Recovery waits for local accounting to settle, then the fresh executor reconciles the actual durable state. Manual **Stop** is intentional and never starts self-healing.
+
+Recovery metadata is stored with the local session. On app restart CoS rebuilds old-chat tool fences and the replacement-opening gate before connector work is admitted, then repairs any partially committed Goal/Loop or Prime/worker projection before it marks the episode recovered. The chat controls show the quiet phase labels **Healthy**, **Suspected stall**, **Reloading**, **Rebinding**, **Reconciling**, **Recovered** and **Recovery failed**.
+
 **Workers** keep their conversation when they finish. Send a follow-up to reuse one. The default is two simultaneous workers per family, configurable up to eight. Idle owned tabs can be reused or closed after fresh checks; the durable worker history remains. Drafts, active work and pins are protected.
 
 **Goal** can decide the task is complete and send nothing. **Loop** continues within the brief until disabled. Both support ChatGPT helpers or an optional API backend.
 
 **Astra's finish boundary** can receive queued instructions, plan checkpoints and automatic follow-ups through tools within the same working turn when Session finish is enabled. You can end the turn from the composer. This does not remove provider usage or context limits.
 
-These continuity features do not grant additional quota or access. Do not use new chats, workers, Goal/Loop or compaction to evade a provider restriction. Supervise automated work and stop a restricted workflow instead of asking another chat or tool to continue it.
+These continuity features do not grant additional quota or access. Do not use new chats, workers, Goal/Loop, compaction or self-healing to evade a provider restriction. Supervise automated work and stop a restricted workflow instead of asking another chat or tool to continue it.
 
 ## Troubleshooting
 
@@ -74,6 +80,7 @@ These continuity features do not grant additional quota or access. Do not use ne
 - **Models missing:** use **Reload ChatGPT models**. The picker reflects availability in your signed-in account.
 - **`UNIDENTIFIED_CALLER`:** use that conversation in the paired browser so the extension can prove its request identity. CoS does not guess from the active tab.
 - **`COMPACTION_IN_PROGRESS`:** let the source chat finish its handoff. Work continues in the replacement conversation.
+- **Self-healing is stuck at Rebinding or Reconciling:** leave the original turn alone rather than clicking ChatGPT Retry. CoS is preserving an ambiguous-operation fence or repairing durable projections. Inspect the session's tool/process history and connector health; a mutation whose result was lost must be reconciled, not replayed.
 - **Linux credential storage unavailable:** unlock GNOME Keyring or KWallet, then restart CoS.
 - **A chat will not stop:** **Block** revokes local tools for that exact conversation. It does not claim to cancel the provider's generation.
 

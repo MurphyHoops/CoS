@@ -443,6 +443,44 @@ The extension then scans Chrome's actual `chatgpt.com` tabs immediately before a
   falling back to the lowest tab id so two passes cannot pick differently. Bailing out here left
   the chat broken *and* left the duplicate sitting there. Never open another tab in this case.
 
+#### Self-healing sessions and Emergency Resume
+
+When **Self-healing sessions** is enabled, the browser reload/open above remains the only soft
+recovery for a failure episode. If the exact session still has no canonical progress after the
+bounded post-reload observation window, the durable local session — not the ChatGPT conversation —
+becomes the recovery authority. The app records a failure episode and generation, fences the old
+conversation from local mutation tools, and opens one fresh executor with an Emergency Resume
+bootstrap. This is intentionally different from Compact & Resume: the failed source is never asked
+to answer or produce a handoff.
+
+Every phase transition is compare-and-swap fenced by the expected conversation, failure episode,
+recovery generation and source phase. A late reload receipt, old completion or callback from an
+earlier generation therefore cannot demote or reclaim a newer recovery. The canonical ownership
+change is still `rebindSession(A, B)`. After that durable write, Goal/Loop and Prime/worker
+projections must also be durable before the episode can become `recovered`; a restart while the
+transaction is `reconciling` repairs those projections instead of rolling ownership back to A.
+
+Emergency Resume uses a stable authored marker:
+
+```text
+[[CLF-EMERGENCY-RESUME:<failureEpisodeId>]]
+```
+
+The native Send boundary distinguishes a message that was definitely never clicked from one whose
+click may have been accepted while the ACK or conversation id was lost. The first may fail cleanly;
+the second is never resent. Once ChatGPT exposes the stable marker in the replacement conversation,
+the extension reconciles it through the existing durable recovery command. Two stable marker rows
+for one episode fail closed rather than guessing which send won.
+
+Tool replay follows the same conservative rule. A recovery episode is `read_only_safe_retry` only
+when the whole relevant local turn has explicit read-only calls and no ambiguous dispatch. Unknown,
+shell, browser, plugin or write activity is `mutating_or_ambiguous`. Running tools, recorder writes
+and tool results still settling into durable history block recovery classification; a mutation may
+already have succeeded even when its response disappeared. Emergency Resume therefore tells the
+replacement to treat completed operations as completed and to reconcile durable receipts, files,
+Git/process/session/worker state before deciding whether anything can be redone. `stopped` remains
+explicit user authority and is never converted into a recovery episode.
+
 **What retires a queued repair is scoped to the evidence it was filed on.** A `silence` or
 `no-tab` repair is about a chat, so ordinary activity ends its episode. An `unattributed` or
 `assistant-error` repair is about one broken *turn*, and only two facts retire it: the browser

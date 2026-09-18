@@ -35,10 +35,12 @@ import type {
   ReasoningEffort,
   SessionEvent,
   SessionOrigin,
+  SessionReplacementTransfer,
   SessionSummary,
   StoredText
 } from '../../shared/session.js';
 import { CONTINUATION_MARKER, eventTokens, MAX_TOOL_RESULT_TOKENS, normalizedToolOutcome, storedTextTokens, workSequence } from '../../shared/session.js';
+import type { SelfHealingRecoveryState } from '../../shared/recovery.js';
 import { chronological, positionOf } from '../../shared/chronology.js';
 import { automaticTitle, firstTitleMessage, legacyContextTitle, refreshUserTitle } from './title.js';
 import { agentPlanSchema, agentPlanUpdateSchema, MAX_AGENT_PLAN_BYTES, type AgentPlan, type AgentPlanUpdate } from '../../shared/agent-plan.js';
@@ -320,6 +322,8 @@ function emptySummary(id: string, title: string, conversationId: string | null):
     activeTurnId: null,
     finishTurn: null,
     agents: [],
+    recovery: null,
+    replacementTransfer: null,
     origin: null
   };
 }
@@ -1985,6 +1989,9 @@ function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
         !(finish.conversationId === null || typeof finish.conversationId === 'string') ||
         !(finish.decisionRevision === null || /^[a-f0-9]{64}$/.test(finish.decisionRevision)))) delete publicSummary.finishTurn;
 
+    const recovery = normalizeSelfHealingRecovery(publicSummary.recovery);
+    const replacementTransfer = normalizeReplacementTransfer(publicSummary.replacementTransfer);
+
     // A meta.json written before agents, app-opened chats or the session lineage existed
     // has no such field. A session recorded before the lineage was a single chat by
     // definition, and everything it holds was in that chat's context, so both defaults are
@@ -2039,12 +2046,105 @@ function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
           typeof publicSummary.lastCommittedResumeHandoffId === 'string' &&
           /^[0-9a-z-]{8,64}$/i.test(publicSummary.lastCommittedResumeHandoffId)
             ? publicSummary.lastCommittedResumeHandoffId
-            : null
+            : null,
+        recovery,
+        replacementTransfer
       }
     };
   } catch {
     return null;
   }
+}
+
+function normalizeReplacementTransfer(value: unknown): SessionReplacementTransfer | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Partial<SessionReplacementTransfer>;
+  if ((raw.kind !== 'continuation' && raw.kind !== 'recovery') ||
+      typeof raw.transactionId !== 'string' || raw.transactionId.length < 8 || raw.transactionId.length > 128 ||
+      typeof raw.sourceConversationId !== 'string' || !raw.sourceConversationId || raw.sourceConversationId.length > 512 ||
+      !Number.isFinite(raw.acquiredAt) || raw.acquiredAt! <= 0) return null;
+  const generation = raw.recoveryGeneration;
+  if (raw.kind === 'recovery') {
+    if (!Number.isSafeInteger(generation) || generation! < 1) return null;
+  } else if (generation !== null && generation !== undefined) return null;
+  return {
+    kind: raw.kind,
+    transactionId: raw.transactionId,
+    sourceConversationId: raw.sourceConversationId,
+    recoveryGeneration: raw.kind === 'recovery' ? generation! : null,
+    acquiredAt: raw.acquiredAt!
+  };
+}
+
+function normalizeSelfHealingRecovery(value: unknown): SelfHealingRecoveryState | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Partial<SelfHealingRecoveryState>;
+  const phases = new Set<SelfHealingRecoveryState['phase']>([
+    'healthy', 'suspected_stall', 'soft_recovery', 'hard_recovery',
+    'reconciling', 'recovered', 'recovery_failed'
+  ]);
+  const failures = new Set<SelfHealingRecoveryState['failureKind']>([
+    'silence', 'turn-stalled', 'turn-unknown', 'provider-error', 'tab-missing',
+    'tunnel-interrupted', 'worker-unresponsive', 'prime-unresponsive'
+  ]);
+  const safeties = new Set<SelfHealingRecoveryState['mutationSafety']>([
+    'read_only_safe_retry', 'mutating_or_ambiguous'
+  ]);
+  const nullableTime = (candidate: unknown): candidate is number | null =>
+    candidate === null || (typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0);
+  const lineage = raw.agentLineage;
+  const normalizedLineage = lineage === undefined || lineage === null
+    ? null
+    : (
+        typeof lineage === 'object' && !Array.isArray(lineage) &&
+        (lineage.role === 'prime' || lineage.role === 'worker') &&
+        typeof lineage.agentId === 'string' && /^[a-zA-Z0-9_-]{1,80}$/.test(lineage.agentId) &&
+        typeof lineage.runId === 'string' && /^[0-9a-z-]{8,64}$/i.test(lineage.runId) &&
+        typeof lineage.primeConversationId === 'string' && lineage.primeConversationId.length > 0 && lineage.primeConversationId.length <= 256 &&
+        typeof lineage.task === 'string' && lineage.task.length <= 16_000 &&
+        typeof lineage.createdAt === 'number' && Number.isFinite(lineage.createdAt) && lineage.createdAt >= 0
+      ? lineage
+      : undefined
+    );
+  if (normalizedLineage === undefined) return null;
+  const rawDestination = raw.destinationSend;
+  const destinationSend = rawDestination === undefined
+    ? {
+        state: 'not-attempted' as const,
+        commandId: null,
+        dispatchedAt: null,
+        conversationId: null,
+        messageId: null
+      }
+    : (
+        rawDestination && typeof rawDestination === 'object' && !Array.isArray(rawDestination) &&
+        ['not-attempted', 'attempted-unresolved', 'dispatched-unresolved', 'sent'].includes(rawDestination.state) &&
+        (rawDestination.commandId === null || (typeof rawDestination.commandId === 'string' && /^[A-Za-z0-9_-]{8,128}$/.test(rawDestination.commandId))) &&
+        nullableTime(rawDestination.dispatchedAt) &&
+        (rawDestination.conversationId === null || (typeof rawDestination.conversationId === 'string' && rawDestination.conversationId.length > 0 && rawDestination.conversationId.length <= 256)) &&
+        (rawDestination.messageId === null || (typeof rawDestination.messageId === 'string' && rawDestination.messageId.length > 0 && rawDestination.messageId.length <= 256))
+      ? rawDestination
+      : null
+    );
+  if (!destinationSend) return null;
+  if (
+    !raw.phase || !phases.has(raw.phase) ||
+    typeof raw.failureEpisodeId !== 'string' || !/^[0-9a-f-]{8,64}$/i.test(raw.failureEpisodeId) ||
+    !Number.isSafeInteger(raw.recoveryGeneration) || (raw.recoveryGeneration ?? 0) < 1 ||
+    !Number.isSafeInteger(raw.recoveryAttempts) || (raw.recoveryAttempts ?? -1) < 0 ||
+    !nullableTime(raw.lastRecoveryAt) || !nullableTime(raw.lastProgressAt) ||
+    typeof raw.previousConversationId !== 'string' || raw.previousConversationId.length === 0 || raw.previousConversationId.length > 256 ||
+    !(raw.replacementConversationId === null || (typeof raw.replacementConversationId === 'string' && raw.replacementConversationId.length > 0 && raw.replacementConversationId.length <= 256)) ||
+    !raw.failureKind || !failures.has(raw.failureKind) ||
+    !raw.mutationSafety || !safeties.has(raw.mutationSafety) ||
+    typeof raw.updatedAt !== 'number' || !Number.isFinite(raw.updatedAt) || raw.updatedAt < 0 ||
+    !(raw.error === null || (typeof raw.error === 'string' && raw.error.length <= 500))
+  ) return null;
+  return {
+    ...(raw as SelfHealingRecoveryState),
+    agentLineage: normalizedLineage,
+    destinationSend
+  };
 }
 
 async function readMetaCheckpoint(id: string): Promise<MetaCheckpoint | null> {
@@ -2470,6 +2570,25 @@ export async function conversationWasSuperseded(conversationId: string): Promise
 }
 
 /**
+ * Whether any retained durable lineage contains a superseded provider conversation.
+ *
+ * This is the admission-side ambiguity fence for a request whose exact page proof is still
+ * arriving. A historical A can call again long after A->B, so this fact deliberately has no
+ * process TTL. The authoritative attachment catalog is uncapped and cached; callers pay the
+ * full scan only while that catalog itself is being built.
+ */
+export async function hasSupersededConversationHistory(): Promise<boolean> {
+  const catalog = await ensureAttachmentCatalog();
+  const summaries = new Map(catalog.summaries);
+  for (const [id, entry] of open) summaries.set(id, entry.summary);
+  for (const summary of summaries.values()) {
+    if (!summary.conversationId) continue;
+    if (summary.chatIds.some((conversationId) => conversationId !== summary.conversationId)) return true;
+  }
+  return false;
+}
+
+/**
  * Whether one ChatGPT frontend is still the session's executable attachment.
  *
  * Historical `chatIds` are transcript lineage, not continuing authority. Compact & Resume
@@ -2656,6 +2775,172 @@ export async function observeSessionModel(
   });
 }
 
+type ReplacementTransferClaim = Omit<SessionReplacementTransfer, 'acquiredAt'>;
+
+function sameReplacementTransfer(
+  held: SessionReplacementTransfer | null | undefined,
+  expected: ReplacementTransferClaim
+): boolean {
+  return !!held && held.kind === expected.kind && held.transactionId === expected.transactionId &&
+    held.sourceConversationId === expected.sourceConversationId &&
+    held.recoveryGeneration === expected.recoveryGeneration;
+}
+
+/**
+ * Claims the one provider-replacement slot for a durable session.
+ *
+ * This is intentionally stored in session metadata rather than either feature WAL. A continuation
+ * and a recovery can both be perfectly valid transactions in their own ledgers while still being
+ * mutually exclusive browser side effects for the same session. The session queue is the earliest
+ * common CAS boundary they share.
+ */
+export async function claimSessionReplacementTransfer(
+  id: string,
+  claim: ReplacementTransferClaim
+): Promise<boolean> {
+  if (!claim.transactionId || claim.transactionId.length < 8 || claim.transactionId.length > 128 ||
+      !claim.sourceConversationId || claim.sourceConversationId.length > 512 ||
+      (claim.kind === 'recovery' && (!Number.isSafeInteger(claim.recoveryGeneration) || claim.recoveryGeneration! < 1)) ||
+      (claim.kind === 'continuation' && claim.recoveryGeneration !== null)) return false;
+  const entry = await ensureOpen(id);
+  return enqueueSessionOperation(entry, 'replacement transfer claim', async () => {
+    if (entry.summary.conversationId !== claim.sourceConversationId) return false;
+    const held = entry.summary.replacementTransfer ?? null;
+    if (sameReplacementTransfer(held, claim)) return true;
+    if (held) return false;
+
+    const recovery = entry.summary.recovery;
+    if (claim.kind === 'recovery') {
+      if (!recovery || recovery.failureEpisodeId !== claim.transactionId ||
+          recovery.recoveryGeneration !== claim.recoveryGeneration ||
+          recovery.previousConversationId !== claim.sourceConversationId ||
+          !['suspected_stall', 'soft_recovery', 'hard_recovery'].includes(recovery.phase)) return false;
+    } else if (recovery && (
+      recovery.phase === 'hard_recovery' || recovery.phase === 'reconciling' ||
+      (recovery.phase === 'recovery_failed' &&
+        (recovery.destinationSend.state === 'dispatched-unresolved' || recovery.destinationSend.state === 'sent'))
+    )) {
+      // Legacy/current crash compatibility: hard recovery already owns replacement authority even
+      // if it predates this field. Never let Compact & Resume create C beside that recovery B.
+      return false;
+    }
+
+    const staged: SessionSummary = {
+      ...entry.summary,
+      replacementTransfer: { ...claim, acquiredAt: Date.now() },
+      updatedAt: Date.now()
+    };
+    await writeSummary(staged, entry.historySeq);
+    entry.summary = staged;
+    publishAttachmentSummary(staged);
+    return true;
+  });
+}
+
+/** Releases only the exact transaction that currently owns provider replacement. */
+export async function releaseSessionReplacementTransfer(
+  id: string,
+  claim: ReplacementTransferClaim
+): Promise<boolean> {
+  const entry = await ensureOpen(id);
+  return enqueueSessionOperation(entry, 'replacement transfer release', async () => {
+    const held = entry.summary.replacementTransfer ?? null;
+    if (!held) return true;
+    if (!sameReplacementTransfer(held, claim)) return false;
+    const staged: SessionSummary = { ...entry.summary, replacementTransfer: null, updatedAt: Date.now() };
+    await writeSummary(staged, entry.historySeq);
+    entry.summary = staged;
+    publishAttachmentSummary(staged);
+    return true;
+  });
+}
+
+/**
+ * Persists one self-healing episode edge while proving the caller still names the current chat.
+ *
+ * Recovery metadata is a WAL, not another conversation owner. The exact attachment fence keeps
+ * a late timer from chat A from overwriting the episode after A→B has already committed.
+ */
+export async function setSessionRecoveryState(
+  id: string,
+  expectedConversationId: string,
+  recovery: SelfHealingRecoveryState | null,
+  expected: {
+    failureEpisodeId: string | null;
+    recoveryGeneration: number | null;
+    phases?: readonly SelfHealingRecoveryState['phase'][];
+    previousConversationId?: string;
+    replacementConversationId?: string | null;
+    destinationSendState?: SelfHealingRecoveryState['destinationSend']['state'];
+    destinationCommandId?: string | null;
+    events?: number;
+  }
+): Promise<boolean> {
+  const entry = await ensureOpen(id);
+  return enqueueSessionOperation(entry, 'self-healing recovery', async () => {
+    if (entry.summary.conversationId !== expectedConversationId) return false;
+    if (expected.events !== undefined && entry.summary.events !== expected.events) return false;
+    const held = entry.summary.recovery ?? null;
+    if (expected.failureEpisodeId === null) {
+      if (held !== null) return false;
+    } else if (
+      !held ||
+      held.failureEpisodeId !== expected.failureEpisodeId ||
+      held.recoveryGeneration !== expected.recoveryGeneration ||
+      (expected.phases && !expected.phases.includes(held.phase)) ||
+      (expected.previousConversationId !== undefined && held.previousConversationId !== expected.previousConversationId) ||
+      (expected.replacementConversationId !== undefined && held.replacementConversationId !== expected.replacementConversationId) ||
+      (expected.destinationSendState !== undefined && held.destinationSend.state !== expected.destinationSendState) ||
+      (expected.destinationCommandId !== undefined && held.destinationSend.commandId !== expected.destinationCommandId)
+    ) {
+      return false;
+    }
+    const staged: SessionSummary = { ...entry.summary, recovery, updatedAt: Date.now() };
+    await writeSummary(staged, entry.historySeq);
+    entry.summary = staged;
+    publishAttachmentSummary(staged);
+    return true;
+  });
+}
+
+/**
+ * Atomically commits one Emergency Resume A→B move and its recovery WAL edge.
+ *
+ * The replacement conversation and the canonical session attachment are one fact. Writing them
+ * in separate queued mutations lets two late browser ACKs interleave (WAL=B, WAL=C, rebind=B),
+ * leaving restart unable to tell which replacement won. This operation takes the session queue
+ * once, compare-and-swaps the exact episode/generation, collision-checks B, and writes one meta
+ * snapshot containing both the new attachment and phase=reconciling.
+ */
+export async function commitSelfHealingRebind(
+  id: string,
+  fromConversationId: string,
+  toConversationId: string,
+  episodeId: string,
+  generation: number
+): Promise<SelfHealingRecoveryState | null> {
+  if (!fromConversationId || !toConversationId || fromConversationId === toConversationId || !episodeId || generation < 1) return null;
+  const moved = await rebindSession(id, fromConversationId, toConversationId, undefined, {
+    episodeId,
+    generation
+  }, { kind: 'recovery', transactionId: episodeId, sourceConversationId: fromConversationId, recoveryGeneration: generation });
+  if (!moved) return null;
+  const session = await getSession(id);
+  const recovery = session?.recovery;
+  if (
+    session?.conversationId !== toConversationId ||
+    !recovery ||
+    recovery.failureEpisodeId !== episodeId ||
+    recovery.recoveryGeneration !== generation ||
+    recovery.previousConversationId !== fromConversationId ||
+    recovery.replacementConversationId !== toConversationId ||
+    (recovery.phase !== 'reconciling' && recovery.phase !== 'recovered')
+  ) {
+    return null;
+  }
+  return recovery;
+}
+
 /** Bind once before publishing project work; a task never silently changes folders. */
 export async function bindSessionProject(id: string, projectId: string): Promise<void> {
   if (!/^[a-f0-9-]{36}$/i.test(projectId)) throw new Error('Invalid project id');
@@ -2721,15 +3006,65 @@ export async function rebindSession(
   id: string,
   fromConversationId: string | null,
   toConversationId: string,
-  committedResumeHandoffId?: string
+  committedResumeHandoffId?: string,
+  selfHealing?: { episodeId: string; generation: number },
+  replacementTransfer?: ReplacementTransferClaim
 ): Promise<boolean> {
   if (!toConversationId || fromConversationId === toConversationId) return false;
   if (committedResumeHandoffId !== undefined && !/^[0-9a-z-]{8,64}$/i.test(committedResumeHandoffId)) return false;
+  if (selfHealing && (!selfHealing.episodeId || selfHealing.generation < 1 || !fromConversationId)) return false;
   // Same rule as createSession: once a mutation may attach B, no pre-existing cached miss for
   // B is authoritative. Clearing it early is safe even if the move later refuses or fails.
   missingCurrentConversations.delete(toConversationId);
   const entry = await ensureOpen(id);
   return enqueueSessionOperation(entry, 'rebind', async () => {
+    const heldTransfer = entry.summary.replacementTransfer ?? null;
+    if (replacementTransfer) {
+      if (!sameReplacementTransfer(heldTransfer, replacementTransfer)) return false;
+    } else if (heldTransfer) {
+      return false;
+    }
+    const heldRecovery = entry.summary.recovery;
+    const continuationOwnsReplacement = Boolean(
+      !selfHealing &&
+      replacementTransfer?.kind === 'continuation' &&
+      sameReplacementTransfer(heldTransfer, replacementTransfer)
+    );
+    if (!selfHealing && heldRecovery) {
+      // Hard recovery has crossed the provider-replacement boundary and must win. A merely
+      // suspected/soft episode is non-committing: if Compact & Resume already owns the shared
+      // transfer CAS, that winner may retire the stale episode while committing A→B.
+      if (heldRecovery.phase === 'hard_recovery' || heldRecovery.phase === 'reconciling') return false;
+      if ((heldRecovery.phase === 'suspected_stall' || heldRecovery.phase === 'soft_recovery') &&
+          !continuationOwnsReplacement) return false;
+    }
+    if (selfHealing) {
+      if (
+        !heldRecovery ||
+        heldRecovery.failureEpisodeId !== selfHealing.episodeId ||
+        heldRecovery.recoveryGeneration !== selfHealing.generation ||
+        heldRecovery.previousConversationId !== fromConversationId
+      ) {
+        return false;
+      }
+      // A lost browser ACK may ask the same semantic commit again after the durable metadata
+      // already says B. Accept only the exact episode/generation/B tuple; every other owner is
+      // still refused below. This keeps idempotence inside the one canonical attachment writer.
+      if (
+        entry.summary.conversationId === toConversationId &&
+        heldRecovery.replacementConversationId === toConversationId &&
+        (heldRecovery.phase === 'reconciling' || heldRecovery.phase === 'recovered')
+      ) {
+        return true;
+      }
+      // Stop is durable user intent. It may arrive after the browser already redeemed an
+      // Emergency Resume but before B's ACK commits A→B. Check it inside the same serialized
+      // session transaction as the attachment CAS so a late recovery ACK cannot resurrect a
+      // turn the user explicitly stopped.
+      if (entry.summary.lastTurnOutcome === 'stopped') return false;
+      if (heldRecovery.phase !== 'hard_recovery') return false;
+      if (heldRecovery.replacementConversationId && heldRecovery.replacementConversationId !== toConversationId) return false;
+    }
     if (entry.summary.conversationId !== fromConversationId) return false;
     // Browser conversation ids are UUID-like. A handful of store unit tests deliberately
     // use short symbolic ids and reuse them across retained temp sessions; ownership safety
@@ -2743,6 +3078,19 @@ export async function rebindSession(
         return false;
       }
     }
+    const now = Date.now();
+    const stagedRecovery = selfHealing && heldRecovery
+      ? {
+          ...heldRecovery,
+          phase: 'reconciling' as const,
+          replacementConversationId: toConversationId,
+          updatedAt: now,
+          error: null
+        }
+      : continuationOwnsReplacement && heldRecovery &&
+          (heldRecovery.phase === 'suspected_stall' || heldRecovery.phase === 'soft_recovery')
+        ? null
+        : heldRecovery;
     const staged: SessionSummary = {
       ...entry.summary,
       conversationId: toConversationId,
@@ -2755,7 +3103,10 @@ export async function rebindSession(
       ...(committedResumeHandoffId !== undefined
         ? { lastCommittedResumeHandoffId: committedResumeHandoffId }
         : {}),
-      updatedAt: Date.now(),
+      ...(selfHealing || (continuationOwnsReplacement && stagedRecovery !== heldRecovery)
+        ? { recovery: stagedRecovery }
+        : {}),
+      updatedAt: now,
       // A session whose chat was closed during the handover is live again the moment its new
       // chat is attached; leaving `endedAt` set would draw a visibly growing session as over.
       endedAt: null
@@ -2773,7 +3124,11 @@ export async function rebindSession(
     entry.metaDirty = false;
     missingCurrentConversations.delete(toConversationId);
     publishAttachmentSummary(entry.summary);
-    logInfo(`session ${id} moved from ChatGPT conversation ${fromConversationId} to ${toConversationId}`);
+    logInfo(
+      selfHealing
+        ? `session ${id} self-healing rebind committed from ${fromConversationId} to ${toConversationId}`
+        : `session ${id} moved from ChatGPT conversation ${fromConversationId} to ${toConversationId}`
+    );
     return true;
   });
 }

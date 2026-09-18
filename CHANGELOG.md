@@ -19,6 +19,12 @@ refreh your extension and all CoS plugins in chatgpt
 
 ![Anthropic support reply](docs/images/anthropic-support-reply-2026-09.png)
 
+### Self-healing sessions
+
+- Added opt-in **Self-healing sessions**: after one bounded same-chat recovery, a stuck Goal, Prime or worker can Emergency Resume into one fresh ChatGPT conversation while preserving the same durable local session and agent identity.
+- Emergency Resume reconciles durable tool receipts, running processes, files, Git/session/worker state before continuing. Ambiguous mutating work is never blindly replayed, and an explicit user Stop remains terminal.
+- Recovery state and browser-command WALs survive restart, fence stale old-chat ownership and finish Goal/Loop plus Prime/worker projections before an episode is marked recovered.
+
 ## [2.1.11] — 2 weeks 6 sol
 
 - Goal/Loop decisions use authored conversation context without recorded tool bodies.

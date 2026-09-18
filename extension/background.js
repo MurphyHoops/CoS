@@ -183,6 +183,18 @@ let closing = false;
  */
 let commandAckOutbox = [];
 let ackingCommands = false;
+/** Browser repair results that crossed the Chrome action boundary but are not app-ACKed yet. */
+let repairAckOutbox = [];
+let ackingRepairs = false;
+/**
+ * Stable browser-side identity for one Emergency Resume command.
+ *
+ * RUN_ID belongs to one content document and changes on reload. Recovery ownership belongs to
+ * the browser command/tab transaction instead, so keep a tiny command->owner record in local
+ * storage. The tab id rejects a copied recovery marker in another live tab; once B is observed,
+ * its exact conversation id is retained as the restart/reconciliation destination.
+ */
+let recoveryTransactions = {};
 
 /**
  * Which ChatGPT conversation each browser tab currently represents.
@@ -251,7 +263,7 @@ function load() {
 }
 
 async function loadOnce() {
-  const stored = await chrome.storage.local.get(['port', 'token', 'disconnected', 'deferredRevivals', 'commandAckOutbox', 'inputOpenings', 'desktopInputTabs', 'stopOpenings']);
+  const stored = await chrome.storage.local.get(['port', 'token', 'disconnected', 'deferredRevivals', 'commandAckOutbox', 'repairAckOutbox', 'inputOpenings', 'desktopInputTabs', 'stopOpenings', 'recoveryTransactions']);
   port = typeof stored.port === 'number' ? stored.port : null;
   token = typeof stored.token === 'string' ? stored.token : null;
   // Deliberately in `local` rather than `session`: a choice to disconnect that a browser
@@ -301,6 +313,12 @@ async function loadOnce() {
     : Array.isArray(live.commandAckOutbox)
       ? live.commandAckOutbox.slice(-200)
       : [];
+  repairAckOutbox = Array.isArray(stored.repairAckOutbox) ? stored.repairAckOutbox.slice(-200) : [];
+  recoveryTransactions = stored.recoveryTransactions && typeof stored.recoveryTransactions === 'object' && !Array.isArray(stored.recoveryTransactions)
+    ? Object.fromEntries(Object.entries(stored.recoveryTransactions).filter(([id, row]) => commandMarkerId(id) && row &&
+      typeof row.owner === 'string' && row.owner.length > 0 && row.owner.length <= 128 && Number.isInteger(row.tab) && row.tab >= 0 &&
+      (!row.conversationId || cleanConversationId(row.conversationId))).slice(-100))
+    : {};
   recoveryMonitoring = live.recoveryMonitoring === true;
   const savedDiscardProtection =
     live.discardProtectedTabs && typeof live.discardProtectedTabs === 'object' && !Array.isArray(live.discardProtectedTabs)
@@ -341,8 +359,10 @@ function persistLive() {
       // revival text is duplicated into extension storage.
       chrome.storage.local.set({
         commandAckOutbox: commandAckOutbox.slice(-200),
+        repairAckOutbox: repairAckOutbox.slice(-200),
         inputOpenings,
         stopOpenings,
+        recoveryTransactions,
         deferredRevivals: deferredRevivals.slice(-100)
       })
     ])
@@ -907,6 +927,7 @@ function retryWanted() {
     journal.length > 0 ||
     closeOutbox.length > 0 ||
     commandAckOutbox.length > 0 ||
+    repairAckOutbox.length > 0 ||
     deferredRevivals.length > 0 ||
     Object.keys(tabConversations).length > 0 ||
     Object.keys(discardProtectedTabs).length > 0 ||
@@ -1181,10 +1202,12 @@ async function pairOnce(intent = connectionEpoch, reconnect = false) {
  * The app answers 404 for a command that has been cancelled, superseded, or already
  * sent, so a stale marker types nothing.
  */
-async function redeemCommand(id, client, conversationId = null, projectEntry = false) {
+async function redeemCommand(id, client, conversationId = null, projectEntry = false, source = null) {
   await load();
   if (!id || settled.includes(id)) return { ok: true, command: null };
   const body = { id, client };
+  const recoveryOwner = recoveryTransactionOwner(id, source);
+  if (recoveryOwner) body.recoveryOwner = recoveryOwner;
   if (projectEntry === true) body.projectEntry = true;
   if (typeof conversationId === 'string' && conversationId) body.conversationId = conversationId;
   const result = await call('/commands/redeem', { method: 'POST', body: JSON.stringify(body) });
@@ -1194,6 +1217,14 @@ async function redeemCommand(id, client, conversationId = null, projectEntry = f
   if (result.status === 409) return { ok: true, command: null, gone: true };
   if (!result.ok) return { ok: false, error: result.error || `HTTP ${result.status}` };
   const command = result.data && result.data.command ? result.data.command : null;
+  if (command?.type === 'recovery') {
+    const episode = typeof command.text === 'string'
+      ? command.text.match(/\[\[CLF-EMERGENCY-RESUME:([0-9a-f-]{8,64})\]\]/i)?.[1] ?? null
+      : null;
+    if (!recoveryOwner || !(await rememberRecoveryTransaction(id, source, recoveryOwner, episode))) {
+      return { ok: false, error: 'recovery_transaction_not_durable' };
+    }
+  }
   return { ok: true, command };
 }
 
@@ -1245,18 +1276,32 @@ async function drainCommandAcks(targetId = null) {
       const result = await call(inputReceipt ? '/input/ack' : '/commands/ack', { method: 'POST', body: JSON.stringify(payload) });
       if (entry.id === targetId) targetResult = result;
 
-      if (result.ok || result.status === 404 || result.status === 409) {
+      const recoveryTerminalOwnership = entry.recovery === true && (result.status === 404 || result.status === 409) &&
+        result.data?.disposition === 'terminal';
+      if (result.ok || (!entry.recovery && (result.status === 404 || result.status === 409)) || recoveryTerminalOwnership) {
         if (!inputReceipt && result.ok && result.data?.outcome === 'terminal-failure' && payload.status === 'failed' && !payload.conversationId && entry.source) {
           await retireFailedCommandTab(entry);
         }
         commandAckOutbox = commandAckOutbox.filter((candidate) => candidate !== entry);
         changed = true;
+        if (entry.recovery === true && (result.ok || recoveryTerminalOwnership)) {
+          delete recoveryTransactions[entry.id];
+        }
         if (!inputReceipt && result.ok && result.data?.committed !== false && payload.status === 'sent' && !payload.agent) {
           // The app is authoritative. Settling before its ACK made a transient rejection
           // blacklist a valid superseding resume command for the rest of the browser session.
           settled = [...new Set([...settled, payload.id])].slice(-40);
         }
         continue;
+      }
+
+      // Recovery ownership is transaction-scoped, not document-scoped. A reload can legitimately
+      // turn the old page's RUN_ID into a 404/409 while the same Emergency Resume remains in
+      // flight. Keep the durable outbox row unless the app explicitly says the transaction is
+      // terminal/superseded; dropping it would turn an already-sent bootstrap into replay authority.
+      if (entry.recovery === true && (result.status === 404 || result.status === 409)) {
+        scheduleRetry();
+        break;
       }
 
       // A normalized current payload should not get a permanent 4xx other than the ownership
@@ -1283,9 +1328,18 @@ async function drainCommandAcks(targetId = null) {
 async function ackCommand(id, status, error, conversationId, agent, client, source = null, turnId) {
   await load();
   if (!id) return { ok: false, status: 400, error: 'bad_command_id' };
-  const payload = commandAckPayload(id, status, error, conversationId, agent, client, turnId);
+  const recovery = recoveryTransactionFor(id);
+  if (recovery && Number.isInteger(source?.tab) && recovery.tab !== source.tab &&
+      (!recovery.conversationId || recovery.conversationId !== cleanConversationId(conversationId))) {
+    return { ok: false, status: 409, error: 'foreign_recovery_transaction' };
+  }
+  if (recovery && conversationId && Number.isInteger(source?.tab) && recovery.tab === source.tab) {
+    await rememberRecoveryTransaction(id, source, recovery.owner, recovery.episodeId, conversationId);
+  }
+  const payload = commandAckPayload(id, status, error, conversationId, agent, recovery?.owner ?? client, turnId);
   const queued = {
     ...payload,
+    ...(recovery ? { recovery: true } : {}),
     provisional: payload.conversationId ? null : tabKey(source),
     ...(status === 'failed' && !payload.conversationId && ownsDocument(source) ? { source: { tab: source.tab, documentId: source.documentId, navigationEpoch: source.navigationEpoch } } : {}),
     queuedAt: Date.now()
@@ -1349,6 +1403,60 @@ async function ackDesktopInput(id, owner, conversationId, messageId) {
 function commandMarkerId(value) {
   const id = typeof value === 'string' ? value.trim() : '';
   return id && id.length <= 128 ? id : null;
+}
+
+/** Stable owner presented to the app for a recovery command, independent of content RUN_ID. */
+function recoveryTransactionOwner(id, source) {
+  const commandId = commandMarkerId(id);
+  const tab = Number.isInteger(source?.tab) ? source.tab : null;
+  if (!commandId || tab === null) return null;
+  const held = recoveryTransactions[commandId];
+  if (held) return held.tab === tab ? held.owner : null;
+  return `recovery:${commandId}:tab:${tab}`.slice(0, 128);
+}
+
+/** Publish a recovery transaction only after the app confirms this command really is recovery. */
+async function rememberRecoveryTransaction(id, source, owner, episodeId = null, conversationId = null) {
+  const commandId = commandMarkerId(id);
+  const tab = Number.isInteger(source?.tab) ? source.tab : null;
+  if (!commandId || tab === null || typeof owner !== 'string' || !owner) return false;
+  const existing = recoveryTransactions[commandId];
+  if (existing && (existing.owner !== owner || existing.tab !== tab)) return false;
+  recoveryTransactions[commandId] = {
+    owner,
+    tab,
+    episodeId: typeof episodeId === 'string' ? episodeId : existing?.episodeId ?? null,
+    conversationId: cleanConversationId(conversationId) ?? existing?.conversationId ?? null,
+    updatedAt: Date.now()
+  };
+  const entries = Object.entries(recoveryTransactions)
+    .sort(([, a], [, b]) => Number(a?.updatedAt || 0) - Number(b?.updatedAt || 0))
+    .slice(-100);
+  recoveryTransactions = Object.fromEntries(entries);
+  await persistLive();
+  return true;
+}
+
+function recoveryTransactionFor(id) {
+  const commandId = commandMarkerId(id);
+  return commandId ? recoveryTransactions[commandId] ?? null : null;
+}
+
+function recoveryTransactionForProof(source, episodeId, conversationId) {
+  const destination = cleanConversationId(conversationId);
+  const rows = Object.entries(recoveryTransactions).filter(([, row]) => row && row.episodeId === episodeId);
+  if (rows.length !== 1) return null;
+  const [id, row] = rows[0];
+  const sameTab = Number.isInteger(source?.tab) && row.tab === source.tab;
+  const sameBoundDestination = destination && row.conversationId === destination;
+  return sameTab || sameBoundDestination ? { id, ...row } : null;
+}
+
+async function forgetRecoveryTransaction(id) {
+  const commandId = commandMarkerId(id);
+  if (!commandId || !recoveryTransactions[commandId]) return;
+  delete recoveryTransactions[commandId];
+  await persistLive();
 }
 
 /**
@@ -2315,6 +2423,10 @@ async function maintainOnce() {
   // The app decides whether there is recovery work; a worker holding no tabs is not a worker
   // with nothing to do, it is the one that has to open the chat the app is owed.
   if (token === null) return;
+  // A browser action result is an irreversible custody item. Flush it before asking for new
+  // repairs so a lost HTTP response cannot leave the app believing the old claim is still live
+  // and, conversely, cannot tempt this worker to execute that same action again.
+  await drainRepairAcks();
   let observedTabs = [];
   try { observedTabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS }); } catch { /* Status/recovery still runs; no unobserved tab is pruned. */ }
   const openConversations = [...new Set(observedTabs.map(conversationForTab).filter(Boolean))];
@@ -2420,35 +2532,41 @@ async function maintainOnce() {
 
 async function performBrowserRepairs(repairs, policy) {
   for (const { conversationId, token, focus, requiresClaim } of repairs) {
-    // Re-scanned per repair rather than reused from above. Earlier entries in this same batch
-    // may have created a tab, and the scan has to be the state immediately before the action or
-    // the duplicate rule below is deciding on a tab list that no longer exists.
-    let live = [];
+    let target = null;
+    let repairAction = null;
     try {
-      live = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
-    } catch {
-      return;
-    }
-    const candidates = live.filter((tab) => conversationForTab(tab) === conversationId);
-    // One chat is one tab. Bailing out on two copies left the chat broken *and* left the
-    // duplicate sitting there, so the ambiguity is resolved instead: reload the copy this
-    // worker's registry already binds to the conversation, falling back to the lowest tab id so
-    // two passes never pick differently. A tab is only ever created when the chat has none.
-    const owned = candidates.filter((tab) => tabConversations[tab.id] === conversationId);
-    const [target] = (owned.length > 0 ? owned : candidates).sort((a, b) => a.id - b.id);
-    const repairAction = target ? 'reloaded' : 'reopened';
-    try {
-      if (!target && policy.browserOnly === true) continue;
+      // The tab scan can yield while attribution recovers or a final/new question
+      // retires an interrupted-response repair. Claim first, then throw away every tab fact
+      // observed before that await. A successful claim is the browser-action transaction
+      // boundary: navigation, a restored tab, or another maintenance pass may have changed the
+      // exact target while the app durably accepted the repair.
+      if (requiresClaim) {
+        const claim = await call('/repairs/claim', { method: 'POST', body: JSON.stringify({ token }) });
+        if (!claim.ok || claim.data?.allowed !== true) continue;
+      }
+
+      let live = [];
+      try {
+        live = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+      } catch {
+        if (await queueRepairAck(token, 'failed')) await drainRepairAcks();
+        continue;
+      }
+      const candidates = live.filter((tab) => conversationForTab(tab) === conversationId);
+      // One chat is one tab. Resolve the target only from the post-claim snapshot. If a tab
+      // navigated while claim was in flight it is no longer eligible; if the missing chat
+      // appeared in that interval it is reloaded instead of opening a duplicate.
+      const owned = candidates.filter((tab) => tabConversations[tab.id] === conversationId);
+      [target] = (owned.length > 0 ? owned : candidates).sort((a, b) => a.id - b.id);
+      repairAction = target ? 'reloaded' : 'reopened';
+      if (!target && policy.browserOnly === true) {
+        if (await queueRepairAck(token, 'failed', 'reopened')) await drainRepairAcks();
+        continue;
+      }
       // Select the working tab within Chrome without stealing OS focus from the
       // desktop app. Tab selection and window activation are separate operations.
       if (target && focus) {
         await chrome.tabs.update(target.id, { active: true });
-      }
-      // The tab scan can yield while attribution recovers or a final/new question
-      // retires an interrupted-response repair. Claim only at the action boundary.
-      if (requiresClaim) {
-        const claim = await call('/repairs/claim', { method: 'POST', body: JSON.stringify({ token }) });
-        if (!claim.ok || claim.data?.allowed !== true) continue;
       }
       if (target) await chrome.tabs.reload(target.id);
       else {
@@ -2458,10 +2576,63 @@ async function performBrowserRepairs(repairs, policy) {
       // A tab changed between the scan and action, or Chrome refused it. Report the exact failed
       // handout so the app can show the failure while keeping the same repair retryable. The
       // rest of the batch is unaffected: these are separate chats and separate failures.
-      await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}`);
+      if (await queueRepairAck(token, 'failed', repairAction)) await drainRepairAcks();
       continue;
     }
-    await call(`/status?repaired=${encodeURIComponent(token)}&repairAction=${repairAction}`);
+    if (await queueRepairAck(token, 'repaired', repairAction || 'reloaded')) await drainRepairAcks();
+  }
+}
+
+/**
+ * Takes durable custody of one browser-repair result before attempting the app ACK.
+ * The Chrome action itself is not idempotent, so only this receipt retries after transport loss.
+ */
+async function queueRepairAck(token, outcome, action = null) {
+  await load();
+  const clean = typeof token === 'string' ? token.slice(0, 64) : '';
+  if (!clean || !['repaired', 'failed'].includes(outcome)) return false;
+  const normalizedAction = action === 'reloaded' || action === 'reopened' ? action : null;
+  const prior = repairAckOutbox.find((entry) => entry?.token === clean);
+  if (prior && (prior.outcome !== outcome || prior.action !== normalizedAction)) return false;
+  if (!prior) {
+    repairAckOutbox = [
+      ...repairAckOutbox.filter((entry) => entry?.token !== clean),
+      { token: clean, outcome, action: normalizedAction, queuedAt: Date.now() }
+    ].slice(-200);
+    await persistLive();
+  }
+  scheduleRetry();
+  return true;
+}
+
+async function drainRepairAcks() {
+  await load();
+  if (ackingRepairs || repairAckOutbox.length === 0 || !token) return { ok: true, pending: repairAckOutbox.length };
+  ackingRepairs = true;
+  let changed = false;
+  try {
+    for (const entry of [...repairAckOutbox]) {
+      if (!entry || typeof entry.token !== 'string' || !['repaired', 'failed'].includes(entry.outcome)) {
+        repairAckOutbox = repairAckOutbox.filter((candidate) => candidate !== entry);
+        changed = true;
+        continue;
+      }
+      const key = entry.outcome === 'repaired' ? 'repaired' : 'repairFailed';
+      const suffix = entry.action ? `&repairAction=${encodeURIComponent(entry.action)}` : '';
+      const result = await call(`/status?${key}=${encodeURIComponent(entry.token)}${suffix}`);
+      if (!result.ok) {
+        scheduleRetry();
+        break;
+      }
+      repairAckOutbox = repairAckOutbox.filter((candidate) => candidate !== entry);
+      changed = true;
+    }
+    if (changed) await persistLive();
+    if (repairAckOutbox.length > 0) scheduleRetry();
+    else clearRetryIfIdle();
+    return { ok: true, pending: repairAckOutbox.length };
+  } finally {
+    ackingRepairs = false;
   }
 }
 
@@ -3174,6 +3345,51 @@ const HANDLERS = {
     return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
   },
   /**
+   * Reconciles an Emergency Resume whose native Send crossed but whose ordinary command ACK was
+   * lost with the old document. The content script supplies only a stable episode marker from
+   * ChatGPT's authored user-message model; this handler independently proves that the same live
+   * document is still showing that exact conversation before forwarding the proof to the app.
+   */
+  async recovery_reconcile(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const conversationId = cleanConversationId(message.conversationId);
+    const episodeId = typeof message.episodeId === 'string' && /^[0-9a-f-]{8,64}$/i.test(message.episodeId)
+      ? message.episodeId : null;
+    const messageId = typeof message.messageId === 'string' && message.messageId && message.messageId.length <= 256
+      ? message.messageId : null;
+    if (!conversationId || !episodeId || !messageId) return { ok: false, error: 'bad_recovery_proof' };
+    await noteTabConversation(source, conversationId);
+    if (!(await currentConversationDocument(source, conversationId))) return { ok: false, error: 'stale_document' };
+    const transaction = recoveryTransactionForProof(source, episodeId, conversationId);
+    // No live browser transaction is required once the app has already durably committed this
+    // exact destination; the bridge can prove that from its recovery WAL. Before that point,
+    // however, only the tab that redeemed the Emergency Resume (or its already-bound B) may
+    // present the marker. A copied marker in another tab is not recovery authority.
+    if (!transaction) {
+      const result = await call('/recovery/reconcile', {
+        method: 'POST',
+        body: JSON.stringify({ conversationId, episodeId, messageId })
+      });
+      return (await currentConversationDocument(source, conversationId)) ? result : { ok: false, error: 'stale_document' };
+    }
+    if (!transaction.conversationId && transaction.tab === source.tab) {
+      await rememberRecoveryTransaction(transaction.id, source, transaction.owner, episodeId, conversationId);
+    }
+    const result = await call('/recovery/reconcile', {
+      method: 'POST',
+      body: JSON.stringify({
+        conversationId,
+        episodeId,
+        messageId,
+        client: transaction.owner,
+        commandId: transaction.id
+      })
+    });
+    if (result.ok && result.data?.committed === true) await forgetRecoveryTransaction(transaction.id);
+    return (await currentConversationDocument(source, conversationId)) ? result : { ok: false, error: 'stale_document' };
+  },
+  /**
    * The goal loop: this page saw its turn genuinely finish and wants the next user message.
    *
    * The API key never comes near this worker. The app is handed the conversation id and the
@@ -3347,7 +3563,7 @@ const HANDLERS = {
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
     const tab = await chrome.tabs.get(source.tab);
     if (!ownsDocument(source) || conversationFromUrl(tab.url) !== message.conversationId) return { ok: false, error: 'wrong_conversation' };
-    const result = await redeemCommand(String(message.id || ''), String(message.client || ''), message.conversationId);
+    const result = await redeemCommand(String(message.id || ''), String(message.client || ''), message.conversationId, false, source);
     return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
   },
   async stop_ack(message, _sender, source) {
@@ -3360,13 +3576,33 @@ const HANDLERS = {
       message.conversationId, null, message.client, source, message.turnId);
   },
   /** The marked page asking for the one command it was opened for. */
-  async redeem(message) {
+  async redeem(message, _sender, source) {
     return redeemCommand(
       String(message.id || ''),
       String(message.client || ''),
       typeof message.conversationId === 'string' ? message.conversationId : null,
-      message.projectEntry === true
+      message.projectEntry === true,
+      source
     );
+  },
+  async recovery_send(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const id = commandMarkerId(message.id);
+    const transaction = id ? recoveryTransactionFor(id) : null;
+    if (!id || !transaction || transaction.tab !== source.tab) {
+      return { ok: false, status: 409, error: 'foreign_recovery_transaction' };
+    }
+    const action = message.action === 'dispatch' || message.action === 'release' ? message.action : null;
+    if (!action) return { ok: false, status: 400, error: 'bad_recovery_send' };
+    const result = await call('/recovery/send', {
+      method: 'POST',
+      body: JSON.stringify({ id, client: transaction.owner, action })
+    });
+    if (action === 'release' && result.ok && result.data?.released === true) {
+      await forgetRecoveryTransaction(id);
+    }
+    return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
   },
   /**
    * A revival page has positively identified the exact target chat but it is not submit-ready
@@ -3440,6 +3676,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'settings_get',
     'repair_fiber',
     'redeem',
+    'recovery_send',
+    'recovery_reconcile',
     'defer_revival',
     'forget_revival',
     'ack'

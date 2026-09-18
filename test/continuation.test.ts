@@ -166,7 +166,12 @@ describe('capturing the brief', () => {
   it('does not borrow selection from another conversation or invent missing effort', async () => {
     const summary = await createSession({ title: 'source evidence', conversationId: CHAT_A });
     await store.observeSessionModel(summary.id, CHAT_A, 'gpt-5.6-sol', 10);
-    expect((await openContinuationNow(summary.id, CHAT_A)).requestedModel).toEqual({ model: 'gpt-5.6-sol', reasoningEffort: null });
+    const opened = await openContinuationNow(summary.id, CHAT_A);
+    expect(opened.requestedModel).toEqual({ model: 'gpt-5.6-sol', reasoningEffort: null });
+    // The replacement slot is session-durable now. End this deliberately abandoned continuation
+    // before simulating an unrelated later rebind; an in-memory test reset is not authority to
+    // discard a real provider-replacement transaction.
+    expect(await abortContinuationSourceBeforeSendNow(opened.token, 'test cleanup before unrelated rebind')).toBe(true);
     resetContinuationsForTests();
     await store.rebindSession(summary.id, CHAT_A, CHAT_B);
     expect((await openContinuationNow(summary.id, CHAT_B)).requestedModel).toBeNull();
@@ -698,9 +703,22 @@ describe('the swarm handover', () => {
     saved.state = 'committing';
     saved.to = CHAT_B;
 
-    // This is the exact crash boundary continuation recovery is designed for: durable session
-    // authority already says B, but the in-memory worker ownership projection still says A.
-    expect(await store.rebindSession(summary.id, CHAT_A, CHAT_B)).toBe(true);
+    // This is the exact crash boundary continuation recovery is designed for: the continuation
+    // still owns the shared provider-replacement slot and durable session authority already says
+    // B, but the in-memory worker ownership projection still says A.
+    expect(await store.rebindSession(
+      summary.id,
+      CHAT_A,
+      CHAT_B,
+      undefined,
+      undefined,
+      {
+        kind: 'continuation',
+        transactionId: opened.token,
+        sourceConversationId: CHAT_A,
+        recoveryGeneration: null
+      }
+    )).toBe(true);
     expect((await getSession(summary.id))?.lastCommittedResumeHandoffId).toBeNull();
     resetAgentsForTests();
     restoreSwarm(swarmSnapshot);
@@ -1146,23 +1164,31 @@ describe('a brief that cannot be the whole handoff', () => {
  * when it is armed and, more importantly, when it stops being: an armed gate that nothing
  * clears would make every unrelated new chat wait.
  */
+async function waitForResumeGateCalls(gate: { mock: { calls: unknown[][] } }, count = 2): Promise<void> {
+  // These tests fake Date only. Keep the scheduler real so recorder disk I/O and its 50ms
+  // settle loop make ordinary event-loop progress on every OS, then move logical time explicitly.
+  for (let attempt = 0; attempt < 100 && gate.mock.calls.length < count; attempt += 1) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  expect(gate.mock.calls.length).toBeGreaterThanOrEqual(count);
+}
+
 describe('the window in which a replacement chat is expected', () => {
   it('keeps an early destination observation with the original session after a slow resume commit', async () => {
     const { sessionId, token } = await readyContinuation();
     const destination = '92929292-1111-4222-8333-444444444444';
     await claimContinuationNow(token, 'slow-resume-command');
-    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    vi.useFakeTimers({ toFake: ['Date'] });
     const create = vi.spyOn(store, 'createSession');
     const gate = vi.spyOn(await import('../src/main/session/resume-gate.js'), 'resumeOpeningChat');
     const observation = sessionForConversation(destination);
-    await vi.waitFor(() => expect(gate.mock.calls.length).toBeGreaterThanOrEqual(2));
-    await vi.advanceTimersByTimeAsync(6_000);
+    await waitForResumeGateCalls(gate);
+    vi.setSystemTime(Date.now() + 6_000);
 
-    // The command still owns its sixty-second claim. Five seconds without its ACK
+    // The command still owns its sixty-second claim. Six seconds without its ACK
     // cannot authorize a second durable session for the destination.
     expect(resumeOpeningChat()).toBe(true);
     expect(await commitContinuation(token, destination)).toBe(true);
-    await vi.advanceTimersByTimeAsync(50);
     expect(await observation).toBe(sessionId);
     expect(create).not.toHaveBeenCalled();
     expect((await store.findSessionByConversation(destination))?.id).toBe(sessionId);
@@ -1171,13 +1197,16 @@ describe('the window in which a replacement chat is expected', () => {
   it.each(['abort', 'expiry'] as const)('releases unrelated new recording when the resume claim ends by %s', async reason => {
     const { token } = await readyContinuation();
     await claimContinuationNow(token, 'unfinished-resume-command');
-    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    vi.useFakeTimers({ toFake: ['Date'] });
     const unrelated = reason === 'abort' ? '93939393-1111-4222-8333-444444444444' : '94949494-1111-4222-8333-444444444444';
     const gate = vi.spyOn(await import('../src/main/session/resume-gate.js'), 'resumeOpeningChat');
     const observation = sessionForConversation(unrelated);
-    await vi.waitFor(() => expect(gate.mock.calls.length).toBeGreaterThanOrEqual(2));
-    if (reason === 'abort') abortContinuation(token, 'cancelled before destination');
-    await vi.advanceTimersByTimeAsync(reason === 'expiry' ? RESUME_CLAIM_WINDOW_MS + 100 : 100);
+    await waitForResumeGateCalls(gate);
+    if (reason === 'abort') {
+      abortContinuation(token, 'cancelled before destination');
+    } else {
+      vi.setSystemTime(Date.now() + RESUME_CLAIM_WINDOW_MS + 100);
+    }
     const sessionId = await observation;
     expect(sessionId).toBeTruthy();
     expect((await getSession(sessionId!))?.conversationId).toBe(unrelated);

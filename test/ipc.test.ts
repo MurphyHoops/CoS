@@ -377,7 +377,13 @@ beforeEach(async () => {
   await saveConfig({
     ...defaultConfig(),
     sessions: { ...defaultConfig().sessions, record: true },
-    multiAgent: { enabled: true, maxWorkers: 3, allowUnattributedCalls: false, recoverAgentTabs: true }
+    multiAgent: {
+      enabled: true,
+      maxWorkers: 3,
+      allowUnattributedCalls: false,
+      recoverAgentTabs: true,
+      selfHealingSessions: false
+    }
   });
 });
 

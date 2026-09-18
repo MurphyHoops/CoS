@@ -62,6 +62,9 @@ import {
   setContinuationRecoveryHooks,
   type ContinuationSnapshot
 } from './session/continuation.js';
+import { reconcileSelfHealingAfterRestart } from './session/self-healing.js';
+import { LONG_RUN_STATE, restoreLongRunState, type LongRunSnapshot } from './session/long-run.js';
+import { startLongRunRuntime, stopLongRunRuntime } from './session/long-run-runtime.js';
 import { runShutdownSequence } from './shutdown.js';
 import { applyStagedUpdate, startUpdateChecks } from './update.js';
 import { UI_BASE_ZOOM, windowLayoutForWorkArea, titleBarOverlayForTheme } from './window-layout.js';
@@ -326,6 +329,9 @@ void app.whenReady().then(async () => {
   const savedGoalReplies = await readDurable<GoalRepliesSnapshot>(GOAL_REPLIES_STATE);
   if (windowActivation.isDisabled()) return;
   restoreGoalReplies(savedGoalReplies);
+  const savedLongRun = await readDurable<LongRunSnapshot>(LONG_RUN_STATE);
+  if (windowActivation.isDisabled()) return;
+  restoreLongRunState(savedLongRun);
   // Request ownership must exist before either side of the bridge can race in. A request id
   // that was proved yesterday remains the same workflow today even if its ChatGPT tab closed.
   await restoreRequestCorrelations();
@@ -394,6 +400,14 @@ void app.whenReady().then(async () => {
   await restoreContinuations(savedContinuations);
   if (windowActivation.isDisabled()) return;
 
+  // Self-healing recovery owns MCP admission as well as browser delivery. Rebuild every durable
+  // hard-recovery fence and finish any already-committed A→B projection before IPC can expose a
+  // Connect action or auto-connect can start the Core server. Doing this only inside bridge
+  // command restore leaves a startup window where old chat A is still the durable attachment and
+  // can issue one more local mutation before its recovery fence exists.
+  await reconcileSelfHealingAfterRestart();
+  if (windowActivation.isDisabled()) return;
+
   // Strict CSP for our own page. There is no remote content and no inline script.
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
@@ -446,6 +460,7 @@ void app.whenReady().then(async () => {
     void startBridge();
   }
   if (getConfig().ui.autoConnect) void connect();
+  startLongRunRuntime();
 
   // Never awaited: an unreachable GitHub, a slow download or a broken release must not delay a
   // window that is already on screen. Everything it learns arrives through the ordinary state
@@ -495,7 +510,7 @@ app.on('will-quit', (event) => {
       // The budget has to clear the drains it contains, or it would silently defeat them:
       // the bridge force-closes wedged localhost sockets at 15s and the MCP endpoint forces
       // its own drain at 30s. This is the outer bound on both, not a competing one.
-      { name: 'admission/drain', budgetMs: 40_000, run: () => [shutdownConnection(), shutdownBridge()] },
+      { name: 'admission/drain', budgetMs: 40_000, run: () => [stopLongRunRuntime(), shutdownConnection(), shutdownBridge()] },
       // Phase 2: only after request handlers are done may their owned child processes go.
       {
         name: 'process cleanup',

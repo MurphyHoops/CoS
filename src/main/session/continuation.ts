@@ -64,18 +64,22 @@ import {
   thawPrimeTransfer
 } from '../agents.js';
 import { clearChatWorkspace, moveChatWorkspace, workspaceForChat } from '../workspace.js';
-import { clearGoalObjective, clearGoalSwitch, goalObjectiveFor, goalSwitchFor, moveGoalObjective, moveGoalSwitch, retireGoalDraftsFor } from '../goal.js';
+import { clearGoalObjective, clearGoalSwitch, goalObjectiveFor, goalSwitchFor, moveGoalObjective, moveGoalSwitch } from '../goal.js';
 import { writeDurableNow, writeDurableSoon } from '../durable.js';
 import { prepareHandoff, resumeBootstrapMatches } from './handoff.js';
-import { ensureHandoffRecorded, recordHandoff, recordNote, rebindConversation } from './recorder.js';
+import { ensureHandoffRecorded, recordHandoff, recordNote } from './recorder.js';
+import { publishSessionRebindProjection } from './rebind.js';
+import { moveLongRunStateNow } from './long-run.js';
 import { endResumeClaim, noteResumeClaim, resetResumeGate } from './resume-gate.js';
 import {
+  claimSessionReplacementTransfer,
   ensureCommittedResumeHandoff,
   findSessionByConversation,
   getSession,
   readEvents,
   readHandoff,
   refuseAutomaticCompactionNow,
+  releaseSessionReplacementTransfer,
   rebindSession
 } from './store.js';
 
@@ -402,6 +406,15 @@ async function transitionNow(
     throw err;
   }
   publishRecord(entry, next);
+  if (next.state === 'committed' || next.state === 'aborted') {
+    try {
+      await releaseSessionReplacementTransfer(entry.sessionId, continuationTransfer(entry));
+    } catch (err) {
+      // A stale exact owner is fail-closed. Restart or a later terminal retry can release it;
+      // never turn a durable terminal WAL edge back into an apparent failure after publication.
+      logWarn(`continuation ${entry.token.slice(0, 8)} could not release session replacement ownership — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   return next;
 }
 
@@ -760,6 +773,13 @@ function makeContinuation(sessionId: string, fromConversationId: string, automat
   };
 }
 
+const continuationTransfer = (entry: Pick<Continuation, 'token' | 'from'>) => ({
+  kind: 'continuation' as const,
+  transactionId: entry.token,
+  sourceConversationId: entry.from,
+  recoveryGeneration: null
+});
+
 /** Durable open used before the bridge hands the one-shot compaction prompt to a page. */
 export async function openContinuationNow(
   sessionId: string,
@@ -789,6 +809,17 @@ export async function openContinuationNow(
       // otherwise its retry could resurrect a token the bridge never returned to the page.
       writeDurableSoon(CONTINUATIONS_STATE, snapshotContinuations());
       throw err;
+    }
+    if (!(await claimSessionReplacementTransfer(sessionId, continuationTransfer(entry)))) {
+      // The continuation WAL exists first so a crash can reconstruct the transaction that was
+      // trying to own replacement. A losing claim is erased before this function returns and,
+      // most importantly, before any caller may open/focus a browser replacement.
+      try {
+        await writeDurableNow(CONTINUATIONS_STATE, snapshotContinuations());
+      } catch {
+        writeDurableSoon(CONTINUATIONS_STATE, snapshotContinuations());
+      }
+      throw new Error('another provider-replacement transaction already owns this session');
     }
     byToken.set(entry.token, entry);
     beginPrimeTransfer(fromConversationId);
@@ -1183,17 +1214,40 @@ export async function claimContinuationNow(token: string, claimant: string): Pro
   return { summary: entry.summary };
 }
 
+async function publishCommittedProjectionDurably(
+  entry: Continuation,
+  toConversationId: string,
+  swarm: 'absent' | 'frozen' | 'recovery'
+): Promise<boolean> {
+  // Session metadata is already authoritative at every call site below. A long-run wait can
+  // outlive the continuation WAL retention window, so its execution epoch cannot rely on the
+  // old writeDurableSoon projection being replayed after another crash.
+  let durable = false;
+  try {
+    durable = await moveLongRunStateNow(entry.sessionId, entry.from, toConversationId);
+    if (!durable) {
+      logWarn(`continuation ${entry.token.slice(0, 8)} could not move durable long-run authority to ${toConversationId}`);
+    }
+  } catch (error) {
+    logWarn(
+      `continuation ${entry.token.slice(0, 8)} long-run projection will retry — ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+
+  // The canonical session attachment already says B. Rebuildable live projections must follow
+  // that fact even if the extra long-run fsync barrier failed, otherwise Prime/workspace/Goal
+  // authority would stay split across A and B for the rest of this process. The continuation
+  // WAL stays committing until the durability barrier succeeds, so restart/retry repairs the
+  // remaining disk projection without rolling the authoritative A→B move backwards.
+  publishCommittedProjection(entry, toConversationId, swarm);
+  return durable;
+}
 function publishCommittedProjection(
   entry: Continuation,
   toConversationId: string,
   swarm: 'absent' | 'frozen' | 'recovery'
 ): void {
-  rebindConversation(entry.sessionId, entry.from, toConversationId);
-  moveChatWorkspace(entry.from, toConversationId);
-  moveGoalObjective(entry.from, toConversationId);
-  moveGoalSwitch(entry.from, toConversationId);
-  // A's final is superseded, never a completed turn in B. B earns its own debt.
-  retireGoalDraftsFor(entry.from);
+  publishSessionRebindProjection(entry.sessionId, entry.from, toConversationId);
   if (swarm === 'frozen') {
     if (!commitPrimeTransfer(entry.from, toConversationId)) {
       // The frozen handover cannot expire. A miss here means the run ended outright while
@@ -1271,7 +1325,9 @@ async function reconcileCommitting(entry: Continuation, toConversationId: string
         };
       }
     }
-    publishCommittedProjection(entry, toConversationId, 'recovery');
+    if (!(await publishCommittedProjectionDurably(entry, toConversationId, 'recovery'))) {
+      return { status: 'retryable', reason: 'the session moved, but long-run execution authority is not durable in the replacement chat yet' };
+    }
     await finishCommittedRecord(entry, toConversationId);
     return { status: 'already-committed', conversationId: toConversationId };
   }
@@ -1313,7 +1369,14 @@ async function reconcileCommitting(entry: Continuation, toConversationId: string
 
   let moved = false;
   try {
-    moved = await rebindSession(entry.sessionId, entry.from, toConversationId, entry.handoffId ?? undefined);
+    moved = await rebindSession(
+      entry.sessionId,
+      entry.from,
+      toConversationId,
+      entry.handoffId ?? undefined,
+      undefined,
+      continuationTransfer(entry)
+    );
   } catch (err) {
     logWarn(`continuation ${entry.token.slice(0, 8)} rebind threw: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -1337,7 +1400,9 @@ async function reconcileCommitting(entry: Continuation, toConversationId: string
           };
         }
       }
-      publishCommittedProjection(entry, toConversationId, swarm === 'frozen' ? 'frozen' : 'absent');
+      if (!(await publishCommittedProjectionDurably(entry, toConversationId, swarm === 'frozen' ? 'frozen' : 'absent'))) {
+        return { status: 'retryable', reason: 'the session moved, but long-run execution authority is not durable in the replacement chat yet' };
+      }
       await finishCommittedRecord(entry, toConversationId);
       return { status: 'committed', conversationId: toConversationId };
     }
@@ -1358,8 +1423,11 @@ async function reconcileCommitting(entry: Continuation, toConversationId: string
     return { status: 'retryable', reason };
   }
 
-  // --- publish. Total map work only, after the authoritative durable attachment says B.
-  publishCommittedProjection(entry, toConversationId, swarm === 'frozen' ? 'frozen' : 'absent');
+  // --- publish. The authoritative durable attachment already says B. Long-run execution
+  // authority crosses its own fsync barrier before the remaining rebuildable map projections.
+  if (!(await publishCommittedProjectionDurably(entry, toConversationId, swarm === 'frozen' ? 'frozen' : 'absent'))) {
+    return { status: 'retryable', reason: 'the session moved, but long-run execution authority is not durable in the replacement chat yet' };
+  }
   await finishCommittedRecord(entry, toConversationId);
   logInfo(
     `continuation ${entry.token.slice(0, 8)} committed: session ${entry.sessionId} is now chat ${toConversationId}`
@@ -1473,6 +1541,14 @@ export function abortContinuation(token: string, reason: string): boolean {
   endResumeClaim(entry.token);
   cancelPrimeTransfer(entry.from);
   changed();
+  // The public legacy API is synchronous. Preserve durability ordering asynchronously: terminal
+  // continuation WAL first, then release the exact shared replacement owner. Until both land the
+  // stale owner merely blocks another replacement, which is the safe failure mode.
+  void changedNow()
+    .then(() => releaseSessionReplacementTransfer(entry.sessionId, continuationTransfer(entry)))
+    .catch((err) => logWarn(
+      `continuation ${entry.token.slice(0, 8)} could not durably release replacement ownership — ${err instanceof Error ? err.message : String(err)}`
+    ));
   logWarn(`continuation ${entry.token.slice(0, 8)} abandoned — ${reason}`);
   noteAbandoned(entry, reason);
   return true;
@@ -1646,10 +1722,15 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
             );
           }
         }
-        publishCommittedProjection(entry, entry.to, 'recovery');
-        entry.state = 'committed';
-        entry.error = null;
-        logInfo(`continuation ${entry.token.slice(0, 8)} recovered after durable commit`);
+        const longRunDurable = await publishCommittedProjectionDurably(entry, entry.to, 'recovery');
+        if (longRunDurable) {
+          entry.state = 'committed';
+          entry.error = null;
+          logInfo(`continuation ${entry.token.slice(0, 8)} recovered after durable commit`);
+        } else {
+          entry.error = 'Recovered session ownership, but long-run execution authority still needs its durable A→B projection.';
+          logWarn(`continuation ${entry.token.slice(0, 8)} kept its WAL retryable because long-run authority is not durable yet`);
+        }
       } else if (entry.state === 'committing' && session && session.conversationId === entry.from) {
         if (waitingExpired) {
           // The WAL proves the durable session move never landed. Restart must not turn an
@@ -1702,6 +1783,27 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
     // likely to hit it. Re-armed from now rather than from the original claim, because what
     // matters is how long from *here* that chat still has to appear.
     if (entry.state === 'claimed') noteResumeClaim(entry.token);
+    if (entry.state !== 'committed' && entry.state !== 'aborted') {
+      let ownsTransfer = false;
+      try {
+        ownsTransfer = await claimSessionReplacementTransfer(entry.sessionId, continuationTransfer(entry));
+      } catch (err) {
+        logWarn(`continuation ${entry.token.slice(0, 8)} could not restore replacement ownership — ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (!ownsTransfer) {
+        // Another durable transaction owns replacement. Keep the restored continuation terminal
+        // so no later bridge pickup can open C beside that owner; the repaired snapshot is fsynced
+        // below before bridge startup exposes any browser command.
+        entry.state = 'aborted';
+        entry.error = 'Recovery found another provider-replacement transaction already owns this session.';
+        endResumeClaim(entry.token);
+        cancelPrimeTransfer(entry.from);
+      }
+    } else {
+      // Crash after terminal continuation WAL but before owner release: clear only this exact
+      // token. A newer continuation/recovery owner is untouched by the compare-and-swap.
+      await releaseSessionReplacementTransfer(entry.sessionId, continuationTransfer(entry)).catch(() => false);
+    }
     byToken.set(entry.token, entry);
   }
   try {

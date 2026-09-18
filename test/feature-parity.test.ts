@@ -23,7 +23,8 @@ describe('portable browser-backed feature parity', () => {
         enabled: true,
         maxWorkers: 2,
         allowUnattributedCalls: true,
-        recoverAgentTabs: false
+        recoverAgentTabs: false,
+        selfHealingSessions: false
       });
       expect(browserExtensionRequired(config)).toBe(true);
     }
@@ -65,6 +66,7 @@ describe('portable browser-backed feature parity', () => {
       'exec_command',
       'write_stdin',
       'update_plan',
+      'session_wait',
       'agents',
       'session_finish',
       'exec'

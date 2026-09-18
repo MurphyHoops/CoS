@@ -59,6 +59,7 @@ import {
   UNATTENDED_EXEC_NOTICE_MS
 } from '../src/main/codex/ownership.js';
 import { unifiedExecManager } from '../src/main/codex/manager.js';
+import { resetLongRunStateForTests, restoreLongRunState } from '../src/main/session/long-run.js';
 import { locateRipgrep } from '../src/main/ripgrep.js';
 import { IS_WINDOWS, makeTempDir, removeTempDir, writeTree } from './helpers.js';
 
@@ -288,6 +289,7 @@ afterAll(async () => {
 beforeEach(async () => {
   if (endpoint) await endpoint.stop();
   resetWorkspaces();
+  resetLongRunStateForTests();
   ctx.caps = withCaps({});
   ctx.readOnly = true;
   ctx.roots = [{ name: 'workspace', path: approved }];
@@ -594,7 +596,7 @@ describe('surface boundaries', () => {
     everything();
     const names = toolNames(await core('tools/list'));
     // find is absent because exec_command is present — they are mutually exclusive.
-    expect(names).toEqual(['agents', 'apply_patch', 'exec', 'exec_command', 'read', 'update_plan', 'view_image', 'write_stdin']);
+    expect(names).toEqual(['agents', 'apply_patch', 'exec', 'exec_command', 'read', 'session_wait', 'update_plan', 'view_image', 'write_stdin']);
     for (const name of surfaceDefinition('desktop').tools.filter(name => name !== 'exec')) expect(names, name).not.toContain(name);
   });
 
@@ -809,7 +811,7 @@ describe('surface boundaries', () => {
     const desktopTools = toolList(await desktop('tools/list'));
 
     // Each populated surface includes code mode; find and the shell exec pair remain exclusive.
-    expect(coreTools).toHaveLength(8);
+    expect(coreTools).toHaveLength(9); // session_wait is the ninth Core control-plane tool.
     expect(desktopTools).toHaveLength(BROWSER_TOOLS.length + (IS_WINDOWS ? 16 : process.platform === 'darwin' ? 3 : 1));
 
     // And the size, which is what a discovery pull actually costs the model on every
@@ -1121,6 +1123,7 @@ describe('capability gating', () => {
   it('offers plans and agents only when enabled, without session lookup', async () => {
     expect(toolNames(await core('tools/list'))).not.toContain('session');
     expect(toolNames(await core('tools/list'))).not.toContain('update_plan');
+    expect(toolNames(await core('tools/list'))).not.toContain('session_wait');
     expect(toolNames(await core('tools/list'))).not.toContain('agents');
 
     ctx.sessionTools = true;
@@ -1128,6 +1131,7 @@ describe('capability gating', () => {
     const names = toolNames(await core('tools/list'));
     expect(names).not.toContain('session');
     expect(names).toContain('update_plan');
+    expect(names).toContain('session_wait');
     expect(names).toContain('agents');
   });
 
@@ -3064,6 +3068,299 @@ describe('agent-maintained plans over MCP', () => {
   });
 });
 
+describe('durable wait admission over MCP', () => {
+  it('fails closed when session_wait cannot prove the source turn yet', async () => {
+    ctx.sessionTools = true;
+    const conversationId = 'wait-admission-source';
+    const summary = await createSession({ title: 'wait admission source', conversationId });
+    const requestId = 'wfr_wait_turn_pending';
+    expect(observeRequestCorrelation({
+      requestId,
+      conversationId,
+      sessionId: summary.id,
+      messageId: 'msg-wait-turn-pending',
+      tool: 'session_wait',
+      observedAt: Date.now()
+    })).toBe('stored');
+
+    const reply = await modern(
+      'tools/call',
+      { name: 'session_wait', arguments: { action: 'arm', kind: 'timer', seconds: 60 } },
+      { 'x-request-id': `${requestId}/att1` }
+    );
+    expect(failed(reply)).toBe(true);
+    expect(textOf(reply)).toContain('WAIT_TURN_ID_PENDING');
+  });
+
+  it('keeps a late source request fenced after resolution but admits the new continuation request immediately', async () => {
+    ctx.sessionTools = true;
+    const conversationId = 'wait-resolved-request-fence';
+    const summary = await createSession({ title: 'resolved request fence', conversationId });
+    const now = Date.now();
+    const sourceRequestId = 'wfr_wait_resolved_source';
+    const obligationId = 'obligation-wait-resolved-request';
+    restoreLongRunState({
+      version: 1,
+      savedAt: now,
+      epochs: [{
+        sessionId: summary.id,
+        conversationId,
+        generation: 1,
+        updatedAt: now
+      }],
+      obligations: [{
+        id: obligationId,
+        sessionId: summary.id,
+        conversationId,
+        epochGeneration: 1,
+        reason: 'wait_resolved',
+        state: 'owed',
+        sourceTurnId: 'turn-resolved-source',
+        sourceRequestId,
+        source: 'timer:test',
+        inputId: null,
+        result: 'timer resolved',
+        createdAt: now - 1_000,
+        updatedAt: now,
+        issuedAt: null
+      }],
+      waits: [{
+        id: 'wait-resolved-contract',
+        sessionId: summary.id,
+        conversationId,
+        epochGeneration: 1,
+        obligationId,
+        kind: 'timer',
+        repository: null,
+        runId: null,
+        processId: null,
+        dueAt: now - 1,
+        description: 'resolved request fence test',
+        state: 'resolved',
+        attempts: 0,
+        nextCheckAt: now,
+        lastError: null,
+        result: 'timer resolved',
+        createdAt: now - 1_000,
+        updatedAt: now
+      }]
+    });
+
+    expect(observeRequestCorrelation({
+      requestId: sourceRequestId,
+      conversationId,
+      sessionId: summary.id,
+      messageId: 'msg-wait-resolved-source',
+      tool: 'read',
+      observedAt: Date.now()
+    })).toBe('stored');
+    const stale = await modern(
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } },
+      { 'x-request-id': `${sourceRequestId}/att1` }
+    );
+    expect(failed(stale)).toBe(true);
+    expect(textOf(stale)).toContain('WAIT_ARMED_FINISH_TURN');
+
+    const continuationRequestId = 'wfr_wait_resolved_continuation';
+    expect(observeRequestCorrelation({
+      requestId: continuationRequestId,
+      conversationId,
+      sessionId: summary.id,
+      messageId: 'msg-wait-resolved-continuation',
+      tool: 'read',
+      observedAt: Date.now()
+    })).toBe('stored');
+    const fresh = await modern(
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/src/app.ts'] } },
+      { 'x-request-id': `${continuationRequestId}/att1` }
+    );
+    expect(failed(fresh), textOf(fresh)).toBe(false);
+    // Use an immutable fixture: notes.txt is intentionally clobbered by an earlier patch
+    // regression in this end-to-end file, and this assertion is about authority admission.
+    expect(textOf(fresh)).toContain('export const name');
+  });
+
+  it('does not let a fulfilled wait source request revive itself through session_wait control', async () => {
+    ctx.sessionTools = true;
+    const conversationId = 'wait-fulfilled-retired-source';
+    const summary = await createSession({ title: 'fulfilled retired source', conversationId });
+    const now = Date.now();
+    const sourceRequestId = 'wfr_wait_fulfilled_source';
+    const obligationId = 'obligation-wait-fulfilled-source';
+    restoreLongRunState({
+      version: 1,
+      savedAt: now,
+      epochs: [{
+        sessionId: summary.id,
+        conversationId,
+        generation: 1,
+        updatedAt: now
+      }],
+      obligations: [{
+        id: obligationId,
+        sessionId: summary.id,
+        conversationId,
+        epochGeneration: 1,
+        reason: 'wait_resolved',
+        state: 'fulfilled',
+        sourceTurnId: 'turn-fulfilled-source',
+        sourceRequestId,
+        source: 'timer:test',
+        inputId: '00000000-0000-4000-8000-000000000001',
+        result: 'timer resolved',
+        createdAt: now - 2_000,
+        updatedAt: now,
+        issuedAt: now - 1_000
+      }],
+      waits: [{
+        id: 'wait-fulfilled-source-contract',
+        sessionId: summary.id,
+        conversationId,
+        epochGeneration: 1,
+        obligationId,
+        kind: 'timer',
+        repository: null,
+        runId: null,
+        processId: null,
+        dueAt: now - 1_500,
+        description: 'fulfilled source retirement test',
+        state: 'resolved',
+        attempts: 0,
+        nextCheckAt: now - 1_500,
+        lastError: null,
+        result: 'timer resolved',
+        createdAt: now - 2_000,
+        updatedAt: now - 1_500
+      }]
+    });
+    expect(observeRequestCorrelation({
+      requestId: sourceRequestId,
+      conversationId,
+      sessionId: summary.id,
+      messageId: 'msg-wait-fulfilled-source',
+      tool: 'session_wait',
+      observedAt: Date.now()
+    })).toBe('stored');
+
+    for (const action of ['status', 'cancel'] as const) {
+      const retired = await modern(
+        'tools/call',
+        { name: 'session_wait', arguments: { action } },
+        { 'x-request-id': `${sourceRequestId}/att1` }
+      );
+      expect(failed(retired)).toBe(true);
+      expect(textOf(retired)).toContain('WAIT_SOURCE_RETIRED');
+    }
+
+    const newRequestId = 'wfr_wait_fulfilled_new_turn';
+    expect(observeRequestCorrelation({
+      requestId: newRequestId,
+      conversationId,
+      sessionId: summary.id,
+      messageId: 'msg-wait-fulfilled-new',
+      tool: 'session_wait',
+      observedAt: Date.now()
+    })).toBe('stored');
+    const status = await modern(
+      'tools/call',
+      { name: 'session_wait', arguments: { action: 'status' } },
+      { 'x-request-id': `${newRequestId}/att1` }
+    );
+    expect(failed(status), textOf(status)).toBe(false);
+    expect(textOf(status)).toContain('continuation work is fulfilled');
+  });
+
+  it('hard-fences ordinary tools while an exact durable wait is armed', async () => {
+    ctx.sessionTools = true;
+    const conversationId = 'wait-admission-current';
+    const summary = await createSession({ title: 'wait admission current', conversationId });
+    const now = Date.now();
+    const obligationId = 'obligation-wait-admission';
+    restoreLongRunState({
+      version: 1,
+      savedAt: now,
+      epochs: [{
+        sessionId: summary.id,
+        conversationId,
+        generation: 1,
+        updatedAt: now
+      }],
+      obligations: [{
+        id: obligationId,
+        sessionId: summary.id,
+        conversationId,
+        epochGeneration: 1,
+        reason: 'wait_resolved',
+        state: 'waiting',
+        sourceTurnId: 'turn-wait-source',
+        source: 'timer:test',
+        inputId: null,
+        result: null,
+        createdAt: now,
+        updatedAt: now,
+        issuedAt: null
+      }],
+      waits: [{
+        id: 'wait-admission-contract',
+        sessionId: summary.id,
+        conversationId,
+        epochGeneration: 1,
+        obligationId,
+        kind: 'timer',
+        repository: null,
+        runId: null,
+        processId: null,
+        dueAt: now + 60_000,
+        description: 'admission fence test',
+        state: 'waiting',
+        attempts: 0,
+        nextCheckAt: now + 60_000,
+        lastError: null,
+        result: null,
+        createdAt: now,
+        updatedAt: now
+      }]
+    });
+
+    const readRequest = 'wfr_wait_fenced_read';
+    expect(observeRequestCorrelation({
+      requestId: readRequest,
+      conversationId,
+      sessionId: summary.id,
+      messageId: 'msg-wait-fenced-read',
+      tool: 'read',
+      observedAt: Date.now()
+    })).toBe('stored');
+    const blocked = await modern(
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } },
+      { 'x-request-id': `${readRequest}/att1` }
+    );
+    expect(failed(blocked)).toBe(true);
+    expect(textOf(blocked)).toContain('WAIT_ARMED_FINISH_TURN');
+    expect(textOf(blocked)).toContain('No local tool was run');
+
+    const statusRequest = 'wfr_wait_status_allowed';
+    expect(observeRequestCorrelation({
+      requestId: statusRequest,
+      conversationId,
+      sessionId: summary.id,
+      messageId: 'msg-wait-status',
+      tool: 'session_wait',
+      observedAt: Date.now()
+    })).toBe('stored');
+    const status = await modern(
+      'tools/call',
+      { name: 'session_wait', arguments: { action: 'status' } },
+      { 'x-request-id': `${statusRequest}/att1` }
+    );
+    expect(failed(status), textOf(status)).toBe(false);
+    expect(textOf(status)).toContain('Durable wait timer is waiting');
+  });
+});
+
 describe('exec sessions belong to the chat that opened them', () => {
   beforeEach(() => {
     ctx.readOnly = false;
@@ -3224,6 +3521,34 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(textOf(stale)).toContain('no local tool was run');
   });
 
+  it('waits for late request proof before a superseded old chat can run its first new tool call', async () => {
+    const chatA = 'f0f00015-1111-4111-8111-111111111111';
+    const chatB = 'f0f00016-1111-4111-8111-111111111111';
+    const summary = await createSession({ title: 'late superseded proof', conversationId: chatA });
+    expect(await rebindSession(summary.id, chatA, chatB)).toBe(true);
+
+    const requestId = 'wfr_superseded_late_identity';
+    setTimeout(() => {
+      observeRequestCorrelation({
+        requestId,
+        conversationId: chatA,
+        sessionId: summary.id,
+        messageId: 'late-superseded-message',
+        tool: 'read',
+        observedAt: Date.now()
+      });
+    }, 40).unref?.();
+
+    const reply = await modern(
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } },
+      { 'x-request-id': `${requestId}/att1` }
+    );
+    expect(failed(reply)).toBe(true);
+    expect(textOf(reply)).toContain('CONVERSATION_SUPERSEDED');
+    expect(textOf(reply)).not.toContain('/workspace/notes.txt');
+  });
+
   it('refuses every tool from a chat whose handoff brief has been asked for, until the move is over', async () => {
     resetContinuationsForTests();
     const chatA = 'f0f00007-1111-4111-8111-111111111111';
@@ -3251,8 +3576,14 @@ describe('exec sessions belong to the chat that opened them', () => {
     const afterBrief = await asChat('wfr_compact_a', 'read', { paths: ['/workspace/src/app.ts'] });
     expect(textOf(afterBrief)).toContain('COMPACTION_IN_PROGRESS');
 
-    // The commit hands the refusal over to the superseded attachment for good.
-    expect(await rebindSession(summary.id, chatA, chatB)).toBe(true);
+    // The commit hands the refusal over to the superseded attachment for good. The raw store
+    // seam must carry the exact continuation replacement claim just like production commit does.
+    expect(await rebindSession(summary.id, chatA, chatB, undefined, undefined, {
+      kind: 'continuation',
+      transactionId: opened.token,
+      sourceConversationId: chatA,
+      recoveryGeneration: null
+    })).toBe(true);
     expect(prove('wfr_compact_b', chatB, summary.id)).toBe('stored');
     abortContinuation(opened.token, 'the test moved the session by hand');
     const stale = await asChat('wfr_compact_a', 'read', { paths: ['/workspace/src/app.ts'] });
@@ -3416,6 +3747,11 @@ describe('exec sessions belong to the chat that opened them', () => {
     const replay = await asChat(requestId, 'read', { paths: ['/workspace/src/app.ts'] });
     expect(textOf(replay)).toContain('transport-replay');
     expect(unifiedExecManager.exitedUnread(new Set([id]))).toHaveLength(1);
+    // Receipt retirement deliberately requires a request that started strictly after successful
+    // publication. Date.now() is millisecond-granular, so a sequential call in the same tick is
+    // conservatively indistinguishable from a concurrent request; wait for the next clock tick.
+    const replayReceivedAt = Date.now();
+    await vi.waitFor(() => expect(Date.now()).toBeGreaterThan(replayReceivedAt), { timeout: 1000, interval: 1 });
     const receipt = await asChat(requestId, 'read', { paths: ['/workspace/src/app.ts'] });
     expect(textOf(receipt)).not.toContain('transport-replay');
     expect(unifiedExecManager.exitedUnread(new Set([id]))).toEqual([]);
@@ -3460,6 +3796,12 @@ describe('exec sessions belong to the chat that opened them', () => {
 
     expect(textOf(blocked)).toMatch(/Background session \d+ completed/);
     expect(textOf(blocked)).toContain('owed-');
+
+    // The blocked response also publishes one owed result. Automatic receipt deliberately needs
+    // a later owner request, not a request whose Date.now() start is indistinguishable from the
+    // publication itself. Full-suite load can otherwise place these sequential calls in one ms.
+    const blockedReceivedAt = Date.now();
+    await vi.waitFor(() => expect(Date.now()).toBeGreaterThan(blockedReceivedAt), { timeout: 1000, interval: 1 });
 
     const admitted = await asChat(blockedRequest, 'exec_command', {
       cmd: IS_WINDOWS ? "Write-Output 'admitted-after-drain'" : "printf '%s\\n' admitted-after-drain",

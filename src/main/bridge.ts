@@ -18,7 +18,7 @@ export { setBrowserWorkArea } from './browser-window-layout.js';
 import { pendingBrowserPreferenceRequest, acknowledgeBrowserPreferences } from './browser-preferences.js';
 import { sessionFinishHeld, releaseSessionFinish, getSessionFinishDraft, sessionFinishWaiting } from './session/finish.js';
 import { observeUsage } from './session/usage.js';
-import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, completeBrowserDecision, listInputs, fileSilenceInput, hasQueuedAfterTurnInput, inputBeforeGoal, pendingQueuedPickups, deferSilenceInput, revokeSilenceInputs } from './session/input.js';
+import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, completeBrowserDecision, listInputs, cancelInput, fileSilenceInput, hasQueuedAfterTurnInput, inputBeforeGoal, pendingQueuedPickups, deferSilenceInput, revokeSilenceInputs } from './session/input.js';
 /**
  * The local bridge between the Chrome extension and this app.
  *
@@ -45,6 +45,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 import type { BridgeStatus } from '../shared/types.js';
 import { positionOf } from '../shared/chronology.js';
+import { SELF_HEAL_MARKER_RECONCILE_MS, SELF_HEAL_POST_RELOAD_MS } from '../shared/recovery.js';
 import { CHAT_SILENCE_MS, CONTINUATION_MARKER, isReasoningEffort, normalizedToolOutcome, toolCallSummary,
   type ReasoningEffort, type SessionEvent, type SessionOrigin, type StoredText, type ToolCallRecord } from '../shared/session.js';
 import { isChatBlocked, chatBlockedAt } from './session/blocked-chats.js';
@@ -104,6 +105,7 @@ import {
   conversationWasSuperseded,
   findSessionByConversation,
   getSession,
+  indexedSessions,
   readSessionPlan,
   listUsageSessions,
   readRecentEvents,
@@ -144,6 +146,7 @@ import {
   primeConversationGone,
   primeConversation,
   requestWorkerRevivals,
+  retireWorkerContinuationIfUnsent,
   rollbackWorkerRevivalClaim,
   releaseQuiescentRun,
   retiredWorkerForConversation,
@@ -189,13 +192,34 @@ import {
   type ContinuationSendState
 } from './session/continuation.js';
 import type { ContinuationView } from './session/continuation.js';
-import { noteResumeOpening } from './session/resume-gate.js';
+import { endResumeClaim, noteResumeClaim, noteResumeOpening } from './session/resume-gate.js';
+import { armRecoveryFence, disarmRecoveryFence, recoveryFenceActive } from './session/recovery-fence.js';
+import {
+  beginEmergencyResumeDestinationSend,
+  beginSelfHealingEpisode,
+  bindEmergencyResumeDestination,
+  commitEmergencyResume,
+  dispatchEmergencyResumeDestinationSend,
+  failSelfHealingRecovery,
+  markSoftRecovery,
+  noteSelfHealingProgress,
+  prepareEmergencyResume,
+  releaseEmergencyResumeDestinationSend,
+  reconcileSelfHealingAfterRestart,
+  recoveryStatusLabel
+} from './session/self-healing.js';
 import { readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
 import { APP_VERSION, BRIDGE_PROTOCOL } from './version.js';
 import { conversationHasMcpCallSince } from './session/store.js';
 import { sessionWorkingAt } from '../shared/session-activity.js';
 import { requestCorrelation } from './session/correlation.js';
 import { bindAgentWorkspace } from './workspace.js';
+import {
+  cancelLongRunNow,
+  longRunMessageAuthority,
+  longRunWorkFor,
+  noteLongRunProgressNow
+} from './session/long-run.js';
 
 /** Fixed candidates so the extension can find the app without being told a port. */
 export const DEFAULT_PORTS = [8765, 8766, 8767, 8768, 8769];
@@ -228,6 +252,8 @@ export const STALE_SWARM_MS = 2 * 60_000;
  */
 /** Per-conversation floor between browser reload/open actions, regardless of why they were requested. */
 export const BROWSER_RECOVERY_COOLDOWN_MS = 3 * 60_000;
+/** Four extension retry periods. A claimed soft repair may be ambiguous, but never own custody forever. */
+export const BROWSER_REPAIR_ACK_CUSTODY_MS = 2 * 60_000;
 const STALE_SWARM_SWEEP_MS = 30_000;
 /** /events batches currently between parse and durable/session+worker lifecycle completion. */
 let observationWritesInFlight = 0;
@@ -426,6 +452,19 @@ type CommandSpec =
    * brief got newer — not two fresh chats, which is what keying on the handoff produced.
    */
   | { type: 'resume'; sessionId: string; token: string }
+  /** Fresh provider executor for an existing durable local session. */
+  | {
+      type: 'recovery';
+      sessionId: string;
+      fromConversationId: string;
+      episodeId: string;
+      generation: number;
+      text: string;
+      agent: string | null;
+      runId: string | null;
+      model: string | null;
+      reasoningEffort: ReasoningEffort | null;
+    }
   | { type: 'stop'; sessionId: string; conversationId: string; turnId: string; userMessageId?: string };
 
 interface Command {
@@ -487,7 +526,7 @@ interface DurableCommandRecord {
 }
 
 interface DurableCommandSnapshot {
-  version: 4;
+  version: 5;
   commands: DurableCommandRecord[];
   receipts: CommandReceipt[];
 }
@@ -1275,6 +1314,7 @@ function goalBlockReason(id: string): 'worker' | 'blocked' | '' {
 export type SessionControlsView = {
   sessionId: string;
   recovery?: import('../shared/recovery.js').RecoveryCountdown[];
+  selfHealingStatus: string | null;
   plan: import('../shared/agent-plan.js').AgentPlan | null;
   conversationId: string;
   automation: 'off' | 'goal' | 'loop';
@@ -1325,8 +1365,12 @@ export async function sessionControlsFor(sessionId: string): Promise<SessionCont
   const plan = await readSessionPlan(sessionId);
   const finishWaiting = await sessionFinishWaiting(sessionId, activeTurnId, id);
   const recovery = await sessionRecoveryCountdowns(sessionId, id);
+  const selfHealingStatus = getConfig().multiAgent.selfHealingSessions || session.recovery
+    ? recoveryStatusLabel(session.recovery)
+    : null;
   return { sessionId, plan, conversationId: id, activeTurnId, finishHeld,
     recovery,
+    selfHealingStatus,
     queueAtFinish: !blocked && inputPolicy.queueAtFinish, canInject: !blocked && inputPolicy.canInject,
     canSendDirectly: !blocked && !!inputPolicy.directTurn,
     finishGoalDraft: getSessionFinishDraft(sessionId, activeTurnId),
@@ -1354,6 +1398,67 @@ async function stopUserAnchor(sessionId: string, turnId: string): Promise<string
   }
   return undefined;
 }
+
+/** Stop owns the current turn, so any pre-commit self-healing attempt for that turn is cancelled first. */
+async function cancelSelfHealingForStopNow(
+  sessionId: string,
+  conversationId: string,
+  reason = 'The user stopped the turn.'
+): Promise<boolean> {
+  const session = await getSession(sessionId);
+  const recovery = session?.recovery;
+  if (
+    !session ||
+    session.conversationId !== conversationId ||
+    !recovery ||
+    recovery.previousConversationId !== conversationId ||
+    recovery.replacementConversationId !== null ||
+    recovery.phase === 'healthy' ||
+    recovery.phase === 'recovered' ||
+    recovery.phase === 'recovery_failed' ||
+    recovery.phase === 'reconciling'
+  ) return false;
+
+  const command = commands.find((entry) =>
+    entry.spec.type === 'recovery' &&
+    entry.spec.sessionId === sessionId &&
+    entry.spec.fromConversationId === conversationId &&
+    entry.spec.episodeId === recovery.failureEpisodeId &&
+    entry.spec.generation === recovery.recoveryGeneration
+  ) ?? null;
+  const failed = await failSelfHealingRecovery(
+    sessionId,
+    conversationId,
+    recovery.failureEpisodeId,
+    recovery.recoveryGeneration,
+    recovery.phase,
+    reason
+  );
+  if (!failed) return false;
+
+  endResumeClaim(recovery.failureEpisodeId);
+  if (command) {
+    const receipt: CommandReceipt = {
+      id: command.id,
+      client: command.owner,
+      conversationId: null,
+      outcome: 'terminal-failure',
+      committed: false,
+      error: reason,
+      completedAt: Date.now()
+    };
+    if (!(await finalizeCommand(command, receipt))) {
+      // Session recovery_failed is already the authoritative cancellation. Keeping a stale
+      // command row is safe because recoveryCommandCurrent() now rejects it on every handout
+      // and restart; retain it only so durable receipt persistence can be retried.
+      logWarn(`bridge: stopped recovery ${specKey(command.spec)} but its command receipt is not durable yet`);
+    }
+  }
+  activeUntil.delete(conversationId);
+  repairsInFlight.delete(conversationId);
+  return true;
+}
+
 /** Stop is a request against one exact live turn, never a predicted final boundary. */
 export async function stopSessionTurn(sessionId: string, expectedTurnId: string): Promise<SessionControlsView> {
   const id = await controlledConversation(sessionId);
@@ -1366,6 +1471,8 @@ export async function stopSessionTurn(sessionId: string, expectedTurnId: string)
   await setSessionAutomation(sessionId, 'off');
   await assertCurrent();
   if (continuationForSession(sessionId)) { await cancelResumeNow(sessionId); await assertCurrent(); }
+  await cancelSelfHealingForStopNow(sessionId, id);
+  await assertCurrent();
   const userMessageId = await stopUserAnchor(sessionId, expectedTurnId);
   await assertCurrent();
   const alreadyQueued = commands.some(entry => entry.spec.type === 'stop' && entry.spec.sessionId === sessionId && entry.spec.turnId === expectedTurnId);
@@ -1881,16 +1988,18 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     try { body = await readBody(req); } catch { return json(res, 400, { error: 'bad_request' }, origin); }
     const token = body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>).token : null;
     if (typeof token !== 'string' || token.length > 128) return json(res, 400, { error: 'bad_request' }, origin);
-    const found = [...repairsInFlight].find(([, repair]) => (repair.reason === 'unattributed' || repair.reason === 'assistant-error') && repair.token === token && repair.state === 'handed');
+    const found = [...repairsInFlight].find(([, repair]) => repair.token === token && repair.state === 'handed');
     if (!found) return json(res, 200, { allowed: false }, origin);
     const [conversationId, repair] = found;
     const session = await getSession(repair.sessionId);
     const current = session?.conversationId === conversationId && !isChatBlocked(conversationId) &&
       !stopRequestedFor(conversationId) && await attributionRepairAllowed(repair, session) &&
-      await assistantRepairCurrent(conversationId, repair);
+      await assistantRepairCurrent(conversationId, repair) && await repairReasonCurrent(conversationId, repair);
     const allowed = current && repairsInFlight.get(conversationId) === repair && repair.state === 'handed' && !repair.claimed;
     if (allowed) {
       repair.claimed = true;
+      repair.claimedAt = Date.now();
+      repair.ambiguous = false;
       if (repair.attribution && repair.attribution.incident.firstAttemptAt === null)
         repair.attribution.incident.firstAttemptAt = Date.now();
     }
@@ -2040,7 +2149,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
             conversationId: id,
             sessionId: result.sessionId!,
             ...candidate,
-            blocked: superseded || goalFencedChat(id)
+            blocked: superseded || recoveryFenceActive(id) || goalFencedChat(id)
           });
         }
       } catch (err) {
@@ -2075,7 +2184,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // journal is allowed to split one turn's observations across adjacent HTTP batches, so
       // reconcile against the just-written durable session rather than treating one transport
       // envelope as a lifecycle boundary.
-      if (agent && agent !== PRIME_ID && result.sessionId) {
+      if (agent && agent !== PRIME_ID && result.sessionId && !recoveryFenceActive(id)) {
         if (!(await reconcileWorkerFinish(id, result.sessionId, observations))) {
           return json(res, 503, { error: 'worker_state_not_durable', retryable: true }, origin);
         }
@@ -2085,7 +2194,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // no input row changed: finish stages and after-turn sends can now be claimed.
       // Publish that boundary to the existing wake channel instead of waiting for
       // the extension's idle maintenance poll. Claims still recheck exact state.
-      committed = { sessionId: result.sessionId, stored: result.stored, wake: !superseded && result.activity.terminal };
+      committed = {
+        sessionId: result.sessionId,
+        stored: result.stored,
+        wake: !superseded && !recoveryFenceActive(id) && result.activity.terminal
+      };
     } finally {
       observationWritesInFlight -= 1;
     }
@@ -2328,6 +2441,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           receipt.destinationSend.conversationId === id && receipt.destinationSend.messageId === resumeUserMessage.messageId) {
         bootstrapMessageId = resumeUserMessage.messageId;
       }
+    } else if (summary?.conversationId === id && summary.recovery?.replacementConversationId === id &&
+        (summary.recovery.phase === 'reconciling' || summary.recovery.phase === 'recovered') && openingUserMessage?.messageId) {
+      const marker = new RegExp(`^\\s*\\[\\[CLF-EMERGENCY-RESUME:${summary.recovery.failureEpisodeId.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\]\\]`);
+      if (!openingUserMessage.message.truncated && marker.test(openingUserMessage.message.text)) {
+        bootstrapMessageId = openingUserMessage.messageId;
+      }
     } else if (summary?.conversationId === id && summary.origin?.kind === 'worker' && summary.origin.agentId && openingUserMessage?.messageId) {
       const original = openingUserMessage.message.text.trimStart();
       const authored = userPromptText(original) ?? original;
@@ -2519,7 +2638,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // Session origin survives A -> B. The atomic rebind records which handoff
         // became this current chat; a desktop-origin session can therefore be resumed.
         bootstrap: summary?.conversationId === id && summary.lastCommittedResumeHandoffId
-          ? 'resume' : summary?.origin?.kind ?? null,
+          ? 'resume'
+          : summary?.conversationId === id && summary.recovery?.replacementConversationId === id &&
+              (summary.recovery.phase === 'reconciling' || summary.recovery.phase === 'recovered')
+            ? 'recovery'
+            : summary?.origin?.kind ?? null,
         // Which worker this chat is, for the page's fold of the bootstrap. From the durable
         // origin, so a reloaded worker tab — which no longer holds its command — still knows.
         bootstrapAgent: summary?.origin?.kind === 'worker' ? summary.origin.agentId ?? null : null,
@@ -3026,6 +3149,214 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       },
       origin
     );
+  }
+
+  /**
+   * Persists the irreversible Emergency Resume Send boundary before content.js may click, or
+   * releases that exact browser attempt only when the owning page positively proves no click
+   * occurred. The bridge command lease and the session recovery WAL move under one serialized
+   * command transition so a crash can leave at most a conservative leased/no-replay state.
+   */
+  if (route === '/recovery/send' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try {
+      body = (await readBody(req)) as Record<string, unknown>;
+    } catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    const id = typeof body['id'] === 'string' ? body['id'] : '';
+    const client = typeof body['client'] === 'string' ? body['client'].slice(0, 128) : '';
+    const action = body['action'] === 'dispatch' || body['action'] === 'release' ? body['action'] : null;
+    if (!id || !client || !action) return json(res, 400, { error: 'bad_recovery_send' }, origin);
+    const command = commands.find((entry) => entry.id === id) ?? null;
+    if (!command || command.spec.type !== 'recovery') return json(res, 404, { error: 'no_such_command' }, origin);
+    const recoverySpec = command.spec;
+    if (command.owner !== client || command.claimedAt === null) {
+      return json(res, 409, { error: 'recovery_command_owner_changed', disposition: 'retain' }, origin);
+    }
+    if (!(await recoveryCommandCurrent(command.spec))) {
+      return json(res, 409, { error: 'recovery_command_not_current', disposition: 'terminal' }, origin);
+    }
+    if (action === 'dispatch') {
+      const dispatched = await writeCommandTransition(command, async () => {
+        if (!commands.includes(command) || command.owner !== client || command.claimedAt === null) return false;
+        return dispatchEmergencyResumeDestinationSend(
+          recoverySpec.sessionId,
+          recoverySpec.episodeId,
+          recoverySpec.generation,
+          command.id
+        );
+      });
+      if (!dispatched) return json(res, 409, { error: 'recovery_send_reclaimed', disposition: 'retain' }, origin);
+      noteResumeClaim(recoverySpec.episodeId);
+      return json(res, 200, { armed: true }, origin);
+    }
+
+    const released = await writeCommandTransition(command, async () => {
+      if (!commands.includes(command) || command.owner !== client || command.claimedAt === null) return false;
+      if (!(await releaseEmergencyResumeDestinationSend(
+        recoverySpec.sessionId,
+        recoverySpec.episodeId,
+        recoverySpec.generation,
+        command.id
+      ))) return false;
+      const record: DurableCommandRecord = {
+        ...durableCommand(command),
+        phase: 'queued',
+        claimedAt: null,
+        owner: null
+      };
+      try {
+        await writeDurableNow(COMMANDS_STATE, commandSnapshot({ commandOverride: { command, record } }));
+      } catch (err) {
+        // Session WAL already proves no native click occurred. Keep the old in-memory lease and
+        // let startup recover the conservative disk row instead of publishing a re-open that was
+        // not itself made durable.
+        logWarn(`bridge: could not durably release ${specKey(command.spec)} after a proven no-Send — ${err instanceof Error ? err.message : String(err)}`);
+        return false;
+      }
+      command.claimedAt = null;
+      command.owner = null;
+      command.lastError = null;
+      if (command.timer) clearTimeout(command.timer);
+      command.timer = null;
+      return true;
+    });
+    if (!released) return json(res, 409, { error: 'recovery_send_not_releasable', disposition: 'retain' }, origin);
+    changed();
+    scheduleDeliver();
+    return json(res, 200, { released: true }, origin);
+  }
+
+  /**
+   * Recovers an Emergency Resume after the irreversible browser Send crossed but its ACK did not.
+   *
+   * The replacement page proves the durable episode marker from ChatGPT's own stable user-message
+   * model and supplies the conversation id it is currently showing. That evidence authorizes no
+   * new transfer primitive: this route still commits through commitEmergencyResume(), whose
+   * session episode/generation CAS and destination collision checks remain the sole A→B authority.
+   */
+  if (route === '/recovery/reconcile' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try {
+      body = (await readBody(req)) as Record<string, unknown>;
+    } catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    const episodeId = typeof body['episodeId'] === 'string' && /^[0-9a-f-]{8,64}$/i.test(body['episodeId'])
+      ? body['episodeId'] : '';
+    const destination = conversationId(body['conversationId']);
+    const messageId = typeof body['messageId'] === 'string' && body['messageId'].length <= 256 ? body['messageId'] : '';
+    const client = typeof body['client'] === 'string' ? body['client'].slice(0, 128) : '';
+    const commandId = typeof body['commandId'] === 'string' && body['commandId'].length <= 128 ? body['commandId'] : '';
+    if (!episodeId || !destination || !messageId) return json(res, 400, { error: 'bad_recovery_proof' }, origin);
+
+    const sessions = await indexedSessions();
+    const session = sessions.find((entry) => entry.recovery?.failureEpisodeId === episodeId) ?? null;
+    const recovery = session?.recovery;
+    if (!session || !recovery) return json(res, 404, { error: 'no_such_recovery', disposition: 'terminal' }, origin);
+    const alreadyAttached = session.conversationId === destination && recovery.replacementConversationId === destination &&
+      (recovery.phase === 'reconciling' || recovery.phase === 'recovered');
+    if (!alreadyAttached && (session.conversationId !== recovery.previousConversationId || recovery.phase !== 'hard_recovery')) {
+      return json(res, 409, { error: 'recovery_not_claimable', disposition: 'terminal' }, origin);
+    }
+    const command = commands.find((entry) => entry.spec.type === 'recovery' &&
+      entry.spec.sessionId === session.id && entry.spec.episodeId === episodeId) ?? null;
+    if (command && command.spec.type === 'recovery' && command.spec.generation !== recovery.recoveryGeneration) {
+      return json(res, 409, { error: 'recovery_command_not_current', disposition: 'terminal' }, origin);
+    }
+    const proofCommandId = commandId || (
+      command && client && command.owner === client && command.claimedAt !== null ? command.id : ''
+    );
+    if (!alreadyAttached && recovery.destinationSend.state === 'attempted-unresolved' && proofCommandId &&
+        recovery.destinationSend.commandId === proofCommandId) {
+      // A stable provider-authored marker proves native Send crossed even if a previous extension
+      // version did not persist the pre-click dispatch checkpoint. Advance only this same command;
+      // no browser action is repeated.
+      await dispatchEmergencyResumeDestinationSend(
+        session.id,
+        episodeId,
+        recovery.recoveryGeneration,
+        proofCommandId
+      );
+    }
+    const afterProof = (await getSession(session.id))?.recovery ?? recovery;
+    if (!alreadyAttached && afterProof.destinationSend.state !== 'dispatched-unresolved' && afterProof.destinationSend.state !== 'sent') {
+      return json(res, 409, { error: 'recovery_send_not_dispatched', disposition: 'retain' }, origin);
+    }
+    if (!alreadyAttached && (!proofCommandId || afterProof.destinationSend.commandId !== proofCommandId)) {
+      return json(res, 409, { error: 'recovery_transaction_changed', disposition: 'retain' }, origin);
+    }
+    if (!alreadyAttached && command && command.spec.type === 'recovery' && !(await recoveryCommandCurrent(command.spec))) {
+      return json(res, 409, { error: 'recovery_command_not_current', disposition: 'terminal' }, origin);
+    }
+    const restoredCustodyOwner = !alreadyAttached && command && command.id === proofCommandId &&
+      command.owner === null && command.claimedAt !== null && client;
+    if (!alreadyAttached && command && (command.id !== proofCommandId || !client ||
+        (command.owner !== client && !restoredCustodyOwner) || command.claimedAt === null)) {
+      // Marker reconciliation is the lost-ACK path of the same page that redeemed this command.
+      // The extension translates document churn into its stable recovery transaction owner. A
+      // copied stable marker is transcript evidence, not command-lease authority: another tab
+      // must never be able to choose B for an episode it did not actually redeem.
+      return json(res, 409, { error: 'recovery_command_owner_changed', disposition: 'retain' }, origin);
+    }
+
+    if (!alreadyAttached) {
+      const bound = await bindEmergencyResumeDestination(
+        session.id,
+        episodeId,
+        afterProof.recoveryGeneration,
+        proofCommandId,
+        destination,
+        messageId
+      );
+      if (!bound) return json(res, 409, { error: 'recovery_destination_conflict', disposition: 'terminal' }, origin);
+    } else {
+      // Attach the provider message id if the ACK won without one. This is idempotent and cannot
+      // choose a different destination because the session already names B.
+      await bindEmergencyResumeDestination(
+        session.id,
+        episodeId,
+        recovery.recoveryGeneration,
+        recovery.destinationSend.commandId,
+        destination,
+        messageId
+      );
+    }
+    const result = await commitEmergencyResume(session.id, episodeId, destination);
+    if (result.status === 'retryable') {
+      return json(res, 503, { error: 'recovery_commit_retryable', retryable: true }, origin);
+    }
+    if (result.status === 'rejected') {
+      return json(res, 409, { error: 'recovery_commit_rejected', disposition: 'terminal' }, origin);
+    }
+    await noteChatOrigin(destination, {
+      kind: 'recovery',
+      fromSessionId: session.id,
+      agentId: recovery.agentLineage?.role === 'worker' ? recovery.agentLineage.agentId : null,
+      task: ''
+    }).catch((err: Error) => logWarn(`could not record recovered chat origin: ${err.message}`));
+    endResumeClaim(episodeId);
+    retireRecoveredSource(recovery.previousConversationId);
+    armResumedChat(session.id, destination);
+    if (!command || command.spec.type !== 'recovery') {
+      return json(res, 200, { committed: true, conversationId: destination }, origin);
+    }
+    const receipt: CommandReceipt = {
+      id: command.id,
+      client: client || command.owner,
+      conversationId: destination,
+      outcome: 'committed',
+      committed: true,
+      error: null,
+      completedAt: Date.now()
+    };
+    if (!(await finalizeCommand(command, receipt))) {
+      return json(res, 503, { error: 'command_receipt_not_durable', retryable: true }, origin);
+    }
+    return json(res, 200, { committed: true, conversationId: destination }, origin);
   }
 
   /**
@@ -3550,6 +3881,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     tidyCommands();
     const wanted = typeof body['id'] === 'string' ? body['id'] : '';
     const client = typeof body['client'] === 'string' ? body['client'].slice(0, 64) : '';
+    const recoveryOwner = typeof body['recoveryOwner'] === 'string'
+      ? body['recoveryOwner'].slice(0, 128)
+      : '';
     const reportedConversation = body['conversationId'] === undefined ? null : conversationId(body['conversationId']);
     if (body['conversationId'] !== undefined && !reportedConversation) {
       return json(res, 400, { error: 'bad_conversation_id' }, origin);
@@ -3558,6 +3892,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!command) {
       // Cancelled, superseded, already sent, or from a previous run of the app. The page
       // does nothing, which is the point: a stale marker must never type anything.
+      return json(res, 404, { error: 'no_such_command' }, origin);
+    }
+    // Current extension supplies a transaction owner stable across document reloads. A content
+    // script from the immediately previous protocol may omit it; its one-document client remains
+    // usable until that document dies, and a later stable marker still has to pass the WAL CAS.
+    const leaseOwner = command.spec.type === 'recovery' ? (recoveryOwner || client) : client;
+    if (command.spec.type === 'recovery' && !(await recoveryCommandCurrent(command.spec))) {
+      retire(command, 'its self-healing episode is no longer current');
       return json(res, 404, { error: 'no_such_command' }, origin);
     }
     if (command.spec.type === 'stop') {
@@ -3576,11 +3918,27 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (command.spec.type === 'resume' && !(resumeFence && sendUnattempted(resumeFence.destinationSend))) {
       return json(res, 409, { error: 'command_already_sent', final: true }, origin);
     }
-    if (command.spec.type === 'revive' && !revivalFor(command.spec.agent, command.spec.runId)) {
-      // tidyCommands() above normally retires these. This is the fail-closed twin of that:
-      // an empty revival has no message of the prime's to type, and a page must never be
-      // handed a command that would put nothing, or scaffolding alone, into a real chat.
-      return json(res, 404, { error: 'no_such_command' }, origin);
+    if (command.spec.type === 'revive') {
+      const revival = revivalFor(command.spec.agent, command.spec.runId);
+      if (!revival) {
+        // tidyCommands() above normally retires these. This is the fail-closed twin of that:
+        // an empty revival has no message of the prime's to type, and a page must never be
+        // handed a command that would put nothing, or scaffolding alone, into a real chat.
+        return json(res, 404, { error: 'no_such_command' }, origin);
+      }
+      if (!revivalLongRunAuthorityCurrent(revival)) {
+        // A durable browser owner means an earlier redeem crossed the command-lease boundary.
+        // Its HTTP response may have been lost after payload disclosure, so stale long-run
+        // authority cannot prove this wake was unsent. Preserve the exact command + broker row as
+        // ambiguous custody until the existing deadline/reconciliation path settles it.
+        if (command.owner !== null) {
+          return json(res, 409, { error: 'command_authority_revoked', final: true }, origin);
+        }
+        await cleanupRevokedLongRunRevival(revival, 'its durable long-run authority was revoked before browser redeem');
+        retire(command, 'its durable long-run authority was revoked before browser redeem');
+        requestWorkerRevivals([command.spec.agent], command.spec.runId);
+        return json(res, 404, { error: 'no_such_command' }, origin);
+      }
     }
     if (
       reportedConversation &&
@@ -3607,7 +3965,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // The bootstrap has provably not been typed yet, so a fresh document may take the tab's
     // place — the page that held it is gone, or was never able to type at all.
     const resumeTakeover = Boolean(resumeFence && sendUnattempted(resumeFence.destinationSend));
-    if (command.owner && command.owner !== client && !resumeTakeover) {
+    if (command.owner && command.owner !== leaseOwner && !resumeTakeover) {
       return json(res, 409, { error: 'command_taken' }, origin);
     }
     // Renew rather than count another attempt: the app already spent one opening this page,
@@ -3617,11 +3975,24 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (command.spec.type === 'revive') {
       const claimed = await persistRevivalRedeem(command, client, claimedAt);
       if (claimed === 'stale') {
-        // A proven MCP call won `waking -> active` before this browser claimed the wake. No
-        // payload has escaped, so the page must not type the same queued words as a second user
-        // message. Retire the now-meaningless bridge command without failing the active worker.
-        retire(command, 'its worker became active before the browser claimed the wake');
+        // A proven MCP call, Stop, or another certified progress event won before browser
+        // payload disclosure. Retire the command and remove any still-unsent long-run row.
+        const revival = revivalFor(command.spec.agent, command.spec.runId);
+        if (revival) {
+          await cleanupRevokedLongRunRevival(revival, 'its durable long-run authority changed during browser redeem');
+        }
+        retire(command, 'its worker or durable long-run authority changed before browser claim completed');
+        requestWorkerRevivals([command.spec.agent], command.spec.runId);
         return json(res, 404, { error: 'no_such_command' }, origin);
+      }
+      if (claimed === 'authority-stale-after-lease') {
+        // The durable browser lease exists, so this redeem (or an earlier same-owner response)
+        // could already have exposed the payload. Renew the live timer exactly once from the
+        // durable claimedAt boundary, then preserve ambiguous custody without re-issuing text.
+        // Later retries are rejected by the preflight owner/stale fence above and cannot extend it.
+        armDeadline(command);
+        changed();
+        return json(res, 409, { error: 'command_authority_revoked', final: true }, origin);
       }
       if (claimed === 'taken') return json(res, 409, { error: 'command_taken' }, origin);
       if (claimed === 'broker-not-durable') {
@@ -3630,8 +4001,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       if (claimed === 'lease-not-durable') {
         return json(res, 503, { error: 'command_lease_not_durable', retryable: true }, origin);
       }
-    } else if (!(await persistCommandLease(command, client, claimedAt, resumeTakeover))) {
-      if (command.owner && command.owner !== client && !resumeTakeover) {
+    } else if (!(await persistCommandLease(command, leaseOwner, claimedAt, resumeTakeover))) {
+      if (command.owner && command.owner !== leaseOwner && !resumeTakeover) {
         return json(res, 409, { error: 'command_taken' }, origin);
       }
       return json(res, 503, { error: 'command_lease_not_durable', retryable: true }, origin);
@@ -3664,6 +4035,23 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         return json(res, 503, { error: 'continuation_claim_not_durable', retryable: true }, origin);
       }
     }
+    if (command.spec.type === 'recovery') {
+      const recoverySpec = command.spec;
+      const begun = await writeCommandTransition(command, async () => {
+        if (!commands.includes(command) || command.owner !== leaseOwner) return false;
+        return !!(await beginEmergencyResumeDestinationSend(
+          recoverySpec.sessionId,
+          recoverySpec.episodeId,
+          recoverySpec.generation,
+          command.id
+        ));
+      });
+      if (!begun) return json(res, 409, { error: 'recovery_send_not_available' }, origin);
+      // The 60-second recorder gate is a liveness lease, not the recovery transaction itself.
+      // Renew it after the durable browser redeem so a slow but still-owned composer cannot let
+      // B's first observations outrun the 90-second command lease.
+      noteResumeClaim(recoverySpec.episodeId);
+    }
     const described = describe(command, client, claimedSummary);
     if (described.text && command.spec.type === 'worker') {
       // A newly spawned worker gets setup once. Revival and Compact & Resume
@@ -3673,7 +4061,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       const sessionId = source?.conversationId === sourceConversation ? source?.id : undefined;
       described.text = await prepareSessionPrompt(described.text, { sessionId });
     }
-    if (!commands.includes(command) || command.owner !== client) return json(res, 409, { error: 'command_taken' }, origin);
+    if (!commands.includes(command) || command.owner !== leaseOwner) return json(res, 409, { error: 'command_taken' }, origin);
     const liveResume = command.spec.type === 'resume' ? continuationByToken(command.spec.token) : null;
     if (command.spec.type === 'resume' && (!liveResume || !sendUnattempted(liveResume.destinationSend)))
       return json(res, 409, { error: 'command_already_sent', final: true }, origin);
@@ -3715,7 +4103,45 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // tab whose model can never be bound to the worker/session it was opened for. Legacy
     // protocol pages omitted client and keep their old idempotent no-op response.
     if (!ownedCommand && client) {
-      return json(res, 404, { error: 'no_such_command' }, origin);
+      // The browser ACK outbox survives both app and browser restarts. If the command ledger was
+      // lost after native Send crossed, the session WAL's exact destination command id is enough
+      // to finish the same transaction without reopening or re-sending the bootstrap.
+      const recoverySession = status === 'sent' && conversation
+        ? (await indexedSessions()).find((entry) =>
+            entry.recovery?.destinationSend.commandId === id &&
+            entry.recovery.failureEpisodeId &&
+            (entry.recovery.destinationSend.state === 'dispatched-unresolved' || entry.recovery.destinationSend.state === 'sent')) ?? null
+        : null;
+      const recovery = recoverySession?.recovery;
+      if (recoverySession && recovery && conversation) {
+        const bound = await bindEmergencyResumeDestination(
+          recoverySession.id,
+          recovery.failureEpisodeId,
+          recovery.recoveryGeneration,
+          id,
+          conversation,
+          null
+        );
+        if (!bound) return json(res, 409, { error: 'recovery_destination_conflict', disposition: 'terminal' }, origin);
+        const result = await commitEmergencyResume(recoverySession.id, recovery.failureEpisodeId, conversation);
+        if (result.status === 'retryable') {
+          return json(res, 503, { error: 'recovery_commit_retryable', retryable: true }, origin);
+        }
+        if (result.status === 'rejected') {
+          return json(res, 409, { error: 'recovery_commit_rejected', disposition: 'terminal' }, origin);
+        }
+        await noteChatOrigin(conversation, {
+          kind: 'recovery',
+          fromSessionId: recoverySession.id,
+          agentId: recovery.agentLineage?.role === 'worker' ? recovery.agentLineage.agentId : null,
+          task: ''
+        }).catch((err: Error) => logWarn(`could not record recovered chat origin: ${err.message}`));
+        endResumeClaim(recovery.failureEpisodeId);
+        retireRecoveredSource(recovery.previousConversationId);
+        armResumedChat(recoverySession.id, conversation);
+        return json(res, 200, { ok: true, outcome: 'committed', committed: true, conversationId: conversation }, origin);
+      }
+      return json(res, 404, { error: 'no_such_command', disposition: 'retain' }, origin);
     }
     if (!ownedCommand) {
       // Compatibility for an already-open legacy page that predates document ids: historically
@@ -3729,7 +4155,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // the command has since been superseded/released or another document owns it: accepting
     // a delayed ACK from the old page could otherwise bind a worker or commit a continuation
     // to the wrong chat after ownership had moved.
-    if (ownedCommand && client && ownedCommand.owner !== client) {
+    const restoredRecoveryCustody = ownedCommand?.spec.type === 'recovery' && ownedCommand.owner === null &&
+      ownedCommand.claimedAt !== null && (await getSession(ownedCommand.spec.sessionId))?.recovery?.destinationSend.commandId === ownedCommand.id;
+    if (ownedCommand && client && ownedCommand.owner !== client && !restoredRecoveryCustody) {
       return json(res, 409, { error: 'command_owner_changed' }, origin);
     }
     if (ownedCommand && client && ownedCommand.claimedAt === null) {
@@ -3749,7 +4177,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // both in hand, and so the only chance to name that chat after the work rather
     // than after the bootstrap prompt about to be typed into it.
     const opened = status === 'sent' ? await commandOrigin(id) : null;
-    if (conversation && opened) {
+    if (conversation && opened && ownedCommand.spec.type !== 'recovery') {
       await noteChatOrigin(conversation, opened).catch((err: Error) =>
         logWarn(`could not record the origin of a fresh chat: ${err.message}`)
       );
@@ -3823,6 +4251,62 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
             outcome: 'terminal-failure',
             committed: false,
             error: why,
+            completedAt: Date.now()
+          };
+        }
+      } else if (command.spec.type === 'recovery') {
+        if (!conversation) return json(res, 503, { error: 'conversation_required', retryable: true }, origin);
+        const beforeBind = (await getSession(command.spec.sessionId))?.recovery;
+        if (beforeBind?.destinationSend.state === 'attempted-unresolved' &&
+            beforeBind.destinationSend.commandId === command.id) {
+          // A successful page ACK is itself proof that native Send crossed. Current extension
+          // persists this before click; this fallback only lets an already-open previous-protocol
+          // page finish the same command without weakening the crash-safe current path.
+          await dispatchEmergencyResumeDestinationSend(
+            command.spec.sessionId,
+            command.spec.episodeId,
+            command.spec.generation,
+            command.id
+          );
+        }
+        const bound = await bindEmergencyResumeDestination(
+          command.spec.sessionId,
+          command.spec.episodeId,
+          command.spec.generation,
+          command.id,
+          conversation,
+          null
+        );
+        if (!bound) {
+          // Another B/C candidate already won the durable destination CAS. This page is a losing
+          // executor, not evidence that the recovery itself failed; never roll the canonical
+          // episode back because a concurrent ACK lost ownership.
+          return json(res, 409, { error: 'recovery_destination_conflict', disposition: 'terminal' }, origin);
+        }
+        const result = await commitEmergencyResume(command.spec.sessionId, command.spec.episodeId, conversation);
+        if (result.status === 'retryable') {
+          logWarn(`bridge: emergency resume for ${command.spec.sessionId} remains retryable — ${result.reason}`);
+          return json(res, 503, { error: 'recovery_commit_retryable', retryable: true }, origin);
+        }
+        if (result.status === 'rejected') {
+          return json(res, 409, { error: 'recovery_commit_rejected', disposition: 'terminal' }, origin);
+        } else {
+          await noteChatOrigin(conversation, {
+            kind: 'recovery',
+            fromSessionId: command.spec.sessionId,
+            agentId: command.spec.agent,
+            task: ''
+          }).catch((err: Error) => logWarn(`could not record recovered chat origin: ${err.message}`));
+          endResumeClaim(command.spec.episodeId);
+          retireRecoveredSource(command.spec.fromConversationId);
+          armResumedChat(command.spec.sessionId, result.conversationId);
+          receipt = {
+            id,
+            client: client || command.owner,
+            conversationId: result.conversationId,
+            outcome: 'committed',
+            committed: true,
+            error: null,
             completedAt: Date.now()
           };
         }
@@ -3946,6 +4430,25 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         }
         }
       }
+    } else if (command.spec.type === 'recovery') {
+      const why = error ? `the browser could not start the recovery chat — ${error}` : 'the browser could not start the recovery chat';
+      const failed = await failRecoveryCommand(command.spec, why);
+      if (failed === 'retryable') {
+        return json(res, 503, { error: 'recovery_failure_not_durable', retryable: true }, origin);
+      }
+      if (failed === 'stale') {
+        return json(res, 409, { error: 'stale_recovery_result' }, origin);
+      }
+      endResumeClaim(command.spec.episodeId);
+      receipt = {
+        id,
+        client: client || command.owner,
+        conversationId: conversation,
+        outcome: 'terminal-failure',
+        committed: false,
+        error: why,
+        completedAt: Date.now()
+      };
     } else if (command.spec.type === 'resume') {
       const state = continuationByToken(command.spec.token);
       if (state?.state === 'committed') {
@@ -4078,6 +4581,27 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   return json(res, 404, { error: 'not_found' }, origin);
 }
 
+/** Final action-boundary fence shared by every browser-mutating repair reason. */
+async function repairReasonCurrent(conversationId: string, repair: Repair): Promise<boolean> {
+  if (repair.reason === 'goal') {
+    const pickup = (await owedPickups(Date.now())).get(conversationId);
+    const watch = goalWatch.get(conversationId);
+    return !!pickup && !!watch && pickup.replyId === watch.replyId && Date.now() >= pickup.listenUntil &&
+      !continuationForSession(pickup.sessionId) && (pickup.queued || !goalDraftBusy(conversationId));
+  }
+  if (repair.reason === 'compaction') {
+    const ticket = continuationForSession(repair.sessionId);
+    return !!ticket && ticket.from === conversationId && ticket.state === 'awaiting-summary';
+  }
+  if (repair.reason === 'silence') {
+    const grant = activeUntil.get(conversationId);
+    return grant?.sessionId === repair.sessionId && runningToolCalls(conversationId) === 0;
+  }
+  // no-tab is retired by first-hand activity before this route; attribution/error have their
+  // stronger predicates above. Re-checking exact repair identity below fences every late claim.
+  return true;
+}
+
 // ------------------------------------------------------------ stale swarm
 
 interface DurableQuiescence {
@@ -4166,23 +4690,100 @@ async function durableQuiescence(conversationId: string, now: number): Promise<D
  */
 export async function sweepStaleSwarm(now = Date.now()): Promise<boolean> {
   const silent = await inspectSilentChats(now);
+  const emergency = await startEmergencyRecoveryForSpent(silent.spent, now);
+  const fallbackSpent = emergency.fallback;
   // A Goal/Loop chat that is spent is not abandoned: the loop owes it the next message.
-  await fileSilenceTickets(silent.spent, now);
+  await fileSilenceTickets(fallbackSpent, now);
   // Beside the silence pass rather than inside it: they measure the same quiet from opposite
   // ends of a turn — one an answer that never arrived, one an answer that arrived and was never
   // picked up — and a chat can only ever be in one of those states.
   const goalsQueued = await inspectOwedGoals(now);
   const compactionsQueued = await inspectOwedCompactions(now);
 
-  const silenceChanged = silent.queued || silent.spent.length > 0 || goalsQueued || compactionsQueued;
+  const silenceChanged = silent.queued || silent.spent.length > 0 || emergency.recovering.length > 0 || goalsQueued || compactionsQueued;
   if (inFlightMcpRequests() > 0 || observationWritesInFlight > 0) return silenceChanged;
   let brokerChanged = false;
   for (const runId of activeRunIds()) {
     if (swarmTransferActive(runId)) continue;
-    brokerChanged = await sweepOwnedSwarm(runId, silent.spent, now) || brokerChanged;
+    brokerChanged = await sweepOwnedSwarm(runId, fallbackSpent, now) || brokerChanged;
   }
-  finishSilentChats(silent.spent);
+  finishSilentChats(fallbackSpent);
   return silenceChanged || brokerChanged;
+}
+
+/**
+ * Converts a spent one-shot reload into Emergency Resume when the setting is enabled.
+ *
+ * A local/MCP request that can still be committing keeps the old executor fenced but alive; the
+ * next maintenance pass rechecks it. Once the fresh-chat command exists, its durable command id
+ * and recovery episode own the attempt, so later sweeps observe the same attempt instead of
+ * opening another tab. A terminal recovery failure falls back to the pre-existing abandonment /
+ * worker-sleep behavior for this exact episode.
+ */
+async function startEmergencyRecoveryForSpent(
+  spent: readonly string[],
+  now: number
+): Promise<{ recovering: string[]; fallback: string[] }> {
+  if (!getConfig().multiAgent.selfHealingSessions) return { recovering: [], fallback: [...spent] };
+  const recovering: string[] = [];
+  const fallback: string[] = [];
+  for (const conversationId of spent) {
+    if (isChatBlocked(conversationId) || stopRequestedFor(conversationId)) {
+      fallback.push(conversationId);
+      continue;
+    }
+    const session = await findSessionByConversation(conversationId, { requireUnique: true });
+    if (!session || session.conversationId !== conversationId || session.lastTurnOutcome === 'stopped') {
+      fallback.push(conversationId);
+      continue;
+    }
+    // Do not even snapshot a new recovery episode while a local call can still acquire durable
+    // attribution. A mutation can have completed but its record may still be settling; taking the
+    // safety snapshot in that window can freeze an earlier read-only call as SAFE_RETRY. Unknown
+    // owners count conservatively for this chat, while a proven other-worker call does not.
+    if (runningToolCalls(conversationId) > 0 || settlingToolCalls(conversationId) > 0 || observationWritesInFlight > 0) {
+      const grant = activeUntil.get(conversationId);
+      if (grant) grant.until = Math.max(grant.until, now + GOAL_QUIET_MS);
+      recovering.push(conversationId);
+      continue;
+    }
+    let episode = session.recovery;
+    if (!episode || episode.previousConversationId !== conversationId ||
+        (episode.phase !== 'suspected_stall' && episode.phase !== 'soft_recovery' &&
+         episode.phase !== 'hard_recovery' && episode.phase !== 'reconciling' && episode.phase !== 'recovery_failed')) {
+      episode = await beginSelfHealingEpisode(session.id, conversationId, 'silence', session.lastToolCallAt);
+    }
+    if (!episode || episode.phase === 'recovery_failed') {
+      fallback.push(conversationId);
+      continue;
+    }
+    if (episode.phase === 'reconciling') {
+      recovering.push(conversationId);
+      continue;
+    }
+    const queued = await queueEmergencyResume(session.id, conversationId, episode.failureEpisodeId);
+    if (queued) {
+      recovering.push(conversationId);
+      logInfo(`bridge: ${conversationId} stayed silent after its one reload — opening one fresh executor for session ${session.id}`);
+      continue;
+    }
+    const current = await getSession(session.id);
+    if (current?.recovery?.failureEpisodeId === episode.failureEpisodeId &&
+        (current.recovery.phase === 'hard_recovery' || current.recovery.phase === 'reconciling')) {
+      recovering.push(conversationId);
+    } else {
+      fallback.push(conversationId);
+    }
+  }
+  return { recovering, fallback };
+}
+
+/** Deterministic integration seam for the crash/settling admission contract. */
+export async function startEmergencyRecoveryForSpentForTests(
+  spent: readonly string[],
+  now = Date.now()
+): Promise<{ recovering: string[]; fallback: string[] }> {
+  return startEmergencyRecoveryForSpent(spent, now);
 }
 
 /** Captures one incarnation for all post-await lifecycle checks. */
@@ -4479,6 +5080,15 @@ async function startBridgeOnce(epoch: number): Promise<number | null> {
         // it did not open for this. A worker whose run is gone finds that out the moment it
         // calls the connector, which is the only place it can act from anyway.
         cancelWorkerCommands(reason, undefined, runId);
+        // A worker's self-healing browser transport is part of that exact run too. Once the run
+        // retires there is no durable Worker-N authority left to move into B, so leave no queued
+        // or leased recovery command capable of opening a replacement executor. recoveryCommandCurrent()
+        // is the synchronous fail-closed twin for a redeem already racing this callback.
+        for (const command of [...commands]) {
+          if (command.spec.type === 'recovery' && command.spec.runId === runId && command.spec.agent) {
+            drop(command, `its worker run ended — ${reason}`);
+          }
+        }
       });
       if (staleSwarmTimer) clearInterval(staleSwarmTimer);
       staleSwarmTimer = setInterval(() => {
@@ -4601,6 +5211,7 @@ function specKey(spec: CommandSpec): string {
   if (spec.type === 'stop') return `stop:${spec.sessionId}:${spec.turnId}`;
   if (spec.type === 'worker') return `worker:${spec.runId}:${spec.agent}`;
   if (spec.type === 'revive') return `revive:${spec.runId}:${spec.agent}`;
+  if (spec.type === 'recovery') return `recovery:${spec.sessionId}`;
   return `resume:${spec.sessionId}`;
 }
 
@@ -4646,7 +5257,7 @@ function commandSnapshot(options: {
     receipts = [...receipts.filter((receipt) => receipt.id !== addReceipt.id), addReceipt];
   }
   receipts = receipts.slice(-MAX_COMMAND_RECEIPTS);
-  return { version: 4, commands: records, receipts };
+  return { version: 5, commands: records, receipts };
 }
 
 function persistCommands(): void {
@@ -4704,7 +5315,13 @@ async function persistCommandLease(
   });
 }
 
-type RevivalRedeemResult = 'ok' | 'stale' | 'taken' | 'broker-not-durable' | 'lease-not-durable';
+type RevivalRedeemResult =
+  | 'ok'
+  | 'stale'
+  | 'authority-stale-after-lease'
+  | 'taken'
+  | 'broker-not-durable'
+  | 'lease-not-durable';
 
 /**
  * Makes `/commands/redeem` the wake arbitration cut, including process crashes.
@@ -4743,7 +5360,8 @@ async function persistRevivalRedeem(
     // Re-check after waiting for a prior redeemer. An MCP call is allowed to win only before
     // the browser-owned broker claim is installed.
     const revival = revivalFor(command.spec.agent, command.spec.runId);
-    if (!revival || revival.conversationId !== command.spec.conversationId) return 'stale';
+    if (!revival || revival.conversationId !== command.spec.conversationId ||
+        !revivalLongRunAuthorityCurrent(revival)) return 'stale';
     if (!claimWorkerRevival(command.spec.agent, command.spec.conversationId, command.spec.runId)) return 'stale';
 
     let brokerDurable = false;
@@ -4771,6 +5389,40 @@ async function persistRevivalRedeem(
       return 'broker-not-durable';
     }
 
+    // Stop/progress may have revoked the long-run obligation while the broker fsync above was
+    // in flight. Before any command lease exists, no browser payload has escaped and the claim
+    // can be rolled back. A same-owner retry may already have a durable lease from an earlier
+    // response, however; that is ambiguous custody and must never be rolled back.
+    const afterBroker = revivalFor(command.spec.agent, command.spec.runId);
+    if (!afterBroker || !revivalLongRunAuthorityCurrent(afterBroker)) {
+      if (command.owner !== null) return 'authority-stale-after-lease';
+      const rolledBack = rollbackWorkerRevivalClaim(
+        command.spec.agent,
+        command.spec.conversationId,
+        command.spec.runId
+      );
+      if (rolledBack) {
+        try {
+          await persistCriticalSwarmNow();
+        } catch (err) {
+          logWarn(
+            `bridge: could not persist authority-revocation rollback for ${specKey(command.spec)} — ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+        if (afterBroker) {
+          // afterBroker still names the exact authority rows that were present while this browser
+          // claim was in flight. Once the claim is rolled back, no payload can have escaped, so a
+          // revoked long-run row is provably unsent and may be retired. Recomputing revivalFor()
+          // here would lose that stale UUID because planning correctly filters revoked rows.
+          await cleanupRevokedLongRunRevival(
+            afterBroker,
+            'its durable long-run authority was revoked while the browser claim fsync was pending'
+          );
+        }
+      }
+      return 'stale';
+    }
+
     if (!(await persistCommandLease(command, client, claimedAt))) {
       // Do NOT roll the broker claim back here. It is already the authoritative durable cut.
       // Keeping the worker browser-owned prevents an MCP call from taking the queued text while
@@ -4778,6 +5430,16 @@ async function persistRevivalRedeem(
       // owner remains the only one allowed to finish the wake.
       if (command.owner && command.owner !== client) return 'taken';
       return 'lease-not-durable';
+    }
+
+    // The command lease is now durable but the HTTP response has still not exposed the payload.
+    // Re-check once more to close the Stop/progress race during that second fsync. Do not roll
+    // back here: a same-owner prior redeem may already have received the text, so the lease is
+    // ambiguous custody. Keeping it inert until its existing deadline is safer than pretending
+    // that potentially delivered work can be unsent.
+    const afterLease = revivalFor(command.spec.agent, command.spec.runId);
+    if (!afterLease || !revivalLongRunAuthorityCurrent(afterLease)) {
+      return 'authority-stale-after-lease';
     }
     return 'ok';
   } finally {
@@ -5158,6 +5820,117 @@ export function queueResume(sessionId: string, token: string): BridgeCommand | n
   return describe(command, null);
 }
 
+/**
+ * Queues the one fresh-chat transport owned by a durable self-healing episode.
+ *
+ * The bootstrap was built from local durable evidence before this call. Keying by session keeps
+ * repeated sweeps inside the same episode from opening a second replacement chat.
+ */
+export async function queueEmergencyResume(
+  sessionId: string,
+  fromConversationId: string,
+  episodeId: string
+): Promise<BridgeCommand | null> {
+  if (!getConfig().multiAgent.selfHealingSessions) return null;
+  if (runningToolCalls(fromConversationId) > 0 || settlingToolCalls(fromConversationId) > 0) return null;
+  // Close the zero-inflight race synchronously. From this point A cannot begin another local
+  // operation while the durable hard-recovery transition and browser command are prepared.
+  const transientFence = `queue:${randomBytes(8).toString('hex')}`;
+  armRecoveryFence(fromConversationId, transientFence);
+  let spec: Extract<CommandSpec, { type: 'recovery' }> | null = null;
+  try {
+    spec = await emergencyResumeCommandSpec(sessionId, fromConversationId, episodeId);
+  } finally {
+    disarmRecoveryFence(fromConversationId, transientFence);
+  }
+  if (!spec) {
+    return null;
+  }
+  const command = queue(spec);
+  armDeadline(command);
+  void deliver();
+  return describe(command, null);
+}
+
+/** Builds recovery transport from session-owned evidence without publishing browser work. */
+async function emergencyResumeCommandSpec(
+  sessionId: string,
+  fromConversationId: string,
+  episodeId: string
+): Promise<Extract<CommandSpec, { type: 'recovery' }> | null> {
+  const prepared = await prepareEmergencyResume(sessionId, fromConversationId, episodeId);
+  if (!prepared) return null;
+  const session = await getSession(sessionId);
+  if (!session || session.conversationId !== fromConversationId) return null;
+  const selected = session.selectedModel?.conversationId === fromConversationId ? session.selectedModel : null;
+  return {
+    type: 'recovery',
+    sessionId,
+    fromConversationId,
+    episodeId,
+    generation: prepared.state.recoveryGeneration,
+    text: prepared.text,
+    agent: prepared.lineage?.role === 'worker' ? prepared.lineage.agentId : null,
+    runId: prepared.lineage?.role === 'worker' ? prepared.lineage.runId : null,
+    model: selected?.model ?? null,
+    reasoningEffort: selected?.reasoningEffort ?? null
+  };
+}
+
+/** Exact durable fence for a queued/restored Emergency Resume browser command. */
+async function recoveryCommandCurrent(spec: Extract<CommandSpec, { type: 'recovery' }>): Promise<boolean> {
+  const session = await getSession(spec.sessionId);
+  const recovery = session?.recovery;
+  const workerLineageCurrent = spec.agent === null || Boolean(
+    spec.runId &&
+    swarmRunning(spec.runId) &&
+    recovery?.agentLineage?.role === 'worker' &&
+    recovery.agentLineage.agentId === spec.agent &&
+    recovery.agentLineage.runId === spec.runId &&
+    agentInfoForOwnedConversation(spec.fromConversationId)?.id === spec.agent &&
+    agentInfoForOwnedConversation(spec.fromConversationId)?.runId === spec.runId
+  );
+  return Boolean(
+    session?.conversationId === spec.fromConversationId &&
+    session.lastTurnOutcome !== 'stopped' &&
+    recovery?.failureEpisodeId === spec.episodeId &&
+    recovery.recoveryGeneration === spec.generation &&
+    recovery.previousConversationId === spec.fromConversationId &&
+    workerLineageCurrent &&
+    recovery.phase === 'hard_recovery'
+  );
+}
+
+/**
+ * A terminal browser result may race the stable Emergency Resume marker that already committed B.
+ * Only the exact still-hard generation may be failed. A false CAS is not permission to retire the
+ * command: distinguish a storage/retryable failure from an async callback that simply lost the
+ * ownership race, so stale failure can never overwrite a successful recovery receipt.
+ */
+async function failRecoveryCommand(
+  spec: Extract<CommandSpec, { type: 'recovery' }>,
+  why: string
+): Promise<'failed' | 'stale' | 'retryable'> {
+  const failed = await failSelfHealingRecovery(
+    spec.sessionId,
+    spec.fromConversationId,
+    spec.episodeId,
+    spec.generation,
+    'hard_recovery',
+    why
+  ).catch(() => false);
+  if (failed) return 'failed';
+  const session = await getSession(spec.sessionId).catch(() => null);
+  const recovery = session?.recovery;
+  if (
+    session?.conversationId === spec.fromConversationId &&
+    recovery?.failureEpisodeId === spec.episodeId &&
+    recovery.recoveryGeneration === spec.generation &&
+    recovery.phase === 'hard_recovery'
+  ) return 'retryable';
+  return 'stale';
+}
+
 function queueResumeCommand(sessionId: string, token: string): Command {
   rememberToken(sessionId, token);
   const command = queue({ type: 'resume', sessionId, token });
@@ -5315,6 +6088,7 @@ function pendingBrowserRevival(): {
 function commandHomeConversation(spec: CommandSpec): string | null {
   if (spec.type === 'stop') return spec.conversationId;
   if (spec.type === 'resume') return continuationByToken(spec.token)?.from ?? null;
+  if (spec.type === 'recovery') return spec.fromConversationId;
   // A revival names an existing chat and opens nothing, so it has no successor to place.
   if (spec.type === 'revive') return null;
   return primeConversation(spec.runId);
@@ -5354,10 +6128,11 @@ function pendingBrowserPlacement(conversationId: string | null): {
   delete command.placement;
   const spec = command.spec;
   const worker = spec.type === 'worker';
+  const recovery = spec.type === 'recovery';
   const selection = spec.type === 'resume' ? continuationByToken(spec.token)?.requestedModel : null;
   return {
-    id: command.id, model: worker ? spec.model : selection?.model ?? null,
-    reasoningEffort: worker ? spec.reasoningEffort : selection?.reasoningEffort ?? null,
+    id: command.id, model: worker || recovery ? spec.model : selection?.model ?? null,
+    reasoningEffort: worker || recovery ? spec.reasoningEffort : selection?.reasoningEffort ?? null,
     active: !worker, homeConversationId: placement.conversationId, project: commandProject(command),
     ...(placement.background ? { background: true as const } : {})
   };
@@ -5393,6 +6168,8 @@ interface ActivityGrant {
   thinkingFailed?: true;
   /** Exact source-turn MCP proof; only a full final response consumes its silence window. */
   mcpBacked?: true;
+  /** Derived from durable soft-recovery WAL after restart; this reload is already spent. */
+  selfHealingSoft?: { episodeId: string; generation: number };
 }
 
 const activeUntil = new Map<string, ActivityGrant>();
@@ -5408,9 +6185,15 @@ function grantActivity(conversationId: string, sessionId: string, at = Date.now(
   const ownership = turn ?? (previous?.sessionId === sessionId ? previous : { turnId: null, model: 'unknown' as const });
   if (ownership.model === 'pro' && (isChatBlocked(conversationId) || stopRequestedFor(conversationId))) return;
   const evidenceAt = previous?.sessionId === sessionId && previous.turnId === ownership.turnId ? Math.max(previous.evidenceAt, at) : at;
-  const mcpBacked = ownership.mcpBacked || (previous?.sessionId === sessionId && previous.turnId === ownership.turnId && previous.mcpBacked);
+  const sameTurn = previous?.sessionId === sessionId && previous.turnId === ownership.turnId;
+  const mcpBacked = ownership.mcpBacked || (sameTurn && previous?.mcpBacked);
+  // Activity is a projection, not recovery authority. A reloaded document commonly reports the
+  // same still-open provider turn again; keep the spent soft-recovery marker across that replay
+  // instead of silently refunding the one-reload budget.
+  const selfHealingSoft = sameTurn ? previous?.selfHealingSoft : undefined;
   activeUntil.set(conversationId, { sessionId, evidenceAt, until: evidenceAt + (ownership.model === 'pro' ? PRO_SILENCE_MS : window), turnId: ownership.turnId, model: ownership.model,
-    ...(mcpBacked ? { mcpBacked: true } : {}) });
+    ...(mcpBacked ? { mcpBacked: true } : {}),
+    ...(selfHealingSoft ? { selfHealingSoft } : {}) });
   awaitingReturn.delete(conversationId);
   armSilenceSweep();
   void considerAutomaticCompaction(conversationId, sessionId);
@@ -5640,7 +6423,7 @@ async function fileSilenceTickets(spent: readonly string[], now: number): Promis
     // for any other reason — not a chat the user wants brought back, say — earned no reload
     // and gets no ticket.
     const held = repairsInFlight.get(conversationId);
-    if (held?.reason !== 'silence' || held.state !== 'done') continue;
+    if (held?.reason !== 'silence' || held.state !== 'done' || held.ambiguous) continue;
     const grant = activeUntil.get(conversationId);
     const session = await getSession(held.sessionId);
     if (!session || session.conversationId !== conversationId) continue;
@@ -5691,7 +6474,7 @@ async function fileSilenceInputTicket(conversationId: string, now: number, liste
   const grant = activeUntil.get(conversationId);
   const repair = repairsInFlight.get(conversationId);
   if (!grant?.turnId || (!grant.thinkingFailed && now - grant.evidenceAt < (grant.model === 'other' ? CHAT_SILENCE_MS : PRO_SILENCE_MS)) ||
-      repair?.reason !== 'silence' || repair.state !== 'done' || repair.sessionId !== grant.sessionId) return false;
+      repair?.reason !== 'silence' || repair.state !== 'done' || repair.ambiguous || repair.sessionId !== grant.sessionId) return false;
   const current = () => activeUntil.get(conversationId) === grant && repairsInFlight.get(conversationId) === repair &&
     !stopRequestedFor(conversationId) && !isChatBlocked(conversationId) &&
     !continuationForSession(grant.sessionId) && runningToolCalls(conversationId) === 0 &&
@@ -5723,6 +6506,17 @@ function armResumedChat(sessionId: string, conversationId: string): void {
 /** A real terminal — stable final answer, explicit stop, worker finish — spends the deadline. */
 function endActivity(conversationId: string): void {
   activeUntil.delete(conversationId);
+  armSilenceSweep();
+}
+
+/** Drops every browser-recovery projection owned by an executor after durable A→B rebind. */
+function retireRecoveredSource(conversationId: string): void {
+  activeUntil.delete(conversationId);
+  repairsInFlight.delete(conversationId);
+  awaitingReturn.delete(conversationId);
+  turnRepairSpent.delete(conversationId);
+  goalWatch.delete(conversationId);
+  compactionWatch.delete(conversationId);
   armSilenceSweep();
 }
 
@@ -5851,7 +6645,7 @@ async function sessionRecoveryCountdowns(sessionId: string, conversationId: stri
   if (!source || (session.activeTurnId && session.activeTurnId !== source)) return result;
   if (boundary?.kind === 'turn_end' && boundary.outcome === 'stopped') return result;
   const repair = repairsInFlight.get(conversationId);
-  const confirmed = repair?.reason === 'silence' && repair.state === 'done' && repair.sessionId === sessionId;
+  const confirmed = repair?.reason === 'silence' && repair.state === 'done' && !repair.ambiguous && repair.sessionId === sessionId;
   const owned = grant?.sessionId === sessionId && grant.turnId === source;
   // A native completion without the canonical final is an immediately visible
   // recovery wait. New accepted work advances this same grant (or reopens the
@@ -5879,7 +6673,7 @@ async function sessionRecoveryCountdowns(sessionId: string, conversationId: stri
   const reply = goalPendingReplyFor(conversationId);
   const goalDeadline = goalActiveFor(conversationId) && reply?.silenceSourceTurnId === source ? reply.listenUntil : undefined;
   const failedDeadline = grant?.sessionId === sessionId && grant.turnId === source && grant.thinkingFailed &&
-    repairsInFlight.get(conversationId)?.state === 'done' ? grant.until : undefined;
+    repairsInFlight.get(conversationId)?.state === 'done' && !repairsInFlight.get(conversationId)?.ambiguous ? grant.until : undefined;
   const deadline = queued?.silenceBoundary?.listenUntil ?? goalDeadline ?? failedDeadline ?? postReloadDeadline;
   const thinkingFailed = boundary?.kind === 'turn_end' && boundary.reason === 'thinking_failed';
   const next = queuedAfterTurn ? 'queue' : goalDeadline ? goalModeFor(conversationId) : undefined;
@@ -5899,6 +6693,10 @@ interface Repair {
   assistantSource?: { key: string; turnId: string | null; completed: boolean };
   attribution?: { incident: UnattributedIncident; candidate: UnattributedCandidate };
   claimed?: boolean;
+  /** When the extension won the exact browser-action claim; null again only before any action. */
+  claimedAt?: number | null;
+  /** Lost browser receipt: action may have happened, so this episode must never issue it again. */
+  ambiguous?: boolean;
   /** Stable local owner; the browser action is valid only while this session is still here. */
   sessionId: string;
   endedTurns: number;
@@ -6053,6 +6851,8 @@ function queueBrowserRecovery(
     sessionId,
     endedTurns,
     state: 'queued',
+    claimedAt: null,
+    ambiguous: false,
     episode,
     reason,
     notBefore,
@@ -6125,6 +6925,39 @@ async function noteRecoveryObservations(
   // without treating picker/presence updates as new work or changing a known model.
   const recorded = sessionId ? await getSession(sessionId) : null;
   const ended = observations.findLast(item => item.kind === 'turn_end');
+  if (sessionId && ended?.outcome === 'stopped') {
+    await cancelSelfHealingForStopNow(sessionId, conversationId);
+    await cancelLongRunNow(sessionId, conversationId, 'manual_stop');
+    const cancelledWork = longRunWorkFor(sessionId);
+    if (cancelledWork?.state === 'cancelled' && cancelledWork.inputId) {
+      await cancelInput(cancelledWork.inputId);
+    }
+  }
+  const successfulTerminal = activity.terminal && (!ended || ended.outcome === 'completed');
+  const softProbation = recorded?.recovery?.phase === 'soft_recovery' &&
+    recorded.recovery.previousConversationId === conversationId &&
+    recorded.recovery.replacementConversationId === null;
+  // During the bounded post-reload probation, "the old turn is working again" is evidence but not
+  // a recovery certificate: provider/Fiber replay can produce exactly that signal and then stall
+  // again. A canonical completed terminal may retire soft recovery; otherwise the one-reload
+  // budget remains spent and the durable deadline still escalates to Emergency Resume.
+  const recoveryCertified = softProbation ? successfulTerminal : (activity.working || successfulTerminal);
+  if (sessionId && activity.meaningful && recoveryCertified) {
+    await noteSelfHealingProgress(
+      sessionId,
+      conversationId,
+      Math.max(1, activity.at ?? ended?.time ?? Date.now())
+    );
+  }
+  if (sessionId && successfulTerminal) {
+    await noteLongRunProgressNow(
+      sessionId,
+      conversationId,
+      Math.max(1, ended?.time ?? activity.at ?? Date.now()),
+      ended?.turnId ?? null,
+      'terminal'
+    );
+  }
   const thinkingFailed = ended?.outcome === 'failed' && ended.reason === 'thinking_failed' &&
     recorded?.lastTurnOutcome === 'failed' && !recorded.activeTurnId;
   // The replacement document can reveal the failure that the silence reload was
@@ -6133,7 +6966,7 @@ async function noteRecoveryObservations(
   const repaired = repairsInFlight.get(conversationId);
   const confirmedAt = lastBrowserRecoveryAt.get(conversationId);
   const sameFailedRepair = thinkingFailed && activity.terminal && ended.turnId &&
-    repaired?.reason === 'silence' && repaired.state === 'done' &&
+    repaired?.reason === 'silence' && repaired.state === 'done' && !repaired.ambiguous &&
     repaired.sessionId === sessionId && repaired.progress?.sessionId === sessionId &&
     repaired.progress.turnId === ended.turnId && confirmedAt !== undefined ? repaired : null;
   const selected = recorded?.selectedModel;
@@ -6239,7 +7072,7 @@ async function noteRecoveryObservations(
     // Give that accepted completion the ordinary two-minute recovery window;
     // historical replay and the replacement page cannot renew a spent reload.
     if (lastEnd === 'completed' && terminalGrant.model === 'other' && ended &&
-        !(repaired?.reason === 'silence' && repaired.state === 'done')) {
+        !(repaired?.reason === 'silence' && repaired.state === 'done' && !repaired.ambiguous)) {
       terminalGrant.evidenceAt = Math.max(terminalGrant.evidenceAt, Math.min(Date.now(), ended.time));
       terminalGrant.until = terminalGrant.evidenceAt + CHAT_SILENCE_MS;
       armSilenceSweep();
@@ -6474,6 +7307,38 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
   const spent: string[] = [];
   const compacting = new Set(pendingContinuations().map((entry) => entry.from));
   for (const [conversationId, grant] of activeUntil) {
+    // The session WAL, not this in-memory activity projection, owns the post-reload budget.
+    // Reconstructing from it also closes the restart/reload race where the page reports the same
+    // open turn and grantActivity() refreshes the ordinary silence clock. Provider activity may
+    // prove liveness, but it cannot extend this deadline without a certified recovery transition.
+    if (grant.selfHealingSoft || getConfig().multiAgent.selfHealingSessions) {
+      const session = await getSession(grant.sessionId);
+      const recovery = session?.recovery;
+      const durableSoft =
+        session?.conversationId === conversationId &&
+        session.lastTurnOutcome !== 'stopped' &&
+        recovery?.phase === 'soft_recovery' &&
+        recovery.previousConversationId === conversationId &&
+        recovery.replacementConversationId === null;
+      if (durableSoft) {
+        grant.selfHealingSoft = {
+          episodeId: recovery.failureEpisodeId,
+          generation: recovery.recoveryGeneration
+        };
+        const dueAt = (recovery.lastRecoveryAt ?? recovery.updatedAt) + SELF_HEAL_POST_RELOAD_MS;
+        grant.until = Math.min(grant.until, dueAt);
+        if (now < dueAt) {
+          deferred = true;
+          continue;
+        }
+        spent.push(conversationId);
+        continue;
+      }
+      // A genuinely certified completion may already have retired the WAL while this projection
+      // still carries its old marker. Drop only the marker; the ordinary open-turn watch, if any,
+      // remains valid and continues through the normal path below.
+      if (grant.selfHealingSoft) delete grant.selfHealingSoft;
+    }
     if (compacting.has(conversationId)) continue;
     if (grant.until > now) continue;
     const pro = await extendedSilenceWindowFor(conversationId, grant.sessionId);
@@ -6549,6 +7414,47 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
   }
   if (deferred) armSilenceSweep(now);
   return { queued, spent };
+}
+
+/** Rebuilds the post-reload observation window from the durable soft-recovery episode. */
+async function restoreSoftRecoveryWatches(now: number): Promise<void> {
+  let restored = 0;
+  for (const session of await indexedSessions()) {
+    const recovery = session.recovery;
+    const conversationId = session.conversationId;
+    if (
+      !conversationId ||
+      !recovery ||
+      recovery.phase !== 'soft_recovery' ||
+      recovery.previousConversationId !== conversationId ||
+      recovery.replacementConversationId !== null
+    ) continue;
+    if (session.lastTurnOutcome === 'stopped') {
+      await failSelfHealingRecovery(
+        session.id,
+        conversationId,
+        recovery.failureEpisodeId,
+        recovery.recoveryGeneration,
+        'soft_recovery',
+        'The user stopped the turn while recovery was observing the reload.'
+      );
+      continue;
+    }
+    const deadline = (recovery.lastRecoveryAt ?? recovery.updatedAt) + SELF_HEAL_POST_RELOAD_MS;
+    activeUntil.set(conversationId, {
+      sessionId: session.id,
+      evidenceAt: recovery.lastProgressAt ?? recovery.updatedAt,
+      until: Math.max(deadline, now + 1),
+      turnId: session.activeTurnId ?? null,
+      model: 'other',
+      selfHealingSoft: {
+        episodeId: recovery.failureEpisodeId,
+        generation: recovery.recoveryGeneration
+      }
+    });
+    restored += 1;
+  }
+  if (restored > 0) armSilenceSweep(now);
 }
 
 /** Retires a confirmed one-shot silence recovery after the caller has handled any Worker slot. */
@@ -6983,6 +7889,11 @@ function noteCallAttribution(
     // canonical summary, not a later browser poll, owns the worker's context meter.
     if (currentConversation && filedSession?.id === sessionId && filedSession.conversationId === conversationId)
       noteAgentContextTokens(conversationId, filedSession.contextTokens);
+    // Hard recovery deliberately keeps A attached until B's atomic commit, but the MCP kernel
+    // fences A during that interval. Its refusal is useful history, never evidence that the
+    // failed executor recovered; otherwise the rejected call would renew the silence clock and
+    // delete the very recovery command that caused the refusal.
+    if (currentConversation && recoveryFenceActive(conversationId)) return;
     if (currentConversation && !endsActivity) lastAttributedCallAt.set(conversationId, Date.now());
     // The recorder has just withdrawn a completed end the page reported: the same server turn
     // went on calling tools. Whatever Goal was drafting for that end — or had filed as owed —
@@ -7043,6 +7954,8 @@ function noteCallAttribution(
     // when Chrome, the tab or a reload destroyed the page's local turn projection.
     const sourceTurnId = filedSession?.activeTurnId ?? previous?.turnId ??
       goalPendingReplyFor(conversationId)?.silenceSourceTurnId ?? filedSession?.finishTurn?.turnId ?? null;
+    void noteLongRunProgressNow(sessionId, conversationId, startedAt, sourceTurnId, 'mcp', requestId)
+      .catch(error => logWarn(`long-run: could not persist certified MCP progress: ${String(error)}`));
     void revokeSilenceInputs(sessionId).catch(error => logWarn(`input: could not withdraw silence pickup: ${String(error)}`));
     void revokeSilenceLoop(conversationId).catch(error => logWarn(`goal: could not withdraw silence pickup: ${String(error)}`));
     grantActivity(conversationId, sessionId, continuingMcp ? Date.now() : pro ? Math.min(Date.now(), startedAt) : Date.now(), CHAT_SILENCE_MS,
@@ -7234,8 +8147,25 @@ async function takePendingRepairs(
   // in place let the first entry win every pass, so one repair the browser could not carry out
   // starved every other chat behind it — precisely when several chats break at once.
   for (const [conversationId, repair] of [...repairsInFlight]) {
-    if (repair.state !== 'handed' || repair.reason === 'goal' || repair.reason === 'unattributed' || repair.reason === 'assistant-error') continue;
+    if (repair.state === 'handed' && repair.claimed && repair.claimedAt &&
+        now - repair.claimedAt >= BROWSER_REPAIR_ACK_CUSTODY_MS) {
+      // The browser won this exact action claim, so executing it again is forbidden even though
+      // its result receipt never arrived. Release only *custody*: mark the old action ambiguous
+      // and let silence/no-tab/self-healing inspect current durable state on the next pass.
+      repair.state = 'done';
+      repair.ambiguous = true;
+      await updateRepairProgress(
+        conversationId,
+        repair,
+        `Browser recovery acknowledgement was lost while recovering ${repairReason(repair)}; the browser action will not be repeated.`
+      );
+      armSilenceSweep();
+      continue;
+    }
+    if (repair.state !== 'handed' || repair.claimed || repair.reason === 'goal' || repair.reason === 'unattributed' || repair.reason === 'assistant-error') continue;
     repair.state = 'queued';
+    repair.claimedAt = null;
+    repair.ambiguous = false;
     repairsInFlight.delete(conversationId);
     repairsInFlight.set(conversationId, repair);
   }
@@ -7254,6 +8184,9 @@ async function takePendingRepairs(
     if (!unclaimedError) {
       repair.state = 'handed';
       repair.token = randomBytes(9).toString('base64url');
+      repair.claimed = false;
+      repair.claimedAt = null;
+      repair.ambiguous = false;
       await updateRepairProgress(conversationId, repair, `Trying to reload chat to recover ${repairReason(repair)}…`);
     }
     // A missed pre-action claim may retry the same offer. Once claimed, ambiguous
@@ -7272,7 +8205,7 @@ async function takePendingRepairs(
         !stopRequestedFor(conversationId))
       {
         ready.push({ conversationId, token: repair.token, reason: repair.reason, focus: repair.reason === 'compaction',
-          ...(repair.attribution || repair.reason === 'assistant-error' ? { requiresClaim: true } : {}) });
+          requiresClaim: true });
       }
   }
   return ready;
@@ -7318,24 +8251,73 @@ async function confirmRepair(token: string, action: 'reloaded' | 'reopened' | nu
   for (const [conversationId, repair] of repairsInFlight) {
     if (repair.state === 'handed' && repair.token === token) {
       repair.state = 'done';
+      repair.ambiguous = false;
       if (repair.attribution && repair.attribution.incident.firstAttemptAt === null)
         repair.attribution.incident.firstAttemptAt = Date.now();
       lastBrowserRecoveryAt.set(conversationId, Date.now());
       awaitingReturn.add(conversationId);
       if (repair.reason === 'silence') {
         const failedGrant = activeUntil.get(conversationId);
-        if (failedGrant?.thinkingFailed) failedGrant.until = Date.now() + 5 * 60_000;
+        const selfHealing = Boolean(failedGrant && getConfig().multiAgent.selfHealingSessions);
+        if (failedGrant && selfHealing) {
+          const episode = await beginSelfHealingEpisode(
+            repair.sessionId,
+            conversationId,
+            failedGrant.thinkingFailed ? 'provider-error' : 'silence',
+            failedGrant.evidenceAt
+          );
+          if (episode) {
+            const currentGrant = activeUntil.get(conversationId);
+            if (repairsInFlight.get(conversationId) !== repair || currentGrant !== failedGrant) {
+              // A real recorder-confirmed activity batch can win while the episode's durable
+              // safety snapshot is being read. If it did, retire the just-created suspected
+              // episode from that exact newer evidence instead of letting an old reload ACK
+              // manufacture a fresh soft-recovery generation behind it.
+              const latest = await getSession(repair.sessionId);
+              const progressAt = Math.max(
+                currentGrant?.sessionId === repair.sessionId ? currentGrant.evidenceAt : 0,
+                latest?.lastToolCallAt ?? 0,
+                latest?.lastAssistantFinalAt ?? 0,
+                latest?.lastTurnOutcome === 'completed' ? (latest.lastTurnEndAt ?? 0) : 0
+              );
+              if (progressAt > failedGrant.evidenceAt) {
+                await noteSelfHealingProgress(repair.sessionId, conversationId, progressAt);
+              }
+            } else {
+              const soft = await markSoftRecovery(
+                repair.sessionId,
+                conversationId,
+                episode.failureEpisodeId,
+                episode.recoveryGeneration
+              );
+              if (soft?.phase === 'soft_recovery') {
+                failedGrant.selfHealingSoft = {
+                  episodeId: soft.failureEpisodeId,
+                  generation: soft.recoveryGeneration
+                };
+              }
+            }
+          }
+        }
+        if (failedGrant && selfHealing) failedGrant.until = Date.now() + SELF_HEAL_POST_RELOAD_MS;
+        else if (failedGrant?.thinkingFailed) failedGrant.until = Date.now() + 5 * 60_000;
         else if (failedGrant?.model === 'other') failedGrant.until = Date.now() + SILENCE_RELOAD_LISTEN_MS;
         // Persist the next existing instruction as soon as this exact refresh is
         // acknowledged. Native readiness and the normal Send receipt still gate delivery.
-        const inputFiled = await fileSilenceInputTicket(conversationId, Date.now());
-        if (!inputFiled && (loopAfterTurnFor(conversationId) || failedGrant?.model === 'other')) await fileSilenceTickets([conversationId], Date.now());
+        // Self-healing owns this post-reload observation window. Sending Goal/queued input into A
+        // here would create a second request just before A may be retired; those obligations move
+        // with the durable session and are resumed by B after reconciliation instead.
+        const inputFiled = selfHealing ? false : await fileSilenceInputTicket(conversationId, Date.now());
+        if (!selfHealing && !inputFiled && (loopAfterTurnFor(conversationId) || failedGrant?.model === 'other'))
+          await fileSilenceTickets([conversationId], Date.now());
         // Ordinary models listen for one minute from the confirmed refresh;
         // failed views retain five minutes. These reuse the same grant and tickets.
         // Worker retirement retains its separate recovery rules below.
         const grant = activeUntil.get(conversationId);
         const pro = await extendedSilenceWindowFor(conversationId, repair.sessionId);
-        if (grant?.thinkingFailed) {
+        if (grant && selfHealing) {
+          armSilenceSweep();
+        } else if (grant?.thinkingFailed) {
           armSilenceSweep();
         } else if (pro) {
           if (grant && activeUntil.get(conversationId) === grant) {
@@ -7380,6 +8362,8 @@ async function failRepairAttempt(token: string, action: 'reloaded' | 'reopened' 
     else {
       repair.state = 'queued';
       repair.claimed = false;
+      repair.claimedAt = null;
+      repair.ambiguous = false;
       repairsInFlight.delete(conversationId);
       repairsInFlight.set(conversationId, repair);
     }
@@ -7469,6 +8453,10 @@ async function deliverOne(): Promise<void> {
   tidyCommands();
   const command = nextDeliverable();
   if (!command) return;
+  if (command.spec.type === 'recovery' && !(await recoveryCommandCurrent(command.spec))) {
+    retire(command, 'its self-healing episode is no longer current');
+    return;
+  }
   if (!openInBrowser) {
     // Nothing can open a browser in this process, and nothing will come and ask. Ending it
     // here is what keeps the failure honest: the continuation stays in the chat it is in and
@@ -7494,6 +8482,7 @@ async function deliverOne(): Promise<void> {
   // commit quite correctly refuses to overwrite it. The later durable redeem refreshes the same
   // gate; commit/abort/drop clears it through the continuation state machine.
   if (command.spec.type === 'resume') noteResumeOpening(command.spec.token);
+  if (command.spec.type === 'recovery') noteResumeOpening(command.spec.episodeId);
   // Beside the chat it succeeds, when this app can name that chat and its browser is still
   // polling. Only that browser can put the new tab in the window the old one is in, and only
   // a tab it creates itself is guaranteed to be in a browser this extension is loaded in.
@@ -7536,8 +8525,8 @@ async function openFreshChatInBrowser(command: Command): Promise<void> {
     // difference, and the window it opens is only ever spent by a browser failing to appear.
     if (!browserPresent()) lastBrowserLaunchAt = Date.now();
     await openInBrowser(
-      command.spec.type === 'worker'
-        ? commandUrl(command.id, command.spec.model, command.spec.reasoningEffort)
+      command.spec.type === 'worker' || command.spec.type === 'recovery'
+        ? commandUrl(command.id, command.spec.model, command.spec.reasoningEffort, null, commandHomeConversation(command.spec))
         : commandUrl(command.id, null, null, commandProject(command), commandHomeConversation(command.spec))
     );
   } catch (err) {
@@ -7746,6 +8735,7 @@ function scheduleDeliver(): void {
  */
 function bootstrapText(spec: CommandSpec, summary: string): string {
   if (spec.type === 'stop') return '';
+  if (spec.type === 'recovery') return spec.text;
   if (spec.type === 'revive') {
     // Written by the broker, out of that worker's own inbox, at the moment the page asks.
     // Empty means the broker no longer considers this worker to be waking, and an empty
@@ -7782,6 +8772,37 @@ function revivalFor(agent: string, runId: string): WorkerRevival | null {
   return pendingWorkerRevivals().find((revival) => revival.id === agent && revival.runId === runId) ?? null;
 }
 
+function revivalAuthorityMessageIds(revival: WorkerRevival): readonly string[] {
+  return revival.authorityMessageIds ?? revival.messageIds;
+}
+
+function revivalLongRunAuthorityCurrent(revival: WorkerRevival): boolean {
+  const authority = revivalAuthorityMessageIds(revival);
+  return authority.length > 0 && authority.every(
+    (messageId) => longRunMessageAuthority(messageId, revival.conversationId) !== 'stale'
+  );
+}
+
+async function cleanupRevokedLongRunRevival(revival: WorkerRevival, reason: string): Promise<void> {
+  let retiredAny = false;
+  for (const messageId of revivalAuthorityMessageIds(revival)) {
+    if (longRunMessageAuthority(messageId, revival.conversationId) !== 'stale') continue;
+    if (retireWorkerContinuationIfUnsent(revival.conversationId, messageId, reason) === 'retired') {
+      retiredAny = true;
+    }
+  }
+  if (!retiredAny) return;
+  try {
+    await persistCriticalSwarmNow();
+  } catch (error) {
+    // Safety does not depend on cleanup persistence: redeem rechecks the long-run ledger and
+    // refuses stale authority. This write merely prevents the stale broker row returning later.
+    logWarn(
+      `bridge: could not persist revoked worker-continuation cleanup — ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
 /**
  * The wire form of a command, and — for a resume — the moment its brief is claimed.
  *
@@ -7810,9 +8831,9 @@ function describe(command: Command, client: string | null, claimedSummary?: stri
     } : {}),
     type: spec.type,
     text,
-    agent: spec.type === 'resume' ? null : spec.agent,
-    model: spec.type === 'worker' ? spec.model : selection?.model ?? null,
-    reasoningEffort: spec.type === 'worker' ? spec.reasoningEffort : selection?.reasoningEffort ?? null,
+    agent: spec.type === 'resume' ? null : spec.type === 'recovery' ? spec.agent : spec.agent,
+    model: spec.type === 'worker' || spec.type === 'recovery' ? spec.model : selection?.model ?? null,
+    reasoningEffort: spec.type === 'worker' || spec.type === 'recovery' ? spec.reasoningEffort : selection?.reasoningEffort ?? null,
     // The fence the page enforces before it types. Only a revival has one: the other two
     // kinds open a chat that does not exist yet, so there is nothing to compare against.
     conversationId: spec.type === 'revive' ? spec.conversationId : null
@@ -7821,6 +8842,80 @@ function describe(command: Command, client: string | null, claimedSummary?: stri
 
 function drop(command: Command, why: string): boolean {
   if (!commands.includes(command)) return false;
+  if (command.spec.type === 'recovery') {
+    if (command.timer) clearTimeout(command.timer);
+    command.timer = null;
+    command.lastError = why;
+    let retainAdmissionFences = false;
+    void writeCommandTransition(command, async () => {
+      if (!commands.includes(command) || command.spec.type !== 'recovery') return false;
+      try {
+        const session = await getSession(command.spec.sessionId);
+        const recovery = session?.recovery;
+        const checkpoint = recovery?.destinationSend;
+        if (recovery?.failureEpisodeId === command.spec.episodeId &&
+            recovery.recoveryGeneration === command.spec.generation &&
+            checkpoint?.commandId === command.id) {
+          if (checkpoint.state === 'sent' && checkpoint.conversationId) {
+            const committed = await commitEmergencyResume(
+              command.spec.sessionId,
+              command.spec.episodeId,
+              checkpoint.conversationId
+            );
+            if (committed.status === 'retryable') return false;
+            if (committed.status === 'committed') {
+              await writeDurableNow(COMMANDS_STATE, commandSnapshot({ removeCommandId: command.id }));
+              commands = commands.filter((entry) => entry !== command);
+              changed();
+              return true;
+            }
+          }
+          if (checkpoint.state === 'dispatched-unresolved') {
+            const dispatchedAt = checkpoint.dispatchedAt ?? recovery.updatedAt;
+            if (Date.now() - dispatchedAt < SELF_HEAL_MARKER_RECONCILE_MS) {
+              // Missing ACK after native Send is ambiguity, not non-execution. Keep this exact
+              // command as inert custody and renew B's admission gate; never reopen or retype it.
+              noteResumeClaim(command.spec.episodeId);
+              command.lastError = 'Emergency Resume Send is awaiting stable marker reconciliation.';
+              return false;
+            }
+            retainAdmissionFences = true;
+          }
+        }
+        const failed = await failSelfHealingRecovery(
+          command.spec.sessionId,
+          command.spec.fromConversationId,
+          command.spec.episodeId,
+          command.spec.generation,
+          'hard_recovery',
+          retainAdmissionFences
+            ? 'Emergency Resume Send crossed the browser boundary but no durable destination proof arrived before the reconciliation window expired.'
+            : why,
+          { retainAdmissionFences }
+        );
+        // `false` is acceptable only when the command has become stale because ownership moved
+        // elsewhere. If the same hard-recovery episode is still current, keep the durable command
+        // and retry the local failure write later rather than dropping the only attempt record.
+        if (!failed && await recoveryCommandCurrent(command.spec)) return false;
+        await writeDurableNow(COMMANDS_STATE, commandSnapshot({ removeCommandId: command.id }));
+      } catch (error) {
+        logWarn(`bridge: could not durably fail ${specKey(command.spec)} — ${error instanceof Error ? error.message : String(error)}`);
+        return false;
+      }
+      if (!retainAdmissionFences) endResumeClaim(command.spec.episodeId);
+      commands = commands.filter((entry) => entry !== command);
+      changed();
+      logWarn(`bridge: gave up on ${specKey(command.spec)} — ${why}`);
+      return true;
+    }).then((retired) => {
+      if (retired) scheduleDeliver();
+      else if (commands.includes(command)) armDeadline(command, 30_000);
+    }).catch((error) => {
+      logWarn(`bridge: recovery retirement failed — ${error instanceof Error ? error.message : String(error)}`);
+      if (commands.includes(command)) armDeadline(command, 30_000);
+    });
+    return true;
+  }
   const automaticEntry = command.spec.type === 'resume' ? continuationByToken(command.spec.token) : null;
   const automaticResume =
     automaticEntry?.automatic === true && automaticEntry.state !== 'committing' && automaticEntry.state !== 'committed';
@@ -7968,7 +9063,7 @@ function nextDeliverable(): Command | null {
   if (commandWrites.size > 0) return null;
   // A spent lease stays spent even after its deadline; only expiry settles it.
   return commands.find((command) => command.claimedAt === null &&
-    (command.spec.type === 'worker' || command.spec.type === 'resume')) ?? null;
+    (command.spec.type === 'worker' || command.spec.type === 'resume' || command.spec.type === 'recovery')) ?? null;
 }
 
 /**
@@ -7999,6 +9094,12 @@ async function commandOrigin(id: string): Promise<SessionOrigin | null> {
   // worker chat when it was first opened, and rewriting that origin now would only overwrite
   // the task this worker was actually created for with whatever it is being asked next.
   if (spec.type === 'revive') return null;
+  if (spec.type === 'recovery') return {
+    kind: 'recovery',
+    fromSessionId: spec.sessionId,
+    agentId: spec.agent,
+    task: ''
+  };
   return {
     kind: 'resume',
     fromSessionId: spec.sessionId,
@@ -8160,6 +9261,29 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
     };
   }
   if (
+    version >= 5 &&
+    raw.type === 'recovery' &&
+    typeof (raw as Partial<Extract<CommandSpec, { type: 'recovery' }>>).sessionId === 'string' &&
+    typeof (raw as Partial<Extract<CommandSpec, { type: 'recovery' }>>).fromConversationId === 'string' &&
+    typeof (raw as Partial<Extract<CommandSpec, { type: 'recovery' }>>).episodeId === 'string' &&
+    typeof (raw as Partial<Extract<CommandSpec, { type: 'recovery' }>>).text === 'string'
+  ) {
+    const recovery = raw as Extract<CommandSpec, { type: 'recovery' }>;
+    if (!conversationId(recovery.fromConversationId) || recovery.episodeId.length > 64 || recovery.text.length > MAX_CHATGPT_MESSAGE_CHARS) return null;
+    return {
+      type: 'recovery',
+      sessionId: recovery.sessionId,
+      fromConversationId: recovery.fromConversationId,
+      episodeId: recovery.episodeId,
+      generation: Number.isSafeInteger(recovery.generation) && recovery.generation > 0 ? recovery.generation : 1,
+      text: recovery.text,
+      agent: typeof recovery.agent === 'string' && /^[a-z0-9-]{1,40}$/i.test(recovery.agent) ? recovery.agent : null,
+      runId: typeof recovery.runId === 'string' ? recovery.runId : null,
+      model: isModelSlug(recovery.model) ? recovery.model : null,
+      reasoningEffort: isReasoningEffort(recovery.reasoningEffort) ? recovery.reasoningEffort : null
+    };
+  }
+  if (
     raw.type === 'resume' &&
     typeof (raw as Partial<Extract<CommandSpec, { type: 'resume' }>>).sessionId === 'string' &&
     typeof (raw as Partial<Extract<CommandSpec, { type: 'resume' }>>).token === 'string'
@@ -8179,7 +9303,7 @@ function restoredCommandSnapshot(
   now: number
 ): DurableCommandSnapshot {
   return {
-    version: 4,
+    version: 5,
     commands: plannedCommands.map(durableCommand),
     receipts: plannedReceipts
       .filter((receipt) => now - receipt.completedAt <= COMMAND_TTL_MS)
@@ -8200,7 +9324,7 @@ function planCommandRestore(
   now: number
 ): CommandRestorePlan | null {
   const version = saved.version;
-  if (version !== 1 && version !== 2 && version !== 3 && version !== 4 || !Array.isArray(saved.commands)) return null;
+  if (version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 || !Array.isArray(saved.commands)) return null;
 
   const plannedCommands = [...commands];
   const plannedReceipts = commandReceipts
@@ -8316,6 +9440,143 @@ function planCommandRestore(
 }
 
 /**
+ * Reconstructs the transport half of a hard recovery from the session WAL.
+ *
+ * `hard_recovery` is durable before its browser command on purpose: that ordering fences the old
+ * executor before anything can open a replacement. A crash in between must therefore be repaired
+ * from session metadata rather than leaving A permanently fenced. The recovery episode remains
+ * the authority; this helper only recreates a missing command inside the same bounded episode.
+ */
+async function restoreMissingEmergencyResumes(plan: CommandRestorePlan, now: number): Promise<void> {
+  const existing = new Set(
+    plan.commands
+      .filter((command): command is Command & { spec: Extract<CommandSpec, { type: 'recovery' }> } => command.spec.type === 'recovery')
+      .map((command) => `${command.spec.sessionId}:${command.spec.episodeId}:${command.spec.generation}`)
+  );
+  for (const session of await indexedSessions()) {
+    const recovery = session.recovery;
+    if (
+      !recovery ||
+      recovery.phase !== 'hard_recovery' ||
+      recovery.replacementConversationId !== null ||
+      !session.conversationId ||
+      session.conversationId !== recovery.previousConversationId
+    ) continue;
+
+    const key = `${session.id}:${recovery.failureEpisodeId}:${recovery.recoveryGeneration}`;
+    if (existing.has(key)) continue;
+    // Once the pre-click dispatch checkpoint is durable, absence of the bridge command is an
+    // ambiguous browser result, never proof that no Send happened. Reconstruct inert *custody*
+    // with the same command id so the deadline/reconciliation policy survives an app restart;
+    // this leased row is never eligible to open or type another chat.
+    if (recovery.destinationSend.state === 'dispatched-unresolved') {
+      const dispatchedAt = recovery.destinationSend.dispatchedAt ?? recovery.updatedAt;
+      if (now - dispatchedAt >= SELF_HEAL_MARKER_RECONCILE_MS) {
+        await failSelfHealingRecovery(
+          session.id,
+          session.conversationId,
+          recovery.failureEpisodeId,
+          recovery.recoveryGeneration,
+          'hard_recovery',
+          'Emergency Resume Send crossed the browser boundary but no durable destination proof arrived before the reconciliation window expired.',
+          { retainAdmissionFences: true }
+        );
+        continue;
+      }
+      const spec = await emergencyResumeCommandSpec(session.id, session.conversationId, recovery.failureEpisodeId);
+      const commandId = recovery.destinationSend.commandId;
+      if (!spec || !commandId) {
+        await failSelfHealingRecovery(
+          session.id,
+          session.conversationId,
+          recovery.failureEpisodeId,
+          recovery.recoveryGeneration,
+          'hard_recovery',
+          'The ambiguous Emergency Resume transaction could not reconstruct its exact custody record.',
+          { retainAdmissionFences: true }
+        );
+        continue;
+      }
+      plan.commands.push({
+        id: commandId,
+        spec,
+        createdAt: dispatchedAt,
+        claimedAt: now,
+        timer: null,
+        lastError: 'Emergency Resume Send is awaiting stable marker reconciliation.',
+        owner: null
+      });
+      existing.add(key);
+      plan.restored += 1;
+      noteResumeOpening(recovery.failureEpisodeId);
+      logInfo(`bridge: restored inert recovery custody for session ${session.id}; no browser action will be replayed`);
+      continue;
+    }
+    if (recovery.destinationSend.state === 'sent') {
+      // Restart reconciliation should normally commit this before command restore. If a retryable
+      // projection barrier kept the session in A, preserve the gate and never open another B.
+      noteResumeOpening(recovery.failureEpisodeId);
+      logInfo(`bridge: recovery ${session.id} already has a durable destination; not reopening transport`);
+      continue;
+    }
+    if (!getConfig().multiAgent.selfHealingSessions) {
+      await failSelfHealingRecovery(
+        session.id,
+        session.conversationId,
+        recovery.failureEpisodeId,
+        recovery.recoveryGeneration,
+        'hard_recovery',
+        'Self-healing sessions was disabled before recovery transport could resume.'
+      );
+      continue;
+    }
+
+    const episodeAt = recovery.lastRecoveryAt ?? recovery.updatedAt;
+    if (!Number.isFinite(episodeAt) || now - episodeAt > COMMAND_TTL_MS) {
+      await failSelfHealingRecovery(
+        session.id,
+        session.conversationId,
+        recovery.failureEpisodeId,
+        recovery.recoveryGeneration,
+        'hard_recovery',
+        'The recovery episode expired while the app was not running; no replacement chat was reopened.'
+      );
+      continue;
+    }
+
+    const spec = await emergencyResumeCommandSpec(session.id, session.conversationId, recovery.failureEpisodeId);
+    if (!spec) {
+      await failSelfHealingRecovery(
+        session.id,
+        session.conversationId,
+        recovery.failureEpisodeId,
+        recovery.recoveryGeneration,
+        'hard_recovery',
+        'The durable recovery episode could not reconstruct its browser command.'
+      );
+      continue;
+    }
+    plan.commands.push({
+      // A crash after redeem but before pre-click dispatch may reconstruct the same inert command
+      // id. Nothing irreversible crossed; preserving that id lets the surviving browser document
+      // finish the exact attempt instead of inventing a second transaction.
+      id: recovery.destinationSend.state === 'attempted-unresolved' && recovery.destinationSend.commandId
+        ? recovery.destinationSend.commandId
+        : randomBytes(8).toString('hex'),
+      spec,
+      createdAt: now,
+      claimedAt: null,
+      timer: null,
+      lastError: null,
+      owner: null
+    });
+    existing.add(key);
+    plan.restored += 1;
+    logInfo(`bridge: reconstructed Emergency Resume transport for session ${session.id}`);
+  }
+}
+
+/**
  * Reloads commands left over from a previous run.
  *
  * Ordinary commands older than the TTL are discarded rather than acted on: reopening the app
@@ -8325,15 +9586,45 @@ function planCommandRestore(
  * 1 is migrated conservatively, including resume commands whose continuation WAL survived.
  */
 export async function restoreCommands(): Promise<void> {
+  // Session metadata is the A→B authority. Repair any crash window in its in-memory projections
+  // before restored browser commands become deliverable or an old executor can regain custody.
+  await reconcileSelfHealingAfterRestart();
   const saved = await readDurable<{
     version?: number;
     commands?: unknown;
     receipts?: unknown;
   }>(COMMANDS_STATE);
-  if (!saved) return;
   const now = Date.now();
-  const plan = planCommandRestore(saved, now);
+  // A missing command file is a valid crash point: the session WAL can already say
+  // `hard_recovery` before the transport has performed its first durable write. Seed an empty
+  // version-5 snapshot from retained in-memory state so that episode can reconstruct below.
+  const plan = planCommandRestore(saved ?? { version: 5, commands: [], receipts: [] }, now);
   if (!plan) return;
+
+  // Recovery commands carry local-session authority rather than a standalone continuation WAL.
+  // Revalidate them after session crash reconciliation and before any command is published or
+  // allowed to open a browser. A stale durable marker may remain on disk after the A→B commit or
+  // after a terminal recovery failure; neither state is permission to create another executor.
+  const currentCommands: Command[] = [];
+  for (const command of plan.commands) {
+    if (command.spec.type === 'recovery' && !(await recoveryCommandCurrent(command.spec))) {
+      if (command.timer) clearTimeout(command.timer);
+      command.timer = null;
+      continue;
+    }
+    currentCommands.push(command);
+  }
+  plan.commands = currentCommands;
+  await restoreMissingEmergencyResumes(plan, now);
+
+  // Rebuild the replacement-chat recorder gate from durable recovery authority before the
+  // bridge publishes any restored browser work. `startBridgeOnce()` keeps every browser route
+  // behind `bridgeRecovering` until this function returns, so an already-open replacement B
+  // cannot race `/events` into minting a shadow session after an app crash. The ACK/terminal
+  // recovery path clears this exact episode id through endResumeClaim().
+  for (const command of plan.commands) {
+    if (command.spec.type === 'recovery') noteResumeOpening(command.spec.episodeId);
+  }
 
   if (plan.expiredRevivals.length > 0) {
     let brokerRelevant = false;
@@ -8392,6 +9683,7 @@ export async function restoreCommands(): Promise<void> {
   commandReceipts = plan.receipts;
   for (const token of plan.resumeTokens) rememberToken(token.sessionId, token.token);
   rearmRetainedCommandDeadlines();
+  await restoreSoftRecoveryWatches(now);
   if (plan.restored > 0) {
     logInfo(`bridge: restored ${plan.restored} chat command(s) from the previous run`);
     changed();
