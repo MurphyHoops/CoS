@@ -706,7 +706,7 @@ async function markRecoveryRecovered(
   // same task still owes forward progress in B. The Emergency Resume bootstrap gets a grace
   // window; if it never makes a new local MCP call, the local long-run supervisor files one stable
   // continuation instead of letting the recovered conversation become an idle endpoint.
-  if (goalSwitchFor(conversationId).enabled) {
+  if (goalSwitchFor(conversationId).enabled || recovery.agentLineage !== null) {
     await ensureRecoveryWorkNow(
       sessionId,
       conversationId,
