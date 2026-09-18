@@ -88,6 +88,7 @@ import {
 import { requestCorrelation } from '../session/correlation.js';
 import { BLOCKED_CHAT_REFUSAL, anyChatBlocked, isChatBlocked } from '../session/blocked-chats.js';
 import { anyContinuationOpen, compactingConversation } from '../session/continuation.js';
+import { anyLongRunWaitActive, longRunWaitBlocksTools } from '../session/long-run.js';
 import { anyRecoveryFenceActive, recoveryFenceActive } from '../session/recovery-fence.js';
 import { acknowledgeBackgroundExecOutput, backgroundExecRecoveryNotices, offerBackgroundExecOutput } from '../codex/ownership.js';
 import { DEFAULT_MAX_OUTPUT_TOKENS } from '../codex/unified-exec-constants.js';
@@ -639,6 +640,7 @@ async function dispatchTracked(
     anyChatBlocked() ||
     anyContinuationOpen() ||
     anyRecoveryFenceActive() ||
+    anyLongRunWaitActive() ||
     supersededIdentityMayMatter
   ) && requestId) {
     setCallerConversation(
@@ -650,6 +652,10 @@ async function dispatchTracked(
     ? (await conversationAttachment(context.caller.conversationId, context.caller.sessionId ?? null)) === 'superseded'
     : false;
   const recoveringConversation = recoveryFenceActive(context.caller.conversationId);
+  const longRunWaitArmed = name !== 'session_wait' &&
+    !!context.caller.sessionId &&
+    !!context.caller.conversationId &&
+    longRunWaitBlocksTools(context.caller.sessionId, context.caller.conversationId);
   // Two things about liveness, both before the agent is resolved so that the answer this
   // call gets is the state this call itself established.
   //
@@ -778,6 +784,12 @@ async function dispatchTracked(
         ? Promise.resolve(
             fail(
               'CONVERSATION_SUPERSEDED: Compact & Resume replaced this ChatGPT conversation. Its transcript remains readable, but it can no longer execute local tools. Continue only in the replacement chat; no local tool was run.'
+            )
+          )
+        : longRunWaitArmed
+        ? Promise.resolve(
+            fail(
+              'WAIT_ARMED_FINISH_TURN: this durable session handed its external wait to the local CoS supervisor. No local tool was run. End this ChatGPT turn now; CoS will queue exactly one continuation when the wait resolves. Only session_wait status/cancel may inspect or revoke the wait.'
             )
           )
         : dormantWorker
