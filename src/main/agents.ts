@@ -1667,6 +1667,57 @@ export function stageWorkerContinuation(
   }
   return { ...staged, runId };
 }
+
+export type WorkerContinuationRetireResult = 'absent' | 'retired' | 'ambiguous';
+
+/**
+ * Removes one app-owned long-run row only while no browser/tool delivery can have observed it.
+ *
+ * Authority revocation (manual Stop or certified progress) happens in the long-run ledger first.
+ * This cleanup is compensating hygiene for the separately durable worker broker. If the browser
+ * has already claimed or received the wake, ambiguity wins and the row is retained; the bridge's
+ * final long-run authority fence then prevents any *new* hand-out without pretending an earlier
+ * Send can be undone.
+ */
+export function retireWorkerContinuationIfUnsent(
+  conversationId: string,
+  stableMessageId: string,
+  reason: string
+): WorkerContinuationRetireResult {
+  const run = runForConversation(conversationId);
+  const active = run ? boundAgent(conversationId) : null;
+  const dormant = active ? null : dormantAgentForConversation(conversationId)?.agent ?? null;
+  const agent = active ?? dormant;
+  if (!agent || agent.info.role !== 'worker') return 'absent';
+
+  const index = agent.queue.findIndex((message) => message.id === stableMessageId);
+  if (index < 0) return 'absent';
+  const message = agent.queue[index]!;
+  // offeredViaRevival/offeredAt means ChatGPT may already have accepted the browser user message.
+  // waking+!revivable is the narrower pre-ACK cut: /commands/redeem durably handed ownership to
+  // one browser document, so removing its payload here would lie about an in-flight Send.
+  if (message.ackedAt !== null || message.offeredAt !== null || message.offeredViaRevival ||
+      (agent.info.state === 'waking' && !agent.info.revivable)) {
+    return 'ambiguous';
+  }
+
+  agent.queue.splice(index, 1);
+  recount(agent);
+  if (agent.info.state === 'waking') {
+    const remaining = agent.queue.filter(
+      (row) => row.ackedAt === null && row.offeredAt === null && !row.offeredViaRevival && !unpublishedMessages.has(row)
+    );
+    if (remaining.length === 0) {
+      returnWakingWorkerToStopped(agent, agent.info.sleptAt ?? Date.now(), reason);
+    } else {
+      agent.info.task = remaining.map((row) => row.text).join('\n\n').slice(0, MAX_TASK_CHARS);
+    }
+  }
+  logInfo(`multi-agent: retired unsent durable continuation ${stableMessageId.slice(0, 8)} from ${agent.info.id} — ${reason}`);
+  changed('critical');
+  return 'retired';
+}
+
 function stageMessagesActive(
   caller: Caller,
   items: ReadonlyArray<AgentMessageRequest>,
