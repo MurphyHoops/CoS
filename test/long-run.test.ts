@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { initDurableStore, resetDurableForTests } from '../src/main/durable.js';
+import { initDurableStore, readDurable, resetDurableForTests } from '../src/main/durable.js';
 import {
   armLongRunWaitNow,
   cancelLongRunNow,
@@ -177,6 +177,40 @@ describe('durable long-run authority', () => {
 
     const current = captureExecutionTicket(SESSION, CHAT_B)!;
     expect(await resolveLongRunWaitNow(SESSION, wait.id, current, 'B resolved it')).toBe(true);
+  });
+
+  it('fsyncs an idempotent A to B retry even when memory already names B', async () => {
+    await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-fsync',
+      kind: 'timer',
+      dueAt: Date.now() + 10_000
+    });
+    expect(await moveLongRunStateNow(SESSION, CHAT_A, CHAT_B)).toBe(true);
+
+    // Simulate the crash window this API must close: memory already contains B, while the durable
+    // file is absent/stale. Re-initialize a fresh durable root without disturbing the in-memory
+    // execution ledger, then retry the same semantic A→B barrier.
+    const secondRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-long-run-retry-'));
+    try {
+      resetDurableForTests();
+      initDurableStore(secondRoot);
+      expect(executionEpochFor(SESSION)).toMatchObject({ conversationId: CHAT_B, generation: 2 });
+
+      expect(await moveLongRunStateNow(SESSION, CHAT_A, CHAT_B)).toBe(true);
+      const persisted = await readDurable<ReturnType<typeof snapshotLongRunState>>('long-run');
+      expect(persisted?.epochs).toEqual([
+        expect.objectContaining({ sessionId: SESSION, conversationId: CHAT_B, generation: 2 })
+      ]);
+      expect(persisted?.waits).toEqual([
+        expect.objectContaining({ sessionId: SESSION, conversationId: CHAT_B, epochGeneration: 2 })
+      ]);
+    } finally {
+      resetDurableForTests();
+      initDurableStore(directory);
+      await fs.rm(secondRoot, { recursive: true, force: true });
+    }
   });
 
   it('restores a dispatching obligation with the same input id after restart', async () => {
