@@ -3986,9 +3986,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         return json(res, 404, { error: 'no_such_command' }, origin);
       }
       if (claimed === 'authority-stale-after-lease') {
-        // The durable browser lease exists, so an earlier same-owner response could already have
-        // exposed the payload. Do not re-issue it and do not pretend it can be unsent. The
-        // existing command deadline retains ambiguous custody and will settle the waking worker.
+        // The durable browser lease exists, so this redeem (or an earlier same-owner response)
+        // could already have exposed the payload. Renew the live timer exactly once from the
+        // durable claimedAt boundary, then preserve ambiguous custody without re-issuing text.
+        // Later retries are rejected by the preflight owner/stale fence above and cannot extend it.
+        armDeadline(command);
+        changed();
         return json(res, 409, { error: 'command_authority_revoked', final: true }, origin);
       }
       if (claimed === 'taken') return json(res, 409, { error: 'command_taken' }, origin);
