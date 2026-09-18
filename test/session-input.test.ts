@@ -92,6 +92,65 @@ afterEach(async () => {
 });
 
 describe('durable user input ownership', () => {
+  it('delivers one long-run continuation after its source turn completed before the wait resolved', async () => {
+    binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'wait-source', time: 900 };
+    now = 1_000;
+    const work = await ensureRecoveryWorkNow(sessionId, binding.conversationId, 'wait:ordinary', 'wait-source');
+    const leased = await leaseLongRunWorkNow(sessionId, binding.conversationId);
+    const row = await enqueueInput(input({
+      id: leased!.work.inputId!,
+      text: 'Continue after local wait',
+      mode: 'after-turn'
+    }), undefined, work!.id);
+
+    expect(await pendingBrowserInputs()).toEqual([
+      expect.objectContaining({ id: row.id, conversationId: binding.conversationId })
+    ]);
+    const claim = await claimBrowserInput(row.id, 'wait-page', binding.conversationId, true);
+    expect(claim).toMatchObject({ id: row.id, completedTurnId: 'wait-source' });
+    expect(await authorizeBrowserInput(row.id, 'wait-page', binding.conversationId)).toBe(true);
+    expect(await acknowledgeBrowserInput(row.id, 'wait-page', binding.conversationId, 'wait-message')).toBe(true);
+    expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({
+      state: 'sent',
+      messageId: 'wait-message'
+    });
+  });
+
+  it('keeps the old completion rule for ordinary after-turn input without long-run authority', async () => {
+    binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'old-turn', time: 900 };
+    now = 1_000;
+    const row = await enqueueInput(input({ mode: 'after-turn', text: 'Ordinary later instruction' }));
+
+    expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'queued' });
+    expect(await pendingBrowserInputs()).toEqual([]);
+    expect(await claimBrowserInput(row.id, 'ordinary-page', binding.conversationId, true)).toBeNull();
+  });
+
+  it('delivers durable long-run continuation into the same worker chat after its prior turn settled', async () => {
+    binding.origin = 'worker';
+    binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'worker-wait-source', time: 900 };
+    now = 1_000;
+    const work = await ensureRecoveryWorkNow(sessionId, binding.conversationId, 'wait:worker', 'worker-wait-source');
+    const leased = await leaseLongRunWorkNow(sessionId, binding.conversationId);
+    const row = await enqueueInput(input({
+      id: leased!.work.inputId!,
+      text: 'Resume the same worker task after the local wait',
+      mode: 'after-turn'
+    }), undefined, work!.id);
+
+    expect(await pendingBrowserInputs()).toEqual([
+      expect.objectContaining({ id: row.id, conversationId: binding.conversationId })
+    ]);
+    const claim = await claimBrowserInput(row.id, 'worker-wait-page', binding.conversationId, true);
+    expect(claim).toMatchObject({ id: row.id, completedTurnId: 'worker-wait-source' });
+    expect(await authorizeBrowserInput(row.id, 'worker-wait-page', binding.conversationId)).toBe(true);
+    expect(await acknowledgeBrowserInput(row.id, 'worker-wait-page', binding.conversationId, 'worker-wait-message')).toBe(true);
+    expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({
+      state: 'sent',
+      messageId: 'worker-wait-message'
+    });
+  });
+
   it('retires a provably-unsent long-run continuation after certified progress revokes its authority', async () => {
     const work = await ensureRecoveryWorkNow(sessionId, binding.conversationId, 'recovery:test');
     const leased = await leaseLongRunWorkNow(sessionId, binding.conversationId);
