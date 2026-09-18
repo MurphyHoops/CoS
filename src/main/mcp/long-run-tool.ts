@@ -6,7 +6,7 @@ import {
   longRunStatus
 } from '../session/long-run.js';
 import { getSession } from '../session/store.js';
-import { currentCaller } from './call-context.js';
+import { currentCaller, runningToolCalls } from './call-context.js';
 import { fail, failIdentity, guard, ok, type SurfaceRegistrar } from './kernel.js';
 import { toolDeclaration } from './tool-declarations.js';
 
@@ -70,6 +70,16 @@ export function registerLongRunWaitTool(reg: SurfaceRegistrar): void {
       return fail(
         'WAIT_TURN_ID_PENDING: this turn is not durably identified yet, so no external wait was armed. ' +
         'Retry session_wait once; do not start a polling loop or run replacement work.'
+      );
+    }
+    // An armed wait is a turn cut. Do not publish that cut while a sibling handler from the same
+    // executor is still capable of mutating local state; the current session_wait itself accounts
+    // for one running call. Background exec sessions are not counted here because their launching
+    // MCP call has already returned and the process wait explicitly names their durable session id.
+    if (runningToolCalls(caller.conversationId) > 1) {
+      return fail(
+        'WAIT_INFLIGHT_TOOLS: another local tool from this conversation is still running, so no wait was armed. ' +
+        'Let that call settle, reconcile its result, then retry session_wait once.'
       );
     }
     if (input.kind === 'github_run') {
