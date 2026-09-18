@@ -13,6 +13,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -183,6 +184,149 @@ const UNREACHABLE_CONFIRM_MS = 35_000;
  */
 const UNREADY_CONFIRM_MS = 15_000;
 
+export interface OpenAiTunnelLeasePaths {
+  dir: string;
+  pidFile: string;
+  healthFile: string;
+}
+
+/**
+ * Stable per-connector lease files survive an app crash long enough for the next app process to
+ * identify an orphaned tunnel-client. The hash keeps tunnel ids and labels out of temp filenames.
+ */
+export function openAiTunnelLeasePaths(tunnelId: string, label = 'tunnel'): OpenAiTunnelLeasePaths {
+  const key = createHash('sha256').update(`${label}\0${tunnelId}`).digest('hex').slice(0, 24);
+  const dir = path.join(os.tmpdir(), 'chat-on-steroids-tunnels', key);
+  return {
+    dir,
+    pidFile: path.join(dir, 'client.pid'),
+    healthFile: path.join(dir, 'health.url')
+  };
+}
+
+function processAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return Boolean((error as NodeJS.ErrnoException)?.code === 'EPERM');
+  }
+}
+
+async function readPidFile(file: string): Promise<number | null> {
+  try {
+    const value = Number.parseInt((await fs.readFile(file, 'utf8')).trim(), 10);
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+interface OpenAiClientIdentity {
+  tunnelId: string | null;
+  localUrl: string | null;
+}
+
+async function readOpenAiClientIdentity(base: string): Promise<OpenAiClientIdentity | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2_000);
+  try {
+    const response = await fetch(`${base}/api/status`, { signal: controller.signal });
+    if (!response.ok) return null;
+    const status = await response.json() as Record<string, unknown>;
+    return {
+      tunnelId: typeof status['control_plane_tunnel_id'] === 'string'
+        ? status['control_plane_tunnel_id']
+        : null,
+      localUrl: typeof status['mcp_server_url'] === 'string'
+        ? status['mcp_server_url']
+        : null
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function endpointAlive(url: string): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1_500);
+  try {
+    // Any HTTP response proves the old local CoS server still owns the route. The MCP endpoint may
+    // answer 4xx to GET and is still very much alive, so response.ok is intentionally irrelevant.
+    await fetch(url, { method: 'GET', signal: controller.signal });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 3_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!processAlive(pid)) return true;
+    await delay(50);
+  }
+  return !processAlive(pid);
+}
+
+async function retireCrashOrphan(
+  paths: OpenAiTunnelLeasePaths,
+  tunnelId: string,
+  localUrl: string,
+  tag: string
+): Promise<void> {
+  const pid = await readPidFile(paths.pidFile);
+  if (!pid) {
+    // No process identity means there is nothing we can safely kill. A stale health file is only
+    // data from an already-gone generation and may be discarded before this generation starts.
+    await fs.rm(paths.healthFile, { force: true }).catch(() => {});
+    return;
+  }
+  if (!processAlive(pid)) {
+    await Promise.all([
+      fs.rm(paths.pidFile, { force: true }).catch(() => {}),
+      fs.rm(paths.healthFile, { force: true }).catch(() => {})
+    ]);
+    return;
+  }
+
+  let base = await readHealthUrl(paths.healthFile);
+  let identity = base ? await readOpenAiClientIdentity(base) : null;
+  // A parent can die while tunnel-client is still between writing its pid file and publishing its
+  // health URL. Give that exact child a short window to finish startup before deciding ambiguity.
+  for (let i = 0; i < 10 && (!base || !identity); i += 1) {
+    await delay(100);
+    base = await readHealthUrl(paths.healthFile);
+    identity = base ? await readOpenAiClientIdentity(base) : null;
+  }
+
+  if (!identity || identity.tunnelId !== tunnelId || !identity.localUrl) {
+    throw new TunnelError(
+      'A previous tunnel client is still running, but CoS could not verify its identity safely. Stop it manually or restart the computer before reconnecting.'
+    );
+  }
+  if (identity.localUrl === localUrl || await endpointAlive(identity.localUrl)) {
+    throw new TunnelError('Another live CoS process already owns this tunnel connection.');
+  }
+
+  logWarn(`${tag}: retiring orphaned tunnel client ${pid} left by a crashed CoS process`);
+  await terminateProcessTree(pid).catch(() => {});
+  if (!(await waitForProcessExit(pid))) {
+    throw new TunnelError(
+      'The previous orphaned tunnel client could not be stopped safely. Stop it manually before reconnecting.'
+    );
+  }
+  await Promise.all([
+    fs.rm(paths.pidFile, { force: true }).catch(() => {}),
+    fs.rm(paths.healthFile, { force: true }).catch(() => {})
+  ]);
+}
+
 /** A run of unreachable complaints not yet contradicted by a completed poll. */
 export interface UnreachableRun {
   /** When the run began, or 0 when there is no run in progress. */
@@ -247,8 +391,15 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
     throw new TunnelError('Add your OpenAI tunnel API key first.');
   }
 
-  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cglf-'));
-  const healthFile = path.join(workDir, 'health.url');
+  /** Names this connector in the log, since core and desktop may both run one. */
+  const tag = opts.label ? `${opts.label} tunnel` : 'tunnel';
+  const lease = openAiTunnelLeasePaths(opts.settings.tunnelId, opts.label ?? 'tunnel');
+  await fs.mkdir(lease.dir, { recursive: true });
+  // A SIGKILL cannot run this module's normal stop path. Reclaim only a client whose own status
+  // proves it belongs to this exact tunnel and whose previous local CoS server is already gone.
+  await retireCrashOrphan(lease, opts.settings.tunnelId, opts.localUrl, tag);
+  const healthFile = lease.healthFile;
+  const pidFile = lease.pidFile;
 
   const args = [
     'run',
@@ -258,6 +409,8 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
     '127.0.0.1:0',
     '--health.url-file',
     healthFile,
+    '--pid.file',
+    pidFile,
     '--log.format',
     'json',
     '--log.level',
@@ -284,8 +437,6 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
   let retirement: Promise<void> = Promise.resolve();
   /** Consecutive failed attempts, which is what the backoff grows on. */
   let attempts = 0;
-  /** Names this connector in the log, since core and desktop both run one of these. */
-  const tag = opts.label ? `${opts.label} tunnel` : 'tunnel';
 
   const clearTimer = (): void => {
     if (timer) clearTimeout(timer);
@@ -489,8 +640,11 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
   const launch = async (): Promise<void> => {
     if (stopped || current) return;
     clearTimer();
-    // A stale URL from the previous run would otherwise be read as this run's.
-    await fs.rm(healthFile, { force: true }).catch(() => {});
+    // Stale publication files from the previous run would otherwise be read as this run's.
+    await Promise.all([
+      fs.rm(healthFile, { force: true }).catch(() => {}),
+      fs.rm(pidFile, { force: true }).catch(() => {})
+    ]);
     if (stopped || current) return;
 
     opts.report({
@@ -642,8 +796,14 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
       clearTimer();
       const active = current;
       current = null;
-      await Promise.all([retirement, stopTree(active?.proc ?? null)]);
-      await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+      await retirement;
+      const retired = await stopTree(active?.proc ?? null);
+      // Keep the stable lease on disk if shutdown could not prove the client tree stopped. A
+      // later app process can then identify/reconcile that exact survivor instead of losing the
+      // only evidence and starting a duplicate tunnel client.
+      if (retired) {
+        await fs.rm(lease.dir, { recursive: true, force: true }).catch(() => {});
+      }
     }
   };
 }

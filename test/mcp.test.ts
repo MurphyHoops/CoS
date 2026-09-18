@@ -3500,6 +3500,12 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(textOf(blocked)).toMatch(/Background session \d+ completed/);
     expect(textOf(blocked)).toContain('owed-');
 
+    // The blocked response also publishes one owed result. Automatic receipt deliberately needs
+    // a later owner request, not a request whose Date.now() start is indistinguishable from the
+    // publication itself. Full-suite load can otherwise place these sequential calls in one ms.
+    const blockedReceivedAt = Date.now();
+    await vi.waitFor(() => expect(Date.now()).toBeGreaterThan(blockedReceivedAt), { timeout: 1000, interval: 1 });
+
     const admitted = await asChat(blockedRequest, 'exec_command', {
       cmd: IS_WINDOWS ? "Write-Output 'admitted-after-drain'" : "printf '%s\\n' admitted-after-drain",
       workdir: '/workspace',
