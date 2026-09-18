@@ -239,6 +239,24 @@ export function longRunWaitFor(sessionId: string): LongRunWaitContract | null {
   return row ? cloneWait(row) : null;
 }
 
+/**
+ * Exact stale-workflow fence that does not depend on browser/request-correlation recovery.
+ *
+ * session_wait durably captured this request id while its caller identity was proven. If a crash
+ * loses the separately-debounced correlation index, the same server-side workflow may still call
+ * the connector after restart. Matching the durable source id is sufficient to reject that old
+ * executor; a different request id is never classified by this helper.
+ */
+export function longRunSourceRequestFenced(requestId: string | null | undefined): boolean {
+  if (!requestId) return false;
+  for (const work of obligations.values()) {
+    if (work.sourceRequestId !== requestId) continue;
+    if (work.reason !== 'wait_resolved' && work.reason !== 'wait_failed') continue;
+    if (work.state !== 'cancelled') return true;
+  }
+  return false;
+}
+
 export function longRunStatus(sessionId: string): {
   epoch: ExecutionEpoch | null;
   work: WorkObligation | null;
