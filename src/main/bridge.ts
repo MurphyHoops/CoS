@@ -3918,11 +3918,20 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (command.spec.type === 'resume' && !(resumeFence && sendUnattempted(resumeFence.destinationSend))) {
       return json(res, 409, { error: 'command_already_sent', final: true }, origin);
     }
-    if (command.spec.type === 'revive' && !revivalFor(command.spec.agent, command.spec.runId)) {
-      // tidyCommands() above normally retires these. This is the fail-closed twin of that:
-      // an empty revival has no message of the prime's to type, and a page must never be
-      // handed a command that would put nothing, or scaffolding alone, into a real chat.
-      return json(res, 404, { error: 'no_such_command' }, origin);
+    if (command.spec.type === 'revive') {
+      const revival = revivalFor(command.spec.agent, command.spec.runId);
+      if (!revival) {
+        // tidyCommands() above normally retires these. This is the fail-closed twin of that:
+        // an empty revival has no message of the prime's to type, and a page must never be
+        // handed a command that would put nothing, or scaffolding alone, into a real chat.
+        return json(res, 404, { error: 'no_such_command' }, origin);
+      }
+      if (!revivalLongRunAuthorityCurrent(revival)) {
+        await cleanupRevokedLongRunRevival(revival, 'its durable long-run authority was revoked before browser redeem');
+        retire(command, 'its durable long-run authority was revoked before browser redeem');
+        requestWorkerRevivals([command.spec.agent], command.spec.runId);
+        return json(res, 404, { error: 'no_such_command' }, origin);
+      }
     }
     if (
       reportedConversation &&
@@ -3959,11 +3968,21 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (command.spec.type === 'revive') {
       const claimed = await persistRevivalRedeem(command, client, claimedAt);
       if (claimed === 'stale') {
-        // A proven MCP call won `waking -> active` before this browser claimed the wake. No
-        // payload has escaped, so the page must not type the same queued words as a second user
-        // message. Retire the now-meaningless bridge command without failing the active worker.
-        retire(command, 'its worker became active before the browser claimed the wake');
+        // A proven MCP call, Stop, or another certified progress event won before browser
+        // payload disclosure. Retire the command and remove any still-unsent long-run row.
+        const revival = revivalFor(command.spec.agent, command.spec.runId);
+        if (revival) {
+          await cleanupRevokedLongRunRevival(revival, 'its durable long-run authority changed during browser redeem');
+        }
+        retire(command, 'its worker or durable long-run authority changed before browser claim completed');
+        requestWorkerRevivals([command.spec.agent], command.spec.runId);
         return json(res, 404, { error: 'no_such_command' }, origin);
+      }
+      if (claimed === 'authority-stale-after-lease') {
+        // The durable browser lease exists, so an earlier same-owner response could already have
+        // exposed the payload. Do not re-issue it and do not pretend it can be unsent. The
+        // existing command deadline retains ambiguous custody and will settle the waking worker.
+        return json(res, 409, { error: 'command_authority_revoked', final: true }, origin);
       }
       if (claimed === 'taken') return json(res, 409, { error: 'command_taken' }, origin);
       if (claimed === 'broker-not-durable') {
@@ -8723,6 +8742,32 @@ function bootstrapText(spec: CommandSpec, summary: string): string {
 /** The broker's current plan for waking one worker, or null once it is no longer waking. */
 function revivalFor(agent: string, runId: string): WorkerRevival | null {
   return pendingWorkerRevivals().find((revival) => revival.id === agent && revival.runId === runId) ?? null;
+}
+
+function revivalLongRunAuthorityCurrent(revival: WorkerRevival): boolean {
+  return revival.messageIds.every(
+    (messageId) => longRunMessageAuthority(messageId, revival.conversationId) !== 'stale'
+  );
+}
+
+async function cleanupRevokedLongRunRevival(revival: WorkerRevival, reason: string): Promise<void> {
+  let retiredAny = false;
+  for (const messageId of revival.messageIds) {
+    if (longRunMessageAuthority(messageId, revival.conversationId) !== 'stale') continue;
+    if (retireWorkerContinuationIfUnsent(revival.conversationId, messageId, reason) === 'retired') {
+      retiredAny = true;
+    }
+  }
+  if (!retiredAny) return;
+  try {
+    await persistCriticalSwarmNow();
+  } catch (error) {
+    // Safety does not depend on cleanup persistence: redeem rechecks the long-run ledger and
+    // refuses stale authority. This write merely prevents the stale broker row returning later.
+    logWarn(
+      `bridge: could not persist revoked worker-continuation cleanup — ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
 }
 
 /**
