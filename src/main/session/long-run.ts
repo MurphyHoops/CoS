@@ -242,49 +242,60 @@ export function longRunStatus(sessionId: string): {
   };
 }
 
-/** Whether any exact durable session has handed an external wait to the local supervisor. */
+/** Whether any durable wait/debt can still fence its original provider turn. */
 export function anyLongRunWaitActive(): boolean {
-  for (const wait of waits.values()) {
-    if (wait.state !== 'waiting') continue;
-    const epoch = epochs.get(wait.sessionId);
-    const work = obligations.get(wait.sessionId);
+  for (const work of obligations.values()) {
+    const epoch = epochs.get(work.sessionId);
+    const wait = waits.get(work.sessionId);
+    if (!epoch || !wait ||
+        epoch.conversationId !== work.conversationId ||
+        wait.conversationId !== work.conversationId ||
+        wait.obligationId !== work.id ||
+        wait.epochGeneration !== epoch.generation ||
+        work.epochGeneration !== epoch.generation) continue;
+    if (wait.state === 'waiting' && work.state === 'waiting') return true;
     if (
-      epoch &&
-      work &&
-      epoch.conversationId === wait.conversationId &&
-      epoch.generation === wait.epochGeneration &&
-      work.id === wait.obligationId &&
-      work.state === 'waiting' &&
-      work.conversationId === wait.conversationId &&
-      work.epochGeneration === wait.epochGeneration
+      (work.reason === 'wait_resolved' || work.reason === 'wait_failed') &&
+      !!work.sourceTurnId &&
+      (work.state === 'owed' || work.state === 'dispatching' || work.state === 'queued')
     ) return true;
   }
   return false;
 }
 
 /**
- * Hard provider-turn boundary for an armed WaitContract.
+ * Hard provider-turn boundary for a WaitContract.
  *
- * Once session_wait commits, the disposable executor has explicitly handed this external wait to
- * CoS. Ordinary MCP work from that same durable executor is therefore stale authority until the
- * wait resolves or session_wait cancels it. This is deliberately independent of model obedience:
- * prompt guidance is useful, but cannot be the only thing preventing a 50-minute polling turn.
+ * Waiting always fences ordinary tools. Resolution does not hand authority back to the old source
+ * turn: the continuation may already be queued while that provider turn is still winding down.
+ * Once the durable recorder proves a different active turn, that new executor may consume the
+ * continuation normally.
  */
-export function longRunWaitBlocksTools(sessionId: string, conversationId: string): boolean {
+export function longRunWaitBlocksTools(
+  sessionId: string,
+  conversationId: string,
+  activeTurnId: string | null = null
+): boolean {
   const epoch = epochs.get(sessionId);
   const work = obligations.get(sessionId);
   const wait = waits.get(sessionId);
-  return !!epoch &&
+  const exact = !!epoch &&
     !!work &&
     !!wait &&
     epoch.conversationId === conversationId &&
     work.conversationId === conversationId &&
     wait.conversationId === conversationId &&
-    wait.state === 'waiting' &&
-    work.state === 'waiting' &&
     wait.obligationId === work.id &&
     wait.epochGeneration === epoch.generation &&
     work.epochGeneration === epoch.generation;
+  if (!exact) return false;
+  if (wait!.state === 'waiting' && work!.state === 'waiting') return true;
+  return (
+    (work!.reason === 'wait_resolved' || work!.reason === 'wait_failed') &&
+    !!work!.sourceTurnId &&
+    activeTurnId === work!.sourceTurnId &&
+    (work!.state === 'owed' || work!.state === 'dispatching' || work!.state === 'queued')
+  );
 }
 
 export type LongRunMessageAuthority = 'unmanaged' | 'current' | 'stale';
