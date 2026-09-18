@@ -2558,6 +2558,11 @@ export function pendingWorkerRevivals(): WorkerRevival[] {
   for (const run of runs.values()) for (const agent of run.agents.values()) {
     if (agent.info.state !== 'waking' || !agent.info.conversationId) continue;
     const plan = planRevivalText(agent);
+    // A restored waking worker may contain only a revoked long-run continuation whose ExecutionEpoch
+    // moved while the process was down. Do not open a tab merely to have /commands/redeem reject an
+    // empty/stale wake; the long-run supervisor removes the provably-unsent broker row and returns
+    // the worker to sleeping on its first reconciliation pass.
+    if (plan.messageIds.length === 0) continue;
     out.push({
       id: agent.info.id,
       conversationId: agent.info.conversationId,
@@ -2668,6 +2673,11 @@ function planRevivalText(agent: Agent): { text: string; messageIds: string[] } {
     // a later revival in the meantime. This matters especially across feature-disable parking:
     // an active revived worker can be put back to sleep before it makes another tool call.
     if (message.ackedAt !== null || message.offeredViaRevival || unpublishedMessages.has(message)) continue;
+    // Planning a browser wake is itself a publication decision. Apply the same final authority
+    // fence used by the MCP inbox and /commands/redeem so restart cannot resurrect a revoked
+    // automatic continuation just because its broker row outlived the long-run ledger transition.
+    if (agent.info.role === 'worker' &&
+        longRunMessageAuthority(message.id, agent.info.conversationId ?? '') === 'stale') continue;
     if (waiting.length > 0 && chars + message.text.length > MAX_INBOX_OFFER_CHARS) break;
     waiting.push(message);
     chars += message.text.length;
@@ -2698,7 +2708,8 @@ function beginRevival(agent: Agent): WorkerAssignment {
   // report in the prime's existing inbox/history; status carries only a bounded task preview.
   agent.info.label = agent.info.id;
   agent.info.task = agent.queue
-    .filter((message) => message.ackedAt === null && !message.offeredViaRevival)
+    .filter((message) => message.ackedAt === null && !message.offeredViaRevival &&
+      longRunMessageAuthority(message.id, agent.info.conversationId ?? '') !== 'stale')
     .map((message) => message.text).join('\n\n').slice(0, MAX_TASK_CHARS);
   agent.info.result = null;
   agent.info.state = 'waking';
