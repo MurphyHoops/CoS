@@ -21,6 +21,7 @@ import { getConfig } from './config.js';
 import { getChatModels } from './chat-models.js';
 import type { ChatModelOption } from '../shared/chat-models.js';
 import { logInfo, logWarn } from './logger.js';
+import { longRunMessageAuthority } from './session/long-run.js';
 import { inheritWorkspace, releasePrimeWorkspace, bindAgentWorkspace } from './workspace.js';
 
 export const PRIME_ID = 'prime';
@@ -1931,6 +1932,12 @@ function offerAgentMessages(agent: Agent, onFinish = false): AgentMessage[] {
   let offeredChars = 0;
   for (const message of agent.queue) {
     if (message.ackedAt !== null || message.offeredViaRevival || unpublishedMessages.has(message)) continue;
+    // App-owned long-run continuations can also leave the broker through an MCP tool result when
+    // an old worker call comes alive before its browser wake completes. Apply the same execution-
+    // epoch fence here as /commands/redeem: Stop/progress/rebind revocation must close *every*
+    // delivery surface, not only the browser one. Ordinary short broker ids remain unmanaged.
+    if (agent.info.role === 'worker' &&
+        longRunMessageAuthority(message.id, agent.info.conversationId ?? '') === 'stale') continue;
     if (waiting.length > 0 && offeredChars + message.text.length > MAX_INBOX_OFFER_CHARS) break;
     waiting.push(message);
     offeredChars += message.text.length;
