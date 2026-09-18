@@ -811,7 +811,7 @@ describe('surface boundaries', () => {
     const desktopTools = toolList(await desktop('tools/list'));
 
     // Each populated surface includes code mode; find and the shell exec pair remain exclusive.
-    expect(coreTools).toHaveLength(8);
+    expect(coreTools).toHaveLength(9); // session_wait is the ninth Core control-plane tool.
     expect(desktopTools).toHaveLength(BROWSER_TOOLS.length + (IS_WINDOWS ? 16 : process.platform === 'darwin' ? 3 : 1));
 
     // And the size, which is what a discovery pull actually costs the model on every
@@ -3173,11 +3173,13 @@ describe('durable wait admission over MCP', () => {
     })).toBe('stored');
     const fresh = await modern(
       'tools/call',
-      { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } },
+      { name: 'read', arguments: { paths: ['/workspace/src/app.ts'] } },
       { 'x-request-id': `${continuationRequestId}/att1` }
     );
     expect(failed(fresh), textOf(fresh)).toBe(false);
-    expect(textOf(fresh)).toContain('note line 1');
+    // Use an immutable fixture: notes.txt is intentionally clobbered by an earlier patch
+    // regression in this end-to-end file, and this assertion is about authority admission.
+    expect(textOf(fresh)).toContain('export const name');
   });
 
   it('does not let a fulfilled wait source request revive itself through session_wait control', async () => {
