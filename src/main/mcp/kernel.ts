@@ -93,7 +93,7 @@ import { anyRecoveryFenceActive, recoveryFenceActive } from '../session/recovery
 import { acknowledgeBackgroundExecOutput, backgroundExecRecoveryNotices, offerBackgroundExecOutput } from '../codex/ownership.js';
 import { DEFAULT_MAX_OUTPUT_TOKENS } from '../codex/unified-exec-constants.js';
 import { unattributedRepairEta } from '../bridge.js';
-import { conversationAttachment, hasSupersededConversationHistory, readOverflowText } from '../session/store.js';
+import { conversationAttachment, getSession, hasSupersededConversationHistory, readOverflowText } from '../session/store.js';
 import { sessionFinishDeadline } from '../session/finish.js';
 import type { StoredText, ToolOutcome } from '../../shared/session.js';
 
@@ -652,10 +652,17 @@ async function dispatchTracked(
     ? (await conversationAttachment(context.caller.conversationId, context.caller.sessionId ?? null)) === 'superseded'
     : false;
   const recoveringConversation = recoveryFenceActive(context.caller.conversationId);
+  const longRunSession = name !== 'session_wait' && context.caller.sessionId && context.caller.conversationId
+    ? await getSession(context.caller.sessionId).catch(() => null)
+    : null;
   const longRunWaitArmed = name !== 'session_wait' &&
     !!context.caller.sessionId &&
     !!context.caller.conversationId &&
-    longRunWaitBlocksTools(context.caller.sessionId, context.caller.conversationId);
+    longRunWaitBlocksTools(
+      context.caller.sessionId,
+      context.caller.conversationId,
+      longRunSession?.activeTurnId ?? null
+    );
   // Two things about liveness, both before the agent is resolved so that the answer this
   // call gets is the state this call itself established.
   //
