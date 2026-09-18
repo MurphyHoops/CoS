@@ -387,10 +387,13 @@ export async function cancelLongRunNow(
 ): Promise<boolean> {
   return serial(async () => {
     const epoch = epochs.get(sessionId);
+    const heldWork = obligations.get(sessionId);
+    const heldWait = waits.get(sessionId);
+    if (!epoch && !heldWork && !heldWait) return true;
     if (epoch && epoch.conversationId !== conversationId) return false;
     const beforeEpoch = epoch ? cloneEpoch(epoch) : null;
-    const beforeWork = obligations.get(sessionId) ? cloneWork(obligations.get(sessionId)!) : null;
-    const beforeWait = waits.get(sessionId) ? cloneWait(waits.get(sessionId)!) : null;
+    const beforeWork = heldWork ? cloneWork(heldWork) : null;
+    const beforeWait = heldWait ? cloneWait(heldWait) : null;
     const nextEpoch = epochForWrite(sessionId, conversationId, true);
     const now = Date.now();
     const work = obligations.get(sessionId);
