@@ -12,6 +12,7 @@ import {
   agentInfoForOwnedConversation,
   persistCriticalSwarmNow,
   requestWorkerRevivals,
+  retireWorkerContinuationIfUnsent,
   stageWorkerContinuation
 } from '../agents.js';
 import { goalSwitchFor } from '../goal.js';
@@ -29,6 +30,7 @@ import {
   leaseLongRunWorkNow,
   markLongRunWorkQueuedNow,
   resolveLongRunWaitNow,
+  snapshotLongRunState,
   type ExecutionTicket,
   type LongRunWaitContract,
   type WorkObligation
@@ -285,7 +287,34 @@ async function dispatchWork(work: WorkObligation, now: number): Promise<void> {
   }
 }
 
+async function reconcileRevokedWorkerContinuations(): Promise<void> {
+  let retiredAny = false;
+  for (const work of snapshotLongRunState().obligations) {
+    if (!work.inputId || (work.state !== 'fulfilled' && work.state !== 'cancelled')) continue;
+    const retired = retireWorkerContinuationIfUnsent(
+      work.conversationId,
+      work.inputId,
+      `long-run obligation ${work.id} is ${work.state}`
+    );
+    if (retired === 'retired') retiredAny = true;
+  }
+  if (!retiredAny) return;
+  try {
+    if (!(await persistCriticalSwarmNow())) {
+      logWarn('long-run: revoked worker-continuation cleanup has no immediate durable broker sink');
+    }
+  } catch (error) {
+    // The execution fence already makes stale rows non-deliverable. A failed hygiene fsync may
+    // resurrect them after restart, but they remain stale and a later supervisor pass retries
+    // cleanup rather than converting persistence failure into duplicate work.
+    logWarn(
+      `long-run: could not persist revoked worker-continuation cleanup — ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
 export async function pollLongRunRuntime(now = Date.now()): Promise<void> {
+  await reconcileRevokedWorkerContinuations();
   for (const wait of dueLongRunWaits(now)) {
     const ticket = captureExecutionTicket(wait.sessionId, wait.conversationId);
     if (!ticket || ticket.generation !== wait.epochGeneration) continue;
