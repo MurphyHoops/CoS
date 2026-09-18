@@ -91,7 +91,7 @@ export interface LongRunSnapshot {
 export interface ArmLongRunWaitInput {
   sessionId: string;
   conversationId: string;
-  sourceTurnId: string | null;
+  sourceTurnId: string;
   kind: LongRunWaitKind;
   repository?: string | null;
   runId?: number | null;
@@ -319,6 +319,9 @@ export async function armLongRunWaitNow(input: ArmLongRunWaitInput): Promise<Lon
   return serial(async () => {
     if (!validSessionId(input.sessionId) || !validConversationId(input.conversationId)) {
       throw new Error('long_run_identity_invalid');
+    }
+    if (typeof input.sourceTurnId !== 'string' || input.sourceTurnId.length === 0 || input.sourceTurnId.length > 256) {
+      throw new Error('long_run_source_turn_invalid');
     }
     if (input.kind === 'github_run') {
       if (!input.repository || !/^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(input.repository) ||
