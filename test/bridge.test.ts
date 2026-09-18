@@ -3608,6 +3608,9 @@ describe('delivering a bootstrap', () => {
 
     expect(await cancelLongRunNow(fixture.sessionId, conversationId, 'manual Stop before any browser claim')).toBe(true);
     expect(longRunStatus(fixture.sessionId).work?.state).toBe('cancelled');
+    // Planning is also fenced: restart/status polling must not open a useless worker tab for an
+    // automatic continuation whose ExecutionEpoch was already revoked.
+    expect(pendingWorkerRevivals()).toEqual([]);
 
     // Browser cleanup is intentionally not invoked here. The stale row is still physically
     // present in the broker, which proves safety comes from the final authority fence rather than
