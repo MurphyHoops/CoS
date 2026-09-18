@@ -59,6 +59,7 @@ import {
   UNATTENDED_EXEC_NOTICE_MS
 } from '../src/main/codex/ownership.js';
 import { unifiedExecManager } from '../src/main/codex/manager.js';
+import { resetLongRunStateForTests, restoreLongRunState } from '../src/main/session/long-run.js';
 import { locateRipgrep } from '../src/main/ripgrep.js';
 import { IS_WINDOWS, makeTempDir, removeTempDir, writeTree } from './helpers.js';
 
@@ -288,6 +289,7 @@ afterAll(async () => {
 beforeEach(async () => {
   if (endpoint) await endpoint.stop();
   resetWorkspaces();
+  resetLongRunStateForTests();
   ctx.caps = withCaps({});
   ctx.readOnly = true;
   ctx.roots = [{ name: 'workspace', path: approved }];
@@ -3063,6 +3065,119 @@ describe('agent-maintained plans over MCP', () => {
     const disabled = await core('tools/call', { name: 'update_plan', arguments: { plan: [] } });
     expect(failed(disabled)).toBe(true);
     expect(textOf(disabled)).toContain('Session recording');
+  });
+});
+
+describe('durable wait admission over MCP', () => {
+  it('fails closed when session_wait cannot prove the source turn yet', async () => {
+    ctx.sessionTools = true;
+    const conversationId = 'wait-admission-source';
+    const summary = await createSession({ title: 'wait admission source', conversationId });
+    const requestId = 'wfr_wait_turn_pending';
+    expect(observeRequestCorrelation({
+      requestId,
+      conversationId,
+      sessionId: summary.id,
+      messageId: 'msg-wait-turn-pending',
+      tool: 'session_wait',
+      observedAt: Date.now()
+    })).toBe('stored');
+
+    const reply = await modern(
+      'tools/call',
+      { name: 'session_wait', arguments: { action: 'arm', kind: 'timer', seconds: 60 } },
+      { 'x-request-id': `${requestId}/att1` }
+    );
+    expect(failed(reply)).toBe(true);
+    expect(textOf(reply)).toContain('WAIT_TURN_ID_PENDING');
+  });
+
+  it('hard-fences ordinary tools while an exact durable wait is armed', async () => {
+    ctx.sessionTools = true;
+    const conversationId = 'wait-admission-current';
+    const summary = await createSession({ title: 'wait admission current', conversationId });
+    const now = Date.now();
+    const obligationId = 'obligation-wait-admission';
+    restoreLongRunState({
+      version: 1,
+      savedAt: now,
+      epochs: [{
+        sessionId: summary.id,
+        conversationId,
+        generation: 1,
+        updatedAt: now
+      }],
+      obligations: [{
+        id: obligationId,
+        sessionId: summary.id,
+        conversationId,
+        epochGeneration: 1,
+        reason: 'wait_resolved',
+        state: 'waiting',
+        sourceTurnId: 'turn-wait-source',
+        source: 'timer:test',
+        inputId: null,
+        result: null,
+        createdAt: now,
+        updatedAt: now,
+        issuedAt: null
+      }],
+      waits: [{
+        id: 'wait-admission-contract',
+        sessionId: summary.id,
+        conversationId,
+        epochGeneration: 1,
+        obligationId,
+        kind: 'timer',
+        repository: null,
+        runId: null,
+        processId: null,
+        dueAt: now + 60_000,
+        description: 'admission fence test',
+        state: 'waiting',
+        attempts: 0,
+        nextCheckAt: now + 60_000,
+        lastError: null,
+        result: null,
+        createdAt: now,
+        updatedAt: now
+      }]
+    });
+
+    const readRequest = 'wfr_wait_fenced_read';
+    expect(observeRequestCorrelation({
+      requestId: readRequest,
+      conversationId,
+      sessionId: summary.id,
+      messageId: 'msg-wait-fenced-read',
+      tool: 'read',
+      observedAt: Date.now()
+    })).toBe('stored');
+    const blocked = await modern(
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } },
+      { 'x-request-id': `${readRequest}/att1` }
+    );
+    expect(failed(blocked)).toBe(true);
+    expect(textOf(blocked)).toContain('WAIT_ARMED_FINISH_TURN');
+    expect(textOf(blocked)).toContain('No local tool was run');
+
+    const statusRequest = 'wfr_wait_status_allowed';
+    expect(observeRequestCorrelation({
+      requestId: statusRequest,
+      conversationId,
+      sessionId: summary.id,
+      messageId: 'msg-wait-status',
+      tool: 'session_wait',
+      observedAt: Date.now()
+    })).toBe('stored');
+    const status = await modern(
+      'tools/call',
+      { name: 'session_wait', arguments: { action: 'status' } },
+      { 'x-request-id': `${statusRequest}/att1` }
+    );
+    expect(failed(status), textOf(status)).toBe(false);
+    expect(textOf(status)).toContain('Durable wait timer is waiting');
   });
 });
 
