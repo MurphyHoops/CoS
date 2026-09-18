@@ -655,7 +655,7 @@ async function dispatchTracked(
   const longRunSession = name !== 'session_wait' && context.caller.sessionId && context.caller.conversationId
     ? await getSession(context.caller.sessionId).catch(() => null)
     : null;
-  const longRunWaitArmed = name !== 'session_wait' &&
+  const longRunBoundaryBefore =
     !!context.caller.sessionId &&
     !!context.caller.conversationId &&
     longRunWaitBlocksTools(
@@ -664,6 +664,9 @@ async function dispatchTracked(
       longRunSession?.activeTurnId ?? null,
       context.caller.requestId
     );
+  // session_wait status/cancel are the only calls allowed to cross an existing wait boundary.
+  // They still do not inherit ordinary broker/input side effects while that boundary is active.
+  const longRunWaitArmed = name !== 'session_wait' && longRunBoundaryBefore;
   // Two things about liveness, both before the agent is resolved so that the answer this
   // call gets is the state this call itself established.
   //
@@ -679,11 +682,11 @@ async function dispatchTracked(
   // thought asleep takes the free execution slot back for that family, so the liveness
   // bookkeeping below sees the same run it would have seen had the parking not happened. A
   // chat the user stopped from the app is refused below anyway and reclaims nothing.
-  if (!supersededConversation && !recoveringConversation && !longRunWaitArmed &&
+  if (!supersededConversation && !recoveringConversation && !longRunBoundaryBefore &&
       !isFinish && !isChatBlocked(context.caller.conversationId)) {
     reactivateDormantRunForConversation(context.caller.conversationId);
   }
-  const quietWorkers = supersededConversation || recoveringConversation || longRunWaitArmed
+  const quietWorkers = supersededConversation || recoveringConversation || longRunBoundaryBefore
     ? []
     : sleepSilentDetachedWorkers();
   for (const quiet of quietWorkers) {
@@ -692,7 +695,7 @@ async function dispatchTracked(
   // And this call is itself first-hand evidence that its own conversation is alive. That is
   // what undoes a worker given up on because its tab went away — the turn never stopped, so
   // the call arrives from a chat the app had written off, and the write-off was wrong.
-  const alive = supersededConversation || recoveringConversation || longRunWaitArmed
+  const alive = supersededConversation || recoveringConversation || longRunBoundaryBefore
     ? null
     : noteAgentAlive(context.caller.conversationId);
   if (alive?.report) await recordAgentMessage(alive.report, 'sent', context.caller.conversationId);
@@ -769,12 +772,12 @@ async function dispatchTracked(
   // Refuse and let the model retry once page evidence is healthy instead.
   // The arrival of this exact call acknowledges earlier injected input before the
   // handler reads the queue. New queued input is still offered only with its result.
-  if (!nested && !longRunWaitArmed) {
+  if (!nested && !longRunBoundaryBefore) {
     await acknowledgeToolInput(context.caller.sessionId, context.caller.conversationId, requestId, startedAt)
       .catch(() => logWarn('Prior user input receipt could not be saved; its existing claim is preserved'));
   }
   if (!nested && requestId && !blockedChat && !supersededConversation && !recoveringConversation &&
-      !longRunWaitArmed && !compacting) {
+      !longRunBoundaryBefore && !compacting) {
     const explicitPoll = name === 'write_stdin' && args && typeof args === 'object'
       ? (args as { session_id?: number }).session_id : undefined;
     await acknowledgeBackgroundExecOutput(context.caller.sessionId, startedAt, explicitPoll);
@@ -856,13 +859,29 @@ async function dispatchTracked(
   if (!context.agent) {
     context.agent = isFinish ? agentForFinishCaller(context.caller) : agentForCaller(context.caller);
   }
+  // session_wait may have armed or cancelled the durable boundary inside its handler. Re-read it
+  // before any result appendix is allowed to acknowledge or deliver work. In particular, a
+  // successful arm response must contain only the wait receipt, never a fresh inbox/user task
+  // that would entice the disposable source turn to continue working.
+  const longRunSessionAfter = context.caller.sessionId && context.caller.conversationId
+    ? await getSession(context.caller.sessionId).catch(() => null)
+    : null;
+  const longRunBoundaryAfter =
+    !!context.caller.sessionId &&
+    !!context.caller.conversationId &&
+    longRunWaitBlocksTools(
+      context.caller.sessionId,
+      context.caller.conversationId,
+      longRunSessionAfter?.activeTurnId ?? null,
+      context.caller.requestId
+    );
   // This call is the best evidence there is that the previous result reached the agent's
   // conversation, so anything offered then can be retired and written to its history —
   // except what was offered on a finish result, which this call may itself be the model's
   // retry after a lost result. The SDK exposes the JSON-RPC id, but a model-issued retry is
   // a new MCP request with a new id, so that id cannot prove the previous finish result was
   // seen. The broker therefore re-offers rather than assuming; see acknowledgeOffers.
-  const acknowledgedForConversation = supersededConversation || recoveringConversation || longRunWaitArmed || nested
+  const acknowledgedForConversation = supersededConversation || recoveringConversation || longRunBoundaryAfter || nested
     ? null
     : acknowledgeOffersForConversation(
         context.caller.conversationId,
@@ -887,7 +906,7 @@ async function dispatchTracked(
     context.caller.conversationId,
     withInbox(
       context.caller.conversationId,
-      recoveringConversation || longRunWaitArmed ? null : context.agent,
+      recoveringConversation || longRunBoundaryAfter ? null : context.agent,
       baseResult,
       isFinish
     ),
@@ -895,7 +914,7 @@ async function dispatchTracked(
   );
   // Ordinary tools carry direct user input, but only the explicit finish signal
   // advances a planned stage. Successful work is not evidence that a stage is done.
-  const userInput = nested || recoveringConversation || longRunWaitArmed
+  const userInput = nested || recoveringConversation || longRunBoundaryAfter
     ? { messages: [], reminder: '' }
     : await offerToolInput(context.caller.sessionId, context.caller.conversationId, context.caller.requestId, startedAt, name === 'session_finish' && !result.isError).catch(() => {
     logWarn('User input could not be attached; the completed tool result is preserved');
@@ -911,7 +930,7 @@ async function dispatchTracked(
     delivered = { ...delivered, content: [...delivered.content, ...attachments] };
   }
   if (!nested && handlerRan && !blockedChat && !supersededConversation && !recoveringConversation &&
-      !longRunWaitArmed && !compacting) {
+      !longRunBoundaryAfter && !compacting) {
     delivered = await withBackgroundExecRecovery(context, delivered);
   }
   if (!nested) delivered = await withIdentityRecoveredNotice(context, delivered);
