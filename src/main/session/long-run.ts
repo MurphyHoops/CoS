@@ -242,6 +242,51 @@ export function longRunStatus(sessionId: string): {
   };
 }
 
+/** Whether any exact durable session has handed an external wait to the local supervisor. */
+export function anyLongRunWaitActive(): boolean {
+  for (const wait of waits.values()) {
+    if (wait.state !== 'waiting') continue;
+    const epoch = epochs.get(wait.sessionId);
+    const work = obligations.get(wait.sessionId);
+    if (
+      epoch &&
+      work &&
+      epoch.conversationId === wait.conversationId &&
+      epoch.generation === wait.epochGeneration &&
+      work.id === wait.obligationId &&
+      work.state === 'waiting' &&
+      work.conversationId === wait.conversationId &&
+      work.epochGeneration === wait.epochGeneration
+    ) return true;
+  }
+  return false;
+}
+
+/**
+ * Hard provider-turn boundary for an armed WaitContract.
+ *
+ * Once session_wait commits, the disposable executor has explicitly handed this external wait to
+ * CoS. Ordinary MCP work from that same durable executor is therefore stale authority until the
+ * wait resolves or session_wait cancels it. This is deliberately independent of model obedience:
+ * prompt guidance is useful, but cannot be the only thing preventing a 50-minute polling turn.
+ */
+export function longRunWaitBlocksTools(sessionId: string, conversationId: string): boolean {
+  const epoch = epochs.get(sessionId);
+  const work = obligations.get(sessionId);
+  const wait = waits.get(sessionId);
+  return !!epoch &&
+    !!work &&
+    !!wait &&
+    epoch.conversationId === conversationId &&
+    work.conversationId === conversationId &&
+    wait.conversationId === conversationId &&
+    wait.state === 'waiting' &&
+    work.state === 'waiting' &&
+    wait.obligationId === work.id &&
+    wait.epochGeneration === epoch.generation &&
+    work.epochGeneration === epoch.generation;
+}
+
 export type LongRunMessageAuthority = 'unmanaged' | 'current' | 'stale';
 
 /**
