@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { initDurableStore, readDurable, resetDurableForTests } from '../src/main/durable.js';
 import {
+  anyLongRunWaitActive,
   armLongRunWaitNow,
   cancelLongRunNow,
   captureExecutionTicket,
@@ -13,6 +14,7 @@ import {
   executionTicketCurrent,
   leaseLongRunWorkNow,
   longRunStatus,
+  longRunWaitBlocksTools,
   markLongRunWorkQueuedNow,
   moveLongRunStateNow,
   noteLongRunProgressNow,
@@ -41,6 +43,72 @@ afterEach(async () => {
 });
 
 describe('durable long-run authority', () => {
+  it('uses an armed wait as exact execution authority until it is cancelled', async () => {
+    const wait = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-admission-source',
+      kind: 'timer',
+      dueAt: Date.now() + 60_000
+    });
+
+    expect(wait.state).toBe('waiting');
+    expect(anyLongRunWaitActive()).toBe(true);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A)).toBe(true);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_B)).toBe(false);
+
+    expect(await cancelLongRunNow(SESSION, CHAT_A, 'test_cancel')).toBe(true);
+    expect(anyLongRunWaitActive()).toBe(false);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A)).toBe(false);
+  });
+
+  it('does not let the source provider turn fulfill its own resolved wait debt', async () => {
+    const sourceTurnId = 'turn-causal-source';
+    const wait = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId,
+      kind: 'timer',
+      dueAt: Date.now() + 1_000
+    });
+    const ticket = captureExecutionTicket(SESSION, CHAT_A)!;
+    expect(await resolveLongRunWaitNow(SESSION, wait.id, ticket, 'timer resolved')).toBe(true);
+
+    const leased = await leaseLongRunWorkNow(SESSION, CHAT_A);
+    expect(leased?.work.inputId).toEqual(expect.any(String));
+    expect(await markLongRunWorkQueuedNow(
+      SESSION,
+      leased!.work.id,
+      leased!.ticket,
+      leased!.work.inputId!
+    )).toBe(true);
+
+    expect(await noteLongRunProgressNow(
+      SESSION,
+      CHAT_A,
+      Date.now() + 1_000,
+      sourceTurnId,
+      'terminal'
+    )).toBe(false);
+    expect(await noteLongRunProgressNow(
+      SESSION,
+      CHAT_A,
+      Date.now() + 1_001,
+      sourceTurnId,
+      'mcp'
+    )).toBe(false);
+    expect(longRunStatus(SESSION).work?.state).toBe('queued');
+
+    expect(await noteLongRunProgressNow(
+      SESSION,
+      CHAT_A,
+      Date.now() + 1_002,
+      'turn-continuation',
+      'mcp'
+    )).toBe(true);
+    expect(longRunStatus(SESSION).work?.state).toBe('fulfilled');
+  });
+
   it('turns a resolved external wait into one stable continuation obligation', async () => {
     const wait = await armLongRunWaitNow({
       sessionId: SESSION,
