@@ -69,6 +69,7 @@ import { writeDurableNow, writeDurableSoon } from '../durable.js';
 import { prepareHandoff, resumeBootstrapMatches } from './handoff.js';
 import { ensureHandoffRecorded, recordHandoff, recordNote } from './recorder.js';
 import { publishSessionRebindProjection } from './rebind.js';
+import { moveLongRunStateNow } from './long-run.js';
 import { endResumeClaim, noteResumeClaim, resetResumeGate } from './resume-gate.js';
 import {
   claimSessionReplacementTransfer,
@@ -1213,6 +1214,30 @@ export async function claimContinuationNow(token: string, claimant: string): Pro
   return { summary: entry.summary };
 }
 
+async function publishCommittedProjectionDurably(
+  entry: Continuation,
+  toConversationId: string,
+  swarm: 'absent' | 'frozen' | 'recovery'
+): Promise<boolean> {
+  // Session metadata is already authoritative at every call site below. A long-run wait can
+  // outlive the continuation WAL retention window, so its execution epoch cannot rely on the
+  // old writeDurableSoon projection being replayed after another crash. Cross this fsync
+  // boundary before the continuation is allowed to publish "committed".
+  try {
+    if (!(await moveLongRunStateNow(entry.sessionId, entry.from, toConversationId))) {
+      logWarn(`continuation ${entry.token.slice(0, 8)} could not move durable long-run authority to ${toConversationId}`);
+      return false;
+    }
+  } catch (error) {
+    logWarn(
+      `continuation ${entry.token.slice(0, 8)} long-run projection will retry — ${error instanceof Error ? error.message : String(error)}`
+    );
+    return false;
+  }
+  publishCommittedProjection(entry, toConversationId, swarm);
+  return true;
+}
+
 function publishCommittedProjection(
   entry: Continuation,
   toConversationId: string,
@@ -1296,7 +1321,9 @@ async function reconcileCommitting(entry: Continuation, toConversationId: string
         };
       }
     }
-    publishCommittedProjection(entry, toConversationId, 'recovery');
+    if (!(await publishCommittedProjectionDurably(entry, toConversationId, 'recovery'))) {
+      return { status: 'retryable', reason: 'the session moved, but long-run execution authority is not durable in the replacement chat yet' };
+    }
     await finishCommittedRecord(entry, toConversationId);
     return { status: 'already-committed', conversationId: toConversationId };
   }
@@ -1369,7 +1396,9 @@ async function reconcileCommitting(entry: Continuation, toConversationId: string
           };
         }
       }
-      publishCommittedProjection(entry, toConversationId, swarm === 'frozen' ? 'frozen' : 'absent');
+      if (!(await publishCommittedProjectionDurably(entry, toConversationId, swarm === 'frozen' ? 'frozen' : 'absent'))) {
+        return { status: 'retryable', reason: 'the session moved, but long-run execution authority is not durable in the replacement chat yet' };
+      }
       await finishCommittedRecord(entry, toConversationId);
       return { status: 'committed', conversationId: toConversationId };
     }
@@ -1390,8 +1419,11 @@ async function reconcileCommitting(entry: Continuation, toConversationId: string
     return { status: 'retryable', reason };
   }
 
-  // --- publish. Total map work only, after the authoritative durable attachment says B.
-  publishCommittedProjection(entry, toConversationId, swarm === 'frozen' ? 'frozen' : 'absent');
+  // --- publish. The authoritative durable attachment already says B. Long-run execution
+  // authority crosses its own fsync barrier before the remaining rebuildable map projections.
+  if (!(await publishCommittedProjectionDurably(entry, toConversationId, swarm === 'frozen' ? 'frozen' : 'absent'))) {
+    return { status: 'retryable', reason: 'the session moved, but long-run execution authority is not durable in the replacement chat yet' };
+  }
   await finishCommittedRecord(entry, toConversationId);
   logInfo(
     `continuation ${entry.token.slice(0, 8)} committed: session ${entry.sessionId} is now chat ${toConversationId}`
