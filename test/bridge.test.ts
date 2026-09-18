@@ -3599,6 +3599,24 @@ describe('delivering a bootstrap', () => {
     expect(offerMessages('worker-1')).toEqual([]);
   });
 
+  it('never offers a revoked long-run worker continuation through the MCP inbox path', async () => {
+    const conversationId = 'b0b0b0b0-7654-4210-8edc-ba9876543210';
+    const fixture = await prepareLongRunWorkerRevival(
+      conversationId,
+      'This stale continuation must be fenced from an old worker MCP result.'
+    );
+
+    expect(await cancelLongRunNow(fixture.sessionId, conversationId, 'manual Stop before any browser claim')).toBe(true);
+    expect(longRunStatus(fixture.sessionId).work?.state).toBe('cancelled');
+
+    // Browser cleanup is intentionally not invoked here. The stale row is still physically
+    // present in the broker, which proves safety comes from the final authority fence rather than
+    // lucky cleanup ordering. The periodic long-run supervisor removes this hygiene row later.
+    expect(snapshotSwarm()?.agents.find((entry) => entry.info.id === 'worker-1')?.queue.map((row) => row.id))
+      .toEqual([fixture.inputId]);
+    expect(offerMessages('worker-1')).toEqual([]);
+  });
+
   it('revokes a long-run worker wake that is stopped while its broker claim fsync is paused', async () => {
     const conversationId = 'b1b1b1b1-7654-4210-8edc-ba9876543210';
     const fixture = await prepareLongRunWorkerRevival(
