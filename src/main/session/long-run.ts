@@ -48,6 +48,8 @@ export interface WorkObligation {
   reason: LongRunWorkReason;
   state: LongRunWorkState;
   sourceTurnId: string | null;
+  /** Exact ChatGPT MCP workflow id for the source provider turn. New wait admissions always set it. */
+  sourceRequestId?: string | null;
   source: string | null;
   inputId: string | null;
   result: string | null;
@@ -92,6 +94,7 @@ export interface ArmLongRunWaitInput {
   sessionId: string;
   conversationId: string;
   sourceTurnId: string;
+  sourceRequestId?: string | null;
   kind: LongRunWaitKind;
   repository?: string | null;
   runId?: number | null;
@@ -172,7 +175,13 @@ export function restoreLongRunState(snapshot: LongRunSnapshot | null): void {
     const epoch = epochs.get(raw.sessionId);
     if (!epoch || epoch.conversationId !== raw.conversationId || epoch.generation !== raw.epochGeneration) continue;
     const current = obligations.get(raw.sessionId);
-    if (!current || raw.updatedAt > current.updatedAt) obligations.set(raw.sessionId, cloneWork(raw));
+    const normalized = cloneWork({
+      ...raw,
+      sourceRequestId: typeof raw.sourceRequestId === 'string' && raw.sourceRequestId.length > 0
+        ? raw.sourceRequestId.slice(0, 200)
+        : null
+    });
+    if (!current || raw.updatedAt > current.updatedAt) obligations.set(raw.sessionId, normalized);
   }
 
   for (const raw of Array.isArray(snapshot.waits) ? snapshot.waits : []) {
@@ -274,6 +283,7 @@ export function anyLongRunWaitActive(): boolean {
 export function longRunWaitBlocksTools(
   sessionId: string,
   conversationId: string,
+  requestId: string | null = null,
   activeTurnId: string | null = null
 ): boolean {
   const epoch = epochs.get(sessionId);
@@ -290,12 +300,16 @@ export function longRunWaitBlocksTools(
     work.epochGeneration === epoch.generation;
   if (!exact) return false;
   if (wait!.state === 'waiting' && work!.state === 'waiting') return true;
-  return (
-    (work!.reason === 'wait_resolved' || work!.reason === 'wait_failed') &&
-    !!work!.sourceTurnId &&
-    activeTurnId === work!.sourceTurnId &&
-    (work!.state === 'owed' || work!.state === 'dispatching' || work!.state === 'queued')
-  );
+  if (
+    (work!.reason !== 'wait_resolved' && work!.reason !== 'wait_failed') ||
+    (work!.state !== 'owed' && work!.state !== 'dispatching' && work!.state !== 'queued')
+  ) return false;
+  // New waits pin the exact ChatGPT workflow id. A late request from the source turn remains
+  // fenced even after the recorder has already closed that turn, while the first call from the
+  // continuation's new request id is admitted immediately. Legacy snapshots without this field
+  // retain the older activeTurnId fallback rather than silently widening authority.
+  if (work!.sourceRequestId) return !requestId || requestId === work!.sourceRequestId;
+  return !!work!.sourceTurnId && activeTurnId === work!.sourceTurnId;
 }
 
 export type LongRunMessageAuthority = 'unmanaged' | 'current' | 'stale';
@@ -334,6 +348,10 @@ export async function armLongRunWaitNow(input: ArmLongRunWaitInput): Promise<Lon
     if (typeof input.sourceTurnId !== 'string' || input.sourceTurnId.length === 0 || input.sourceTurnId.length > 256) {
       throw new Error('long_run_source_turn_invalid');
     }
+    if (input.sourceRequestId !== undefined && input.sourceRequestId !== null &&
+        (typeof input.sourceRequestId !== 'string' || input.sourceRequestId.length === 0 || input.sourceRequestId.length > 200)) {
+      throw new Error('long_run_source_request_invalid');
+    }
     if (input.kind === 'github_run') {
       if (!input.repository || !/^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(input.repository) ||
           typeof input.runId !== 'number' || !Number.isSafeInteger(input.runId) || input.runId <= 0) {
@@ -362,6 +380,7 @@ export async function armLongRunWaitNow(input: ArmLongRunWaitInput): Promise<Lon
         beforeWork?.state === 'waiting' &&
         beforeWait.obligationId === beforeWork.id &&
         beforeWork.sourceTurnId === input.sourceTurnId &&
+        (input.sourceRequestId == null || beforeWork.sourceRequestId === input.sourceRequestId) &&
         (input.kind !== 'github_run' ||
           (beforeWait.repository === input.repository && beforeWait.runId === input.runId)) &&
         (input.kind !== 'process' || beforeWait.processId === input.processId);
@@ -378,6 +397,7 @@ export async function armLongRunWaitNow(input: ArmLongRunWaitInput): Promise<Lon
       reason: 'wait_resolved',
       state: 'waiting',
       sourceTurnId: input.sourceTurnId,
+      sourceRequestId: input.sourceRequestId ?? null,
       source: input.kind === 'github_run' ? `github:${input.repository}:${input.runId}`
         : input.kind === 'process' ? `process:${input.processId}`
           : `timer:${input.dueAt}`,
@@ -569,6 +589,7 @@ export async function ensureRecoveryWorkNow(
       reason: 'recovery_resume',
       state: 'owed',
       sourceTurnId,
+      sourceRequestId: null,
       source: clip(source, 300),
       inputId: null,
       result: null,
