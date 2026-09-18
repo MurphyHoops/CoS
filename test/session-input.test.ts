@@ -15,6 +15,12 @@ import { noteChatOrigin } from '../src/main/session/recorder.js';
 import { stageInputAttachment } from '../src/main/session/input-attachments.js';
 import { listUsageSessions, turnHasMcpCall } from '../src/main/session/store.js';
 import { trackInFlight, emptyEvidence, type CallContext } from '../src/main/mcp/call-context.js';
+import {
+  ensureRecoveryWorkNow,
+  leaseLongRunWorkNow,
+  noteLongRunProgressNow,
+  resetLongRunStateForTests
+} from '../src/main/session/long-run.js';
 // Ownership tests inspect messages; batch-specific assertions use the complete delivery below.
 const offerToolInput = async (...args: Parameters<typeof offerToolInputBatch>) => (await offerToolInputBatch(...args)).messages;
 vi.mock('../src/main/session/recorder.js', () => ({ noteChatOrigin: vi.fn(async () => undefined) }));
@@ -59,6 +65,7 @@ beforeEach(async () => {
   openings.clear();
   vi.mocked(noteChatOrigin).mockClear();
   resetInputForTests();
+  resetLongRunStateForTests();
   automate.mockReset();
   changed.mockReset();
   configureInputDelivery({ applyAutomation: automate, changed });
@@ -79,11 +86,41 @@ beforeEach(async () => {
 afterEach(async () => {
   vi.restoreAllMocks();
   resetInputForTests();
+  resetLongRunStateForTests();
   resetDurableForTests();
   await fs.rm(directory, { recursive: true, force: true });
 });
 
 describe('durable user input ownership', () => {
+  it('retires a provably-unsent long-run continuation after certified progress revokes its authority', async () => {
+    const work = await ensureRecoveryWorkNow(sessionId, binding.conversationId, 'recovery:test');
+    const leased = await leaseLongRunWorkNow(sessionId, binding.conversationId);
+    expect(leased?.work.id).toBe(work?.id);
+    const row = await enqueueInput(input({
+      id: leased!.work.inputId!,
+      text: 'Continue durable work',
+      mode: 'after-turn'
+    }), undefined, leased!.work.id);
+    expect(row).toMatchObject({ state: 'queued', longRunObligationId: leased!.work.id });
+
+    now += 1;
+    expect(await noteLongRunProgressNow(
+      sessionId,
+      binding.conversationId,
+      now,
+      'new-turn',
+      'mcp'
+    )).toBe(true);
+
+    resetInputForTests();
+    const restored = (await listInputs()).find(entry => entry.id === row.id);
+    expect(restored).toMatchObject({
+      state: 'cancelled',
+      error: 'Automatic continuation retired because durable execution authority advanced.'
+    });
+    expect(await pendingBrowserInputs()).toEqual([]);
+  });
+
   it('preserves messages beyond the former composer limit through admission, restart and browser claim', async () => {
     binding.finishEnabled = false;
     const text = 'Long user request. '.repeat(2000);
