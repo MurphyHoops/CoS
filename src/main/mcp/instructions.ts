@@ -106,8 +106,8 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform): string {
       'Output is capped. When truncated, narrow the command or read the relevant region rather than repeating the same request.'
     );
     if (windows) lines.push(
-      'PowerShell does not expand * or ? for native programs: pass ripgrep filename patterns as -g \'*.go\', and expand other globs with Get-ChildItem.',
-      'Bare rg/ripgrep is bound to the app’s bundled ripgrep. In Windows PowerShell, omit 2>&1 on native programs: stderr is already captured and that redirect can leave $? false after exit 0.',
+      'PowerShell does not expand * or ? for native programs. Use rg -g \'*.go\' or Get-ChildItem.',
+      'Bare rg/ripgrep uses bundled ripgrep. Omit 2>&1: stderr is captured, and redirect may leave $? false after exit 0.',
       ...(LAUNCHES_WINDOWS_POWERSHELL_5 ? ['This is Windows PowerShell 5.1, without && or ||. Use cmds or A; if ($?) { B }.'] : [])
     );
     else lines.push('exec_command uses the host’s normal POSIX shell (zsh/bash/sh unless requested otherwise). The bundled ripgrep directory is first on PATH.');
