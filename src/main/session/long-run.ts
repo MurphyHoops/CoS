@@ -589,7 +589,8 @@ export async function noteLongRunProgressNow(
   sessionId: string,
   conversationId: string,
   progressAt: number,
-  turnId: string | null
+  turnId: string | null,
+  evidence: 'mcp' | 'terminal'
 ): Promise<boolean> {
   return serial(async () => {
     const epoch = epochs.get(sessionId);
@@ -598,6 +599,9 @@ export async function noteLongRunProgressNow(
         work.epochGeneration !== epoch.generation ||
         !['owed', 'dispatching', 'queued'].includes(work.state) ||
         !Number.isFinite(progressAt) || progressAt <= work.createdAt) return false;
+    // Recovery continuation is proven only by a new local MCP call. A provider final can be the
+    // short "recovered" answer that exposed the original liveness bug and must not erase debt.
+    if (work.reason === 'recovery_resume' && evidence !== 'mcp') return false;
     if ((work.reason === 'wait_resolved' || work.reason === 'wait_failed') &&
         work.sourceTurnId && (!turnId || turnId === work.sourceTurnId)) return false;
 
