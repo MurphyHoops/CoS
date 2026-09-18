@@ -283,8 +283,8 @@ export function anyLongRunWaitActive(): boolean {
 export function longRunWaitBlocksTools(
   sessionId: string,
   conversationId: string,
-  requestId: string | null = null,
-  activeTurnId: string | null = null
+  activeTurnId: string | null = null,
+  requestId: string | null = null
 ): boolean {
   const epoch = epochs.get(sessionId);
   const work = obligations.get(sessionId);
