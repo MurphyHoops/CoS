@@ -661,8 +661,8 @@ async function dispatchTracked(
     longRunWaitBlocksTools(
       context.caller.sessionId,
       context.caller.conversationId,
-      context.caller.requestId,
-      longRunSession?.activeTurnId ?? null
+      longRunSession?.activeTurnId ?? null,
+      context.caller.requestId
     );
   // Two things about liveness, both before the agent is resolved so that the answer this
   // call gets is the state this call itself established.
