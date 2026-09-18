@@ -25,7 +25,7 @@ export function registerLongRunWaitTool(reg: SurfaceRegistrar): void {
     description:
       'Hand a long external wait to the local CoS supervisor, then finish this turn instead of polling. ' +
       'Use action=arm for GitHub Actions runs, a background exec session, or a timer. CoS durably monitors it and queues one continuation when it resolves. ' +
-      'Use status to inspect the durable wait/work obligation and cancel to revoke it. Do not repeatedly poll the condition after arm succeeds.',
+      'Arming is a hard provider-turn boundary: ordinary tools from this executor are refused until resolution or cancel. Use status to inspect the durable wait/work obligation and cancel to revoke it.',
     inputSchema: z.object({
       action: z.enum(['arm', 'status', 'cancel']),
       kind: z.enum(['github_run', 'process', 'timer']).optional(),
@@ -117,7 +117,7 @@ export function registerLongRunWaitTool(reg: SurfaceRegistrar): void {
         type: 'text' as const,
         text:
           `Durable ${wait.kind} wait armed. Finish this turn now; CoS will monitor it locally and queue exactly one continuation when it resolves. ` +
-          'Do not poll the condition from this provider turn.'
+          'Ordinary tools in this executor are now fenced; only session_wait status/cancel remains available until the wait resolves.'
       }],
       structuredContent: {
         wait_id: wait.id,
