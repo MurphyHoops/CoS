@@ -594,7 +594,7 @@ describe('surface boundaries', () => {
     everything();
     const names = toolNames(await core('tools/list'));
     // find is absent because exec_command is present — they are mutually exclusive.
-    expect(names).toEqual(['agents', 'apply_patch', 'exec', 'exec_command', 'read', 'update_plan', 'view_image', 'write_stdin']);
+    expect(names).toEqual(['agents', 'apply_patch', 'exec', 'exec_command', 'read', 'session_wait', 'update_plan', 'view_image', 'write_stdin']);
     for (const name of surfaceDefinition('desktop').tools.filter(name => name !== 'exec')) expect(names, name).not.toContain(name);
   });
 
@@ -1121,6 +1121,7 @@ describe('capability gating', () => {
   it('offers plans and agents only when enabled, without session lookup', async () => {
     expect(toolNames(await core('tools/list'))).not.toContain('session');
     expect(toolNames(await core('tools/list'))).not.toContain('update_plan');
+    expect(toolNames(await core('tools/list'))).not.toContain('session_wait');
     expect(toolNames(await core('tools/list'))).not.toContain('agents');
 
     ctx.sessionTools = true;
@@ -1128,6 +1129,7 @@ describe('capability gating', () => {
     const names = toolNames(await core('tools/list'));
     expect(names).not.toContain('session');
     expect(names).toContain('update_plan');
+    expect(names).toContain('session_wait');
     expect(names).toContain('agents');
   });
 
