@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   runCommand: vi.fn(),
+  getConfig: vi.fn(),
   goalSwitchFor: vi.fn(),
   agentInfoForOwnedConversation: vi.fn(),
   persistCriticalSwarmNow: vi.fn(),
@@ -19,6 +20,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('../src/main/exec.js', () => ({ runCommand: mocks.runCommand }));
+vi.mock('../src/main/config.js', () => ({ getConfig: mocks.getConfig }));
 vi.mock('../src/main/goal.js', () => ({ goalSwitchFor: mocks.goalSwitchFor }));
 vi.mock('../src/main/agents.js', () => ({
   agentInfoForOwnedConversation: mocks.agentInfoForOwnedConversation,
@@ -58,6 +60,7 @@ beforeEach(async () => {
   directory = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-long-run-runtime-'));
   initDurableStore(directory);
 
+  mocks.getConfig.mockReturnValue({ multiAgent: { enabled: true } });
   mocks.goalSwitchFor.mockReturnValue({ enabled: false, mode: 'goal', own: true, afterTurn: false });
   mocks.agentInfoForOwnedConversation.mockReturnValue(null);
   mocks.persistCriticalSwarmNow.mockResolvedValue(true);
@@ -187,6 +190,30 @@ describe('local long-run supervisor', () => {
       reason: 'recovery_resume',
       state: 'queued'
     });
+  });
+
+  it('parks worker continuation debt while multi-agent mode is disabled', async () => {
+    mocks.getConfig.mockReturnValue({ multiAgent: { enabled: false } });
+    mocks.agentInfoForOwnedConversation.mockReturnValue({
+      id: 'worker-1',
+      role: 'worker',
+      runId: 'run-1',
+      primeConversationId: 'prime-conversation',
+      state: 'sleeping'
+    });
+    mocks.getSession.mockResolvedValue({
+      id: SESSION,
+      conversationId: CHAT,
+      recovery: null,
+      origin: { kind: 'worker' }
+    });
+    const work = await ensureRecoveryWorkNow(SESSION, CHAT, 'recovery:episode:disabled');
+
+    await pollLongRunRuntime(work!.createdAt + 90_001);
+
+    expect(mocks.stageWorkerContinuation).not.toHaveBeenCalled();
+    expect(mocks.enqueueInput).not.toHaveBeenCalled();
+    expect(longRunStatus(SESSION).work).toMatchObject({ id: work!.id, state: 'dispatching' });
   });
 
   it('does not bypass the agent broker while a worker is still active', async () => {
