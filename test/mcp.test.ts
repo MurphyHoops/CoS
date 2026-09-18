@@ -3092,6 +3092,94 @@ describe('durable wait admission over MCP', () => {
     expect(textOf(reply)).toContain('WAIT_TURN_ID_PENDING');
   });
 
+  it('keeps a late source request fenced after resolution but admits the new continuation request immediately', async () => {
+    ctx.sessionTools = true;
+    const conversationId = 'wait-resolved-request-fence';
+    const summary = await createSession({ title: 'resolved request fence', conversationId });
+    const now = Date.now();
+    const sourceRequestId = 'wfr_wait_resolved_source';
+    const obligationId = 'obligation-wait-resolved-request';
+    restoreLongRunState({
+      version: 1,
+      savedAt: now,
+      epochs: [{
+        sessionId: summary.id,
+        conversationId,
+        generation: 1,
+        updatedAt: now
+      }],
+      obligations: [{
+        id: obligationId,
+        sessionId: summary.id,
+        conversationId,
+        epochGeneration: 1,
+        reason: 'wait_resolved',
+        state: 'owed',
+        sourceTurnId: 'turn-resolved-source',
+        sourceRequestId,
+        source: 'timer:test',
+        inputId: null,
+        result: 'timer resolved',
+        createdAt: now - 1_000,
+        updatedAt: now,
+        issuedAt: null
+      }],
+      waits: [{
+        id: 'wait-resolved-contract',
+        sessionId: summary.id,
+        conversationId,
+        epochGeneration: 1,
+        obligationId,
+        kind: 'timer',
+        repository: null,
+        runId: null,
+        processId: null,
+        dueAt: now - 1,
+        description: 'resolved request fence test',
+        state: 'resolved',
+        attempts: 0,
+        nextCheckAt: now,
+        lastError: null,
+        result: 'timer resolved',
+        createdAt: now - 1_000,
+        updatedAt: now
+      }]
+    });
+
+    expect(observeRequestCorrelation({
+      requestId: sourceRequestId,
+      conversationId,
+      sessionId: summary.id,
+      messageId: 'msg-wait-resolved-source',
+      tool: 'read',
+      observedAt: Date.now()
+    })).toBe('stored');
+    const stale = await modern(
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } },
+      { 'x-request-id': `${sourceRequestId}/att1` }
+    );
+    expect(failed(stale)).toBe(true);
+    expect(textOf(stale)).toContain('WAIT_ARMED_FINISH_TURN');
+
+    const continuationRequestId = 'wfr_wait_resolved_continuation';
+    expect(observeRequestCorrelation({
+      requestId: continuationRequestId,
+      conversationId,
+      sessionId: summary.id,
+      messageId: 'msg-wait-resolved-continuation',
+      tool: 'read',
+      observedAt: Date.now()
+    })).toBe('stored');
+    const fresh = await modern(
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } },
+      { 'x-request-id': `${continuationRequestId}/att1` }
+    );
+    expect(failed(fresh), textOf(fresh)).toBe(false);
+    expect(textOf(fresh)).toContain('note line 1');
+  });
+
   it('hard-fences ordinary tools while an exact durable wait is armed', async () => {
     ctx.sessionTools = true;
     const conversationId = 'wait-admission-current';
