@@ -876,12 +876,10 @@ export function noteInputStartupError(id: string, error: string | null): Promise
 async function eligibleStageEnd(entry: InputEntry): Promise<string | null> {
   if (!entry.sessionId) return null;
   const session = await getSession(entry.sessionId);
-  if (!session) return null;
-  // Ordinary outbox work never authors a worker chat. A long-run continuation is different:
-  // it is app-owned execution debt for this exact durable worker session, and its own authority
-  // is rechecked here and again at claim/Send. This lets a slept worker receive the one
-  // continuation that restarts its same task without inventing a Prime->Worker broker message.
-  if (session.origin?.kind === 'worker' && !entry.longRunObligationId) return null;
+  // Worker continuation delivery is owned exclusively by the durable agent revival broker.
+  // Never author a worker chat through the ordinary session-input outbox, even when the row
+  // carries long-run authority: that would bypass slot reservation and waking/ACK fencing.
+  if (!session || session.origin?.kind === 'worker') return null;
   if (entry.longRunObligationId && !(await longRunInputCurrent(entry))) return null;
   const [end] = await readRecentEvents(entry.sessionId, 1, { kinds: ['turn_start', 'turn_end'] });
   // A later native final cannot erase an actual busy rejection. Keep this
