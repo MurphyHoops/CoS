@@ -146,6 +146,59 @@ describe('durable user input ownership', () => {
     expect(await claimBrowserInput(row.id, 'worker-wait-page', binding.conversationId, true)).toBeNull();
   });
 
+  it('retires an authorized stale long-run claim as an ambiguous tombstone and still accepts a late ACK', async () => {
+    binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'wait-source-authorized', time: 900 };
+    now = 1_000;
+    const work = await ensureRecoveryWorkNow(
+      sessionId,
+      binding.conversationId,
+      'recovery:authorized-stale',
+      'wait-source-authorized'
+    );
+    const leased = await leaseLongRunWorkNow(sessionId, binding.conversationId);
+    const row = await enqueueInput(input({
+      id: leased!.work.inputId!,
+      text: 'Continue after ambiguous browser send',
+      mode: 'after-turn'
+    }), undefined, work!.id);
+
+    const claim = await claimBrowserInput(row.id, 'ambiguous-page', binding.conversationId, true);
+    expect(claim).toMatchObject({ id: row.id, state: 'browser' });
+    expect(await authorizeBrowserInput(row.id, 'ambiguous-page', binding.conversationId)).toBe(true);
+
+    now += 1;
+    expect(await noteLongRunProgressNow(
+      sessionId,
+      binding.conversationId,
+      now,
+      'new-certified-turn',
+      'mcp'
+    )).toBe(true);
+
+    resetInputForTests();
+    const retired = (await listInputs()).find(entry => entry.id === row.id);
+    expect(retired).toMatchObject({
+      state: 'cancelled',
+      owner: 'ambiguous-page'
+    });
+    expect(retired?.sendAuthorizedAt).toEqual(expect.any(Number));
+    expect(retired?.error).toContain('may already have been sent and will not be resent');
+
+    // Tombstoning releases local queue authority without rewriting history. If the old browser
+    // later proves the original Send landed, that exact receipt may still settle the tombstone.
+    expect(await acknowledgeBrowserInput(
+      row.id,
+      'ambiguous-page',
+      binding.conversationId,
+      'late-confirmed-message'
+    )).toBe(true);
+    expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({
+      state: 'cancelled',
+      messageId: 'late-confirmed-message',
+      error: 'Cancelled locally; delivery was later confirmed in ChatGPT.'
+    });
+  });
+
   it('retires a provably-unsent long-run continuation after certified progress revokes its authority', async () => {
     const work = await ensureRecoveryWorkNow(sessionId, binding.conversationId, 'recovery:test');
     const leased = await leaseLongRunWorkNow(sessionId, binding.conversationId);
