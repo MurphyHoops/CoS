@@ -399,10 +399,24 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
     // Long-run continuations carry their own execution epoch. If newer certified progress,
     // Stop, or a rebind revoked that authority before native Send/tool delivery, retire the
     // provably-unsent row instead of leaving a permanent ghost in the outbox.
-    if (row.longRunObligationId &&
-        (row.state === 'queued' || (row.state === 'browser' && row.sendAuthorizedAt === undefined)) &&
-        !(await longRunInputCurrent(row))) {
-      return { ...row, state: 'cancelled', error: 'Automatic continuation retired because durable execution authority advanced.' };
+    if (row.longRunObligationId && !(await longRunInputCurrent(row))) {
+      if (row.state === 'queued' || (row.state === 'browser' && row.sendAuthorizedAt === undefined)) {
+        return { ...row, state: 'cancelled', error: 'Automatic continuation retired because durable execution authority advanced.' };
+      }
+      if (row.state === 'browser' && row.sendAuthorizedAt !== undefined) {
+        // Send crossed the irreversible browser boundary, so replay is forbidden. Once a newer
+        // certified progress/Stop/cancel has revoked this long-run obligation, however, keeping
+        // the ambiguous row nonterminal forever would pin the durable session's only input slot.
+        // Retire it as a tombstone instead: a late browser ACK is still accepted below and can
+        // confirm that the original Send landed, but no path may resend these bytes.
+        return {
+          ...row,
+          state: 'cancelled',
+          error:
+            'Automatic continuation authority advanced after Send was authorized. Delivery is unconfirmed; ' +
+            'the message may already have been sent and will not be resent.'
+        };
+      }
     }
     if (row.state === 'queued' && row.delivery === 'tool' && row.toolTurnId) {
       const session = row.sessionId ? await getSession(row.sessionId) : null;
