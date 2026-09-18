@@ -101,6 +101,36 @@ describe('durable long-run authority', () => {
     })).rejects.toThrow('long_run_wait_already_active');
   });
 
+  it('treats a retried timer arm and repeated cancel as the same durable operation', async () => {
+    const firstDue = Date.now() + 10_000;
+    const first = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-retry',
+      kind: 'timer',
+      dueAt: firstDue
+    });
+    const generation = executionEpochFor(SESSION)!.generation;
+
+    // The provider can lose the tool result and retry the same semantic call later. A timer's
+    // recomputed dueAt must not extend the original deadline or advance execution authority.
+    const retry = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-retry',
+      kind: 'timer',
+      dueAt: firstDue + 5_000
+    });
+    expect(retry.id).toBe(first.id);
+    expect(retry.dueAt).toBe(firstDue);
+    expect(executionEpochFor(SESSION)!.generation).toBe(generation);
+
+    expect(await cancelLongRunNow(SESSION, CHAT_A, 'manual_stop')).toBe(true);
+    const cancelledGeneration = executionEpochFor(SESSION)!.generation;
+    expect(await cancelLongRunNow(SESSION, CHAT_A, 'manual_stop')).toBe(true);
+    expect(executionEpochFor(SESSION)!.generation).toBe(cancelledGeneration);
+  });
+
   it('moves work and wait with A to B and fences the stale A epoch', async () => {
     const wait = await armLongRunWaitNow({
       sessionId: SESSION,
