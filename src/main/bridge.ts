@@ -7939,7 +7939,7 @@ function noteCallAttribution(
     // when Chrome, the tab or a reload destroyed the page's local turn projection.
     const sourceTurnId = filedSession?.activeTurnId ?? previous?.turnId ??
       goalPendingReplyFor(conversationId)?.silenceSourceTurnId ?? filedSession?.finishTurn?.turnId ?? null;
-    void noteLongRunProgressNow(sessionId, conversationId, startedAt, sourceTurnId, 'mcp')
+    void noteLongRunProgressNow(sessionId, conversationId, startedAt, sourceTurnId, 'mcp', requestId)
       .catch(error => logWarn(`long-run: could not persist certified MCP progress: ${String(error)}`));
     void revokeSilenceInputs(sessionId).catch(error => logWarn(`input: could not withdraw silence pickup: ${String(error)}`));
     void revokeSilenceLoop(conversationId).catch(error => logWarn(`goal: could not withdraw silence pickup: ${String(error)}`));
