@@ -58,6 +58,7 @@ const {
   cancelResume,
   commandUrl,
   pendingCommands,
+  queueEmergencyResume,
   queueResume,
   resetBridgeForTests,
   restoreCommands,
@@ -76,6 +77,7 @@ const {
   WORKER_BOOTSTRAP_LIMIT_MS,
   WORKER_REDEEM_MS,
   BROWSER_RECOVERY_COOLDOWN_MS,
+  BROWSER_REPAIR_ACK_CUSTODY_MS,
   DEFAULT_PORTS,
   startBridge,
   stopBridge,
@@ -154,6 +156,8 @@ const {
 );
 const { makeTempDir, removeTempDir, SAMPLE_BRIEF, faultGate } = await import('./helpers.js');
 const { resumeBootstrapText } = await import('../src/main/session/handoff.js');
+const { beginSelfHealingEpisode, setSelfHealingRecoveryHooksForTests } = await import('../src/main/session/self-healing.js');
+const { SELF_HEAL_POST_RELOAD_MS } = await import('../src/shared/recovery.js');
 const { getLog } = await import('../src/main/logger.js');
 
 const EXTENSION_ORIGIN = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop';
@@ -366,10 +370,24 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
+  setSelfHealingRecoveryHooksForTests({});
   recoveryBrowserWake.mockClear();
   vi.mocked(safeStorage.isAsyncEncryptionAvailable).mockResolvedValue(true);
   // A test that writes its own config is not allowed to leak it into the next one.
   await saveConfig(suiteConfig);
+  // Provider-replacement ownership is now durable session state. Earlier bridge tests intentionally
+  // reused conversation ids across cases while resetBridgeForTests only cleared process memory;
+  // retire any exact transaction left by the previous case before that memory is discarded.
+  for (const session of await sessionStoreModule.indexedSessions()) {
+    const transfer = session.replacementTransfer;
+    if (!transfer) continue;
+    await sessionStoreModule.releaseSessionReplacementTransfer(session.id, {
+      kind: transfer.kind,
+      transactionId: transfer.transactionId,
+      sourceConversationId: transfer.sourceConversationId,
+      recoveryGeneration: transfer.recoveryGeneration
+    });
+  }
   // The swarm goes first: ending a run queues stop notices into the chats of any workers
   // still live, and those would otherwise be dropped into the queue the bridge reset had
   // just emptied — the previous test's cleanup showing up as the next test's first command.
@@ -2661,8 +2679,9 @@ describe('delivering a bootstrap', () => {
    */
   it('names the chat it opened after the work, not after the bootstrap it typed', async () => {
     await pair();
-    const source = await createSession({ title: 'Harden the MCP workflows' });
-    const command = queueResume(source.id, await readyContinuation(source.id, 'carry on'))!;
+    const sourceChat = '10101010-aaaa-4aaa-8aaa-101010101010';
+    const source = await createSession({ title: 'Harden the MCP workflows', conversationId: sourceChat });
+    const command = queueResume(source.id, await readyContinuation(source.id, 'carry on', sourceChat))!;
     await redeem(command.id);
     const conversationId = 'cccccccc-dddd-eeee-ffff-000000000000';
     await request('POST', '/commands/ack', { body: { id: command.id, status: 'sent', conversationId } });
@@ -2751,8 +2770,9 @@ describe('delivering a bootstrap', () => {
   /** A bootstrap that never reached a tab has no chat to name. */
   it('does not name anything for a failed acknowledgement', async () => {
     await pair();
-    const source = await createSession({ title: 'Never opened' });
-    const command = queueResume(source.id, await readyContinuation(source.id, 'carry on'))!;
+    const sourceChat = '20202020-bbbb-4bbb-8bbb-202020202020';
+    const source = await createSession({ title: 'Never opened', conversationId: sourceChat });
+    const command = queueResume(source.id, await readyContinuation(source.id, 'carry on', sourceChat))!;
     await redeem(command.id);
     const conversationId = 'dddddddd-eeee-ffff-0000-111111111111';
     await request('POST', '/commands/ack', {
@@ -2972,7 +2992,7 @@ describe('delivering a bootstrap', () => {
     expect(first.body).toMatchObject({ final: true, committed: true, conversationId });
     await flushDurable();
     const stored = await readDurable<{ version?: number; receipts?: Array<{ id?: string }> }>('bridge-commands');
-    expect(stored?.version).toBe(4);
+    expect(stored?.version).toBe(5);
     expect(stored?.receipts?.some((entry) => entry.id === command.id)).toBe(true);
 
     // Simulate the main-process restart after the durable commit but before the browser got
@@ -4771,8 +4791,9 @@ describe('delivering a bootstrap', () => {
 
   it('restores a resume when its continuation WAL is restored first', async () => {
     await pair();
-    const source = await createSession({ title: 'interrupted by a restart' });
-    const continuation = await readyContinuation(source.id, 'carry on');
+    const sourceChat = '30303030-cccc-4ccc-8ccc-303030303030';
+    const source = await createSession({ title: 'interrupted by a restart', conversationId: sourceChat });
+    const continuation = await readyContinuation(source.id, 'carry on', sourceChat);
     const command = queueResume(source.id, continuation)!;
     await waitForOpened(1);
     await flushDurable();
@@ -5353,6 +5374,229 @@ describe('targeted open', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('Emergency Resume command reconciliation', () => {
+  async function recoveryCommand(
+    source: string,
+    client = 'recovery-tab'
+  ): Promise<{ sessionId: string; episodeId: string; command: any }> {
+    await pair();
+    await saveConfig({
+      ...suiteConfig,
+      multiAgent: { ...suiteConfig.multiAgent, selfHealingSessions: true }
+    });
+    const session = await createSession({ title: 'recovery command transaction', conversationId: source });
+    const episode = await beginSelfHealingEpisode(session.id, source, 'provider-error');
+    expect(episode).not.toBeNull();
+    const command = await queueEmergencyResume(session.id, source, episode!.failureEpisodeId);
+    expect(command).not.toBeNull();
+    const redeemed = await request('POST', '/commands/redeem', { body: { id: command!.id, client } });
+    expect(redeemed.status).toBe(200);
+    expect(redeemed.body.command).toMatchObject({ id: command!.id, type: 'recovery' });
+    expect(redeemed.body.command.text).toContain(`[[CLF-EMERGENCY-RESUME:${episode!.failureEpisodeId}]]`);
+    return { sessionId: session.id, episodeId: episode!.failureEpisodeId, command };
+  }
+
+  it('commits marker then ACK idempotently through one canonical A→B recovery', async () => {
+    const source = '91919191-1111-4111-8111-111111111111';
+    const destination = '92929292-2222-4222-8222-222222222222';
+    const client = 'marker-first-tab';
+    const { sessionId, episodeId, command } = await recoveryCommand(source, client);
+
+    const marker = await request('POST', '/recovery/reconcile', {
+      body: { episodeId, conversationId: destination, messageId: 'stable-recovery-user', client }
+    });
+    expect(marker.status).toBe(200);
+    expect(marker.body).toMatchObject({ committed: true, conversationId: destination });
+    expect((await getSession(sessionId))?.conversationId).toBe(destination);
+
+    const lateAck = await request('POST', '/commands/ack', {
+      body: { id: command.id, status: 'sent', conversationId: destination, client }
+    });
+    expect(lateAck.status).toBe(200);
+    expect(lateAck.body).toMatchObject({ committed: true, conversationId: destination });
+    expect((await getSession(sessionId))?.recovery).toMatchObject({
+      previousConversationId: source,
+      replacementConversationId: destination,
+      phase: 'recovered'
+    });
+    expect(pendingCommands().some((entry) => entry.id === command.id)).toBe(false);
+  });
+
+  it('commits ACK then marker idempotently even after the recovery command is finalized', async () => {
+    const source = '93939393-1111-4111-8111-111111111111';
+    const destination = '94949494-2222-4222-8222-222222222222';
+    const client = 'ack-first-tab';
+    const { sessionId, episodeId, command } = await recoveryCommand(source, client);
+
+    const ack = await request('POST', '/commands/ack', {
+      body: { id: command.id, status: 'sent', conversationId: destination, client }
+    });
+    expect(ack.status).toBe(200);
+    expect(ack.body).toMatchObject({ committed: true, conversationId: destination });
+    expect(pendingCommands().some((entry) => entry.id === command.id)).toBe(false);
+
+    const lateMarker = await request('POST', '/recovery/reconcile', {
+      body: { episodeId, conversationId: destination, messageId: 'stable-recovery-user-after-ack', client }
+    });
+    expect(lateMarker.status).toBe(200);
+    expect(lateMarker.body).toMatchObject({ committed: true, conversationId: destination });
+    expect((await getSession(sessionId))?.recovery).toMatchObject({
+      replacementConversationId: destination,
+      phase: 'recovered'
+    });
+  });
+
+  it('serializes a truly concurrent recovery ACK and stable marker through one A→B commit', async () => {
+    const source = '94949494-3333-4333-8333-333333333333';
+    const destination = '94949494-4444-4444-8444-444444444444';
+    const client = 'concurrent-recovery-tab';
+    const { sessionId, episodeId, command } = await recoveryCommand(source, client);
+
+    let entered!: () => void;
+    const atRebind = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    setSelfHealingRecoveryHooksForTests({
+      afterSessionRebind: async () => {
+        entered();
+        await hold;
+      }
+    });
+
+    const ackPromise = request('POST', '/commands/ack', {
+      body: { id: command.id, status: 'sent', conversationId: destination, client }
+    });
+    await atRebind;
+    const markerPromise = request('POST', '/recovery/reconcile', {
+      body: { episodeId, commandId: command.id, conversationId: destination,
+        messageId: 'concurrent-stable-recovery-user', client }
+    });
+    const marker = await markerPromise;
+    release();
+    const ack = await ackPromise;
+
+    expect(marker.status).toBe(200);
+    expect(ack.status).toBe(200);
+    expect(marker.body).toMatchObject({ committed: true, conversationId: destination });
+    expect(ack.body).toMatchObject({ committed: true, conversationId: destination });
+    expect((await getSession(sessionId))?.recovery).toMatchObject({
+      previousConversationId: source,
+      replacementConversationId: destination,
+      phase: 'recovered'
+    });
+    expect((await getSession(sessionId))?.conversationId).toBe(destination);
+    expect(pendingCommands().filter((entry) => entry.id === command.id)).toHaveLength(0);
+  });
+
+  it('refuses a stable marker from a document that does not own the recovery command lease', async () => {
+    const source = '95959595-1111-4111-8111-111111111111';
+    const destination = '96969696-2222-4222-8222-222222222222';
+    const { sessionId, episodeId, command } = await recoveryCommand(source, 'owning-tab');
+    expect((await request('POST', '/recovery/send', {
+      body: { id: command.id, client: 'owning-tab', action: 'dispatch' }
+    })).status).toBe(200);
+    const copied = await request('POST', '/recovery/reconcile', {
+      body: { episodeId, conversationId: destination, messageId: 'copied-stable-marker', client: 'foreign-tab' }
+    });
+    expect(copied.status).toBe(409);
+    expect(copied.body.error).toBe('recovery_transaction_changed');
+    expect((await getSession(sessionId))?.conversationId).toBe(source);
+    expect((await getSession(sessionId))?.recovery?.phase).toBe('hard_recovery');
+
+    // Settle the exact owner after proving the copied marker is powerless. Leaving an intentionally
+    // dispatched recovery unresolved would correctly reconstruct inert custody on every later
+    // bridge restart in this shared suite and turn a local test fixture into cross-test state.
+    const owner = await request('POST', '/recovery/reconcile', {
+      body: {
+        episodeId,
+        commandId: command.id,
+        conversationId: destination,
+        messageId: 'owning-stable-marker',
+        client: 'owning-tab'
+      }
+    });
+    expect(owner.status).toBe(200);
+    expect(owner.body).toMatchObject({ committed: true, conversationId: destination });
+  });
+
+  it('does not let old worker A finish between durable session rebind and worker ownership projection', async () => {
+    const source = '97979797-1111-4111-8111-111111111111';
+    const destination = '98989898-2222-4222-8222-222222222222';
+    await pair();
+    await saveConfig({
+      ...suiteConfig,
+      multiAgent: { ...suiteConfig.multiAgent, selfHealingSessions: true }
+    });
+    const spawned = spawn({ caller: { conversationId: PRIME_CHAT }, workers: [{ task: 'finish barrier audit' }] });
+    expect(bindConversation('worker-1', source, spawned.runId)).toBe(true);
+    const session = await createSession({ title: 'worker recovery finish barrier', conversationId: source });
+    const episode = await beginSelfHealingEpisode(session.id, source, 'worker-unresponsive');
+    const command = await queueEmergencyResume(session.id, source, episode!.failureEpisodeId);
+    expect(command).not.toBeNull();
+    expect((await request('POST', '/commands/redeem', {
+      body: { id: command!.id, client: 'worker-recovery-owner' }
+    })).status).toBe(200);
+    expect((await request('POST', '/recovery/send', {
+      body: { id: command!.id, client: 'worker-recovery-owner', action: 'dispatch' }
+    })).status).toBe(200);
+
+    let entered!: () => void;
+    const atExactBarrier = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    setSelfHealingRecoveryHooksForTests({
+      afterSessionRebind: async () => {
+        entered();
+        await hold;
+      }
+    });
+
+    const committing = request('POST', '/commands/ack', {
+      body: {
+        id: command!.id,
+        client: 'worker-recovery-owner',
+        status: 'sent',
+        conversationId: destination
+      }
+    });
+    await atExactBarrier;
+    expect((await getSession(session.id))?.conversationId).toBe(destination);
+    expect((await getSession(session.id))?.recovery?.phase).toBe('reconciling');
+    expect(agentInfoForOwnedConversation(source)).toMatchObject({ id: 'worker-1', state: 'active' });
+
+    const staleFinish = await request('POST', '/events', {
+      body: {
+        conversationId: source,
+        events: [{
+          kind: 'assistant_message', time: Date.now(), turnId: 'old-worker-finish',
+          messageId: 'old-worker-finish-final', text: 'old A says the audit is done', state: 'final', final: true
+        }]
+      }
+    });
+    expect(staleFinish.status).toBe(200);
+    const during = snapshotSwarm()!;
+    expect(during.agents.find((row) => row.info.id === 'worker-1')?.info).toMatchObject({
+      conversationId: source,
+      state: 'active',
+      result: null
+    });
+    expect(during.agents.find((row) => row.info.id === PRIME_ID)?.queue
+      .some((message) => message.text.includes('old A says the audit is done'))).toBe(false);
+
+    release();
+    const committed = await committing;
+    expect(committed.status).toBe(200);
+    expect(committed.body).toMatchObject({ committed: true, conversationId: destination });
+    expect(agentInfoForOwnedConversation(source)).toBeNull();
+    expect(agentInfoForOwnedConversation(destination)).toMatchObject({
+      id: 'worker-1', runId: spawned.runId, state: 'active', result: null
+    });
+    const after = snapshotSwarm()!;
+    expect(after.agents.find((row) => row.info.id === PRIME_ID)?.queue
+      .some((message) => message.text.includes('old A says the audit is done'))).toBe(false);
   });
 });
 
@@ -6491,6 +6735,65 @@ describe('unattributed activity recovery', () => {
     }
   });
 
+  it('does not issue a second no-tab browser action after the first handout was claimed but its ACK was lost', async () => {
+    await pair();
+    spawn({ workers: [{ task: 'audit one claimed no-tab recovery' }], caller: { conversationId: PRIME } });
+    const bootstrap = await redeem();
+    await request('POST', '/commands/ack', {
+      body: { id: bootstrap.id, status: 'sent', conversationId: WORKER, agent: 'worker-1' }
+    });
+    await events(WORKER, [openTurn('claimed-no-tab')]);
+    await request('POST', '/closed', { body: { conversationId: WORKER } });
+
+    const handout = await maintenance();
+    expect(handout).toMatchObject({ conversationId: WORKER, reason: 'no-tab' });
+    expect((await request('POST', '/repairs/claim', { body: { token: handout!.token } })).body.allowed).toBe(true);
+
+    // The browser may already have reopened the chat. Losing only the ACK must retain custody of
+    // that exact action rather than minting another token that can open/reload it a second time.
+    expect(await maintenance()).toBeNull();
+    expect((await request('POST', '/repairs/claim', { body: { token: handout!.token } })).body.allowed).toBe(false);
+    expect(await maintenance()).toBeNull();
+  });
+
+  it('bounds claimed repair custody after a lost ACK and escalates without repeating the browser action', async () => {
+    const previous = getConfig();
+    await saveConfig({
+      ...previous,
+      multiAgent: { ...previous.multiAgent, recoverAgentTabs: true, selfHealingSessions: true }
+    });
+    vi.useFakeTimers();
+    try {
+      await pair();
+      await events(OTHER, [
+        { kind: 'model_selection', model: 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() },
+        openTurn('claimed-repair-ack-loss')
+      ]);
+      const session = await findSessionByConversation(OTHER, { requireUnique: true });
+      expect(session).not.toBeNull();
+
+      await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS);
+      await sweepStaleSwarm(Date.now());
+      const repair = await maintenance();
+      expect(repair).toMatchObject({ conversationId: OTHER, reason: 'silence' });
+      expect((await request('POST', '/repairs/claim', { body: { token: repair!.token } })).body.allowed).toBe(true);
+
+      // The browser action may already have happened; losing only its receipt may not authorize a
+      // second reload. Custody expires into AMBIGUOUS, then Self-Healing inspects durable state
+      // and escalates to one fresh executor instead of holding this repair forever.
+      await vi.advanceTimersByTimeAsync(BROWSER_REPAIR_ACK_CUSTODY_MS);
+      expect(await maintenance()).toBeNull();
+      await sweepStaleSwarm(Date.now());
+      const recovery = pendingCommands().filter((entry) => entry.what === `recovery:${session!.id}`);
+      expect(recovery).toHaveLength(1);
+      expect((await request('POST', '/repairs/claim', { body: { token: repair!.token } })).body.allowed).toBe(false);
+      expect(await maintenance()).toBeNull();
+    } finally {
+      await saveConfig(previous);
+      vi.useRealTimers();
+    }
+  });
+
   /**
    * The page's parting word is not the turn. A document being torn down has no Stop control,
    * so its last observation reads "completed" whatever the server is doing; on 2026-09-03
@@ -7565,6 +7868,106 @@ describe('unattributed activity recovery', () => {
       await sweepStaleSwarm(Date.now());
       expect(chatOf(await maintenance())).toBe(PRIME);
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('self-heals a silent Prime after exactly one claimed reload, with one fresh executor and the same durable session', async () => {
+    const previous = getConfig();
+    await saveConfig({ ...previous, multiAgent: { ...previous.multiAgent, selfHealingSessions: true } });
+    vi.useFakeTimers();
+    try {
+      await pair();
+      spawn({ workers: [{ task: 'keep Prime run alive during recovery' }], caller: { conversationId: PRIME } });
+      const runId = currentRunId(PRIME)!;
+      await events(PRIME, [
+        { kind: 'model_selection', model: 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() },
+        openTurn('prime-self-heal-silent')
+      ]);
+      await attributed(PRIME);
+      const sessionId = (await request('GET', `/activity?conversationId=${PRIME}`)).body.sessionId as string;
+
+      await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS);
+      await sweepStaleSwarm(Date.now());
+      const reload = await maintenance();
+      expect(reload).toMatchObject({ conversationId: PRIME, reason: 'silence' });
+      const claimed = await request('POST', '/repairs/claim', { body: { token: reload!.token } });
+      expect(claimed.body.allowed).toBe(true);
+      expect(await maintenance(reload!.token, 'reloaded')).toBeNull();
+      expect((await sessionControlsFor(sessionId)).selfHealingStatus).toBe('Reloading');
+
+      await vi.advanceTimersByTimeAsync(SELF_HEAL_POST_RELOAD_MS);
+      await sweepStaleSwarm(Date.now());
+      const recovery = pendingCommands().find((entry) => entry.what === `recovery:${sessionId}`);
+      expect(recovery).toBeTruthy();
+      expect((await sessionControlsFor(sessionId)).selfHealingStatus).toBe('Rebinding');
+
+      // Repeated maintenance while B is opening must reuse the one recovery command rather than
+      // opening/reloading a storm of replacement chats.
+      for (let i = 0; i < 4; i++) await sweepStaleSwarm(Date.now());
+      expect(pendingCommands().filter((entry) => entry.what === `recovery:${sessionId}`)).toHaveLength(1);
+
+      const fresh = `f1f1f1f1-1111-4111-8111-${String(recoveryCase).padStart(12, '0')}`;
+      const boot = await redeem(recovery!.id, 'prime-recovery-tab');
+      expect(boot.type).toBe('recovery');
+      const ack = await request('POST', '/commands/ack', {
+        body: { id: recovery!.id, status: 'sent', conversationId: fresh, client: 'prime-recovery-tab' }
+      });
+      expect(ack.body.committed).toBe(true);
+      expect((await getSession(sessionId))?.conversationId).toBe(fresh);
+      expect((await getSession(sessionId))?.recovery?.phase).toBe('recovered');
+      expect(agentInfoForOwnedConversation(PRIME)).toBeNull();
+      expect(agentInfoForOwnedConversation(fresh)).toMatchObject({ id: 'prime', runId });
+    } finally {
+      await saveConfig(previous);
+      vi.useRealTimers();
+    }
+  });
+
+  it('self-heals a silent worker after one reload without moving or blocking its Prime', async () => {
+    const previous = getConfig();
+    await saveConfig({ ...previous, multiAgent: { ...previous.multiAgent, selfHealingSessions: true } });
+    vi.useFakeTimers();
+    try {
+      await pair();
+      spawn({ workers: [{ task: 'worker silence recovery integration' }], caller: { conversationId: PRIME } });
+      const runId = currentRunId(PRIME)!;
+      const opening = await redeem(undefined, 'worker-opening-tab');
+      expect(opening.agent).toBe('worker-1');
+      await request('POST', '/commands/ack', {
+        body: { id: opening.id, status: 'sent', conversationId: WORKER, client: 'worker-opening-tab', agent: 'worker-1' }
+      });
+      await events(WORKER, [
+        { kind: 'model_selection', model: 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() },
+        openTurn('worker-self-heal-silent')
+      ]);
+      await attributed(WORKER);
+      const sessionId = (await request('GET', `/activity?conversationId=${WORKER}`)).body.sessionId as string;
+
+      await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS);
+      await sweepStaleSwarm(Date.now());
+      const reload = await maintenance();
+      expect(reload).toMatchObject({ conversationId: WORKER, reason: 'silence' });
+      expect((await request('POST', '/repairs/claim', { body: { token: reload!.token } })).body.allowed).toBe(true);
+      expect(await maintenance(reload!.token, 'reloaded')).toBeNull();
+      expect((await sessionControlsFor(sessionId)).selfHealingStatus).toBe('Reloading');
+
+      await vi.advanceTimersByTimeAsync(SELF_HEAL_POST_RELOAD_MS);
+      await sweepStaleSwarm(Date.now());
+      const recovery = pendingCommands().find((entry) => entry.what === `recovery:${sessionId}`);
+      expect(recovery).toBeTruthy();
+      const fresh = `f2f2f2f2-2222-4222-8222-${String(recoveryCase).padStart(12, '0')}`;
+      expect((await redeem(recovery!.id, 'worker-recovery-tab')).agent).toBe('worker-1');
+      const ack = await request('POST', '/commands/ack', {
+        body: { id: recovery!.id, status: 'sent', conversationId: fresh, client: 'worker-recovery-tab' }
+      });
+      expect(ack.body.committed).toBe(true);
+      expect(agentInfoForOwnedConversation(WORKER)).toBeNull();
+      expect(agentInfoForOwnedConversation(fresh)).toMatchObject({ id: 'worker-1', runId, conversationId: fresh });
+      expect(agentInfoForOwnedConversation(PRIME)).toMatchObject({ id: 'prime', runId, conversationId: PRIME });
+      expect((await getSession(sessionId))?.recovery?.phase).toBe('recovered');
+    } finally {
+      await saveConfig(previous);
       vi.useRealTimers();
     }
   });

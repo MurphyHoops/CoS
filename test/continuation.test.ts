@@ -166,7 +166,12 @@ describe('capturing the brief', () => {
   it('does not borrow selection from another conversation or invent missing effort', async () => {
     const summary = await createSession({ title: 'source evidence', conversationId: CHAT_A });
     await store.observeSessionModel(summary.id, CHAT_A, 'gpt-5.6-sol', 10);
-    expect((await openContinuationNow(summary.id, CHAT_A)).requestedModel).toEqual({ model: 'gpt-5.6-sol', reasoningEffort: null });
+    const opened = await openContinuationNow(summary.id, CHAT_A);
+    expect(opened.requestedModel).toEqual({ model: 'gpt-5.6-sol', reasoningEffort: null });
+    // The replacement slot is session-durable now. End this deliberately abandoned continuation
+    // before simulating an unrelated later rebind; an in-memory test reset is not authority to
+    // discard a real provider-replacement transaction.
+    expect(await abortContinuationSourceBeforeSendNow(opened.token, 'test cleanup before unrelated rebind')).toBe(true);
     resetContinuationsForTests();
     await store.rebindSession(summary.id, CHAT_A, CHAT_B);
     expect((await openContinuationNow(summary.id, CHAT_B)).requestedModel).toBeNull();
@@ -698,9 +703,22 @@ describe('the swarm handover', () => {
     saved.state = 'committing';
     saved.to = CHAT_B;
 
-    // This is the exact crash boundary continuation recovery is designed for: durable session
-    // authority already says B, but the in-memory worker ownership projection still says A.
-    expect(await store.rebindSession(summary.id, CHAT_A, CHAT_B)).toBe(true);
+    // This is the exact crash boundary continuation recovery is designed for: the continuation
+    // still owns the shared provider-replacement slot and durable session authority already says
+    // B, but the in-memory worker ownership projection still says A.
+    expect(await store.rebindSession(
+      summary.id,
+      CHAT_A,
+      CHAT_B,
+      undefined,
+      undefined,
+      {
+        kind: 'continuation',
+        transactionId: opened.token,
+        sourceConversationId: CHAT_A,
+        recoveryGeneration: null
+      }
+    )).toBe(true);
     expect((await getSession(summary.id))?.lastCommittedResumeHandoffId).toBeNull();
     resetAgentsForTests();
     restoreSwarm(swarmSnapshot);

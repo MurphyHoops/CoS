@@ -3224,6 +3224,34 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(textOf(stale)).toContain('no local tool was run');
   });
 
+  it('waits for late request proof before a superseded old chat can run its first new tool call', async () => {
+    const chatA = 'f0f00015-1111-4111-8111-111111111111';
+    const chatB = 'f0f00016-1111-4111-8111-111111111111';
+    const summary = await createSession({ title: 'late superseded proof', conversationId: chatA });
+    expect(await rebindSession(summary.id, chatA, chatB)).toBe(true);
+
+    const requestId = 'wfr_superseded_late_identity';
+    setTimeout(() => {
+      observeRequestCorrelation({
+        requestId,
+        conversationId: chatA,
+        sessionId: summary.id,
+        messageId: 'late-superseded-message',
+        tool: 'read',
+        observedAt: Date.now()
+      });
+    }, 40).unref?.();
+
+    const reply = await modern(
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } },
+      { 'x-request-id': `${requestId}/att1` }
+    );
+    expect(failed(reply)).toBe(true);
+    expect(textOf(reply)).toContain('CONVERSATION_SUPERSEDED');
+    expect(textOf(reply)).not.toContain('/workspace/notes.txt');
+  });
+
   it('refuses every tool from a chat whose handoff brief has been asked for, until the move is over', async () => {
     resetContinuationsForTests();
     const chatA = 'f0f00007-1111-4111-8111-111111111111';
@@ -3251,8 +3279,14 @@ describe('exec sessions belong to the chat that opened them', () => {
     const afterBrief = await asChat('wfr_compact_a', 'read', { paths: ['/workspace/src/app.ts'] });
     expect(textOf(afterBrief)).toContain('COMPACTION_IN_PROGRESS');
 
-    // The commit hands the refusal over to the superseded attachment for good.
-    expect(await rebindSession(summary.id, chatA, chatB)).toBe(true);
+    // The commit hands the refusal over to the superseded attachment for good. The raw store
+    // seam must carry the exact continuation replacement claim just like production commit does.
+    expect(await rebindSession(summary.id, chatA, chatB, undefined, undefined, {
+      kind: 'continuation',
+      transactionId: opened.token,
+      sourceConversationId: chatA,
+      recoveryGeneration: null
+    })).toBe(true);
     expect(prove('wfr_compact_b', chatB, summary.id)).toBe('stored');
     abortContinuation(opened.token, 'the test moved the session by hand');
     const stale = await asChat('wfr_compact_a', 'read', { paths: ['/workspace/src/app.ts'] });
@@ -3416,6 +3450,11 @@ describe('exec sessions belong to the chat that opened them', () => {
     const replay = await asChat(requestId, 'read', { paths: ['/workspace/src/app.ts'] });
     expect(textOf(replay)).toContain('transport-replay');
     expect(unifiedExecManager.exitedUnread(new Set([id]))).toHaveLength(1);
+    // Receipt retirement deliberately requires a request that started strictly after successful
+    // publication. Date.now() is millisecond-granular, so a sequential call in the same tick is
+    // conservatively indistinguishable from a concurrent request; wait for the next clock tick.
+    const replayReceivedAt = Date.now();
+    await vi.waitFor(() => expect(Date.now()).toBeGreaterThan(replayReceivedAt), { timeout: 1000, interval: 1 });
     const receipt = await asChat(requestId, 'read', { paths: ['/workspace/src/app.ts'] });
     expect(textOf(receipt)).not.toContain('transport-replay');
     expect(unifiedExecManager.exitedUnread(new Set([id]))).toEqual([]);

@@ -50,7 +50,9 @@ describe('cross-platform tunnel executable discovery', () => {
       await writeFile(allowed, '#!/bin/sh\n', { mode: 0o644 });
       await chmod(allowed, 0o755);
 
-      expect(locateBinary('tunnel-client', blocked)).toBeNull();
+      // A non-executable explicit candidate must never be selected. The locator may still
+      // legitimately fall back to a bundled/system tunnel on developer machines that have one.
+      expect(locateBinary('tunnel-client', blocked)).not.toBe(blocked);
       expect(locateBinary('tunnel-client', allowed)).toBe(allowed);
     } finally {
       await removeTempDir(root);

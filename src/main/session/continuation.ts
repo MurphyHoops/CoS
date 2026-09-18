@@ -64,18 +64,21 @@ import {
   thawPrimeTransfer
 } from '../agents.js';
 import { clearChatWorkspace, moveChatWorkspace, workspaceForChat } from '../workspace.js';
-import { clearGoalObjective, clearGoalSwitch, goalObjectiveFor, goalSwitchFor, moveGoalObjective, moveGoalSwitch, retireGoalDraftsFor } from '../goal.js';
+import { clearGoalObjective, clearGoalSwitch, goalObjectiveFor, goalSwitchFor, moveGoalObjective, moveGoalSwitch } from '../goal.js';
 import { writeDurableNow, writeDurableSoon } from '../durable.js';
 import { prepareHandoff, resumeBootstrapMatches } from './handoff.js';
-import { ensureHandoffRecorded, recordHandoff, recordNote, rebindConversation } from './recorder.js';
+import { ensureHandoffRecorded, recordHandoff, recordNote } from './recorder.js';
+import { publishSessionRebindProjection } from './rebind.js';
 import { endResumeClaim, noteResumeClaim, resetResumeGate } from './resume-gate.js';
 import {
+  claimSessionReplacementTransfer,
   ensureCommittedResumeHandoff,
   findSessionByConversation,
   getSession,
   readEvents,
   readHandoff,
   refuseAutomaticCompactionNow,
+  releaseSessionReplacementTransfer,
   rebindSession
 } from './store.js';
 
@@ -402,6 +405,15 @@ async function transitionNow(
     throw err;
   }
   publishRecord(entry, next);
+  if (next.state === 'committed' || next.state === 'aborted') {
+    try {
+      await releaseSessionReplacementTransfer(entry.sessionId, continuationTransfer(entry));
+    } catch (err) {
+      // A stale exact owner is fail-closed. Restart or a later terminal retry can release it;
+      // never turn a durable terminal WAL edge back into an apparent failure after publication.
+      logWarn(`continuation ${entry.token.slice(0, 8)} could not release session replacement ownership — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   return next;
 }
 
@@ -760,6 +772,13 @@ function makeContinuation(sessionId: string, fromConversationId: string, automat
   };
 }
 
+const continuationTransfer = (entry: Pick<Continuation, 'token' | 'from'>) => ({
+  kind: 'continuation' as const,
+  transactionId: entry.token,
+  sourceConversationId: entry.from,
+  recoveryGeneration: null
+});
+
 /** Durable open used before the bridge hands the one-shot compaction prompt to a page. */
 export async function openContinuationNow(
   sessionId: string,
@@ -789,6 +808,17 @@ export async function openContinuationNow(
       // otherwise its retry could resurrect a token the bridge never returned to the page.
       writeDurableSoon(CONTINUATIONS_STATE, snapshotContinuations());
       throw err;
+    }
+    if (!(await claimSessionReplacementTransfer(sessionId, continuationTransfer(entry)))) {
+      // The continuation WAL exists first so a crash can reconstruct the transaction that was
+      // trying to own replacement. A losing claim is erased before this function returns and,
+      // most importantly, before any caller may open/focus a browser replacement.
+      try {
+        await writeDurableNow(CONTINUATIONS_STATE, snapshotContinuations());
+      } catch {
+        writeDurableSoon(CONTINUATIONS_STATE, snapshotContinuations());
+      }
+      throw new Error('another provider-replacement transaction already owns this session');
     }
     byToken.set(entry.token, entry);
     beginPrimeTransfer(fromConversationId);
@@ -1188,12 +1218,7 @@ function publishCommittedProjection(
   toConversationId: string,
   swarm: 'absent' | 'frozen' | 'recovery'
 ): void {
-  rebindConversation(entry.sessionId, entry.from, toConversationId);
-  moveChatWorkspace(entry.from, toConversationId);
-  moveGoalObjective(entry.from, toConversationId);
-  moveGoalSwitch(entry.from, toConversationId);
-  // A's final is superseded, never a completed turn in B. B earns its own debt.
-  retireGoalDraftsFor(entry.from);
+  publishSessionRebindProjection(entry.sessionId, entry.from, toConversationId);
   if (swarm === 'frozen') {
     if (!commitPrimeTransfer(entry.from, toConversationId)) {
       // The frozen handover cannot expire. A miss here means the run ended outright while
@@ -1313,7 +1338,14 @@ async function reconcileCommitting(entry: Continuation, toConversationId: string
 
   let moved = false;
   try {
-    moved = await rebindSession(entry.sessionId, entry.from, toConversationId, entry.handoffId ?? undefined);
+    moved = await rebindSession(
+      entry.sessionId,
+      entry.from,
+      toConversationId,
+      entry.handoffId ?? undefined,
+      undefined,
+      continuationTransfer(entry)
+    );
   } catch (err) {
     logWarn(`continuation ${entry.token.slice(0, 8)} rebind threw: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -1473,6 +1505,14 @@ export function abortContinuation(token: string, reason: string): boolean {
   endResumeClaim(entry.token);
   cancelPrimeTransfer(entry.from);
   changed();
+  // The public legacy API is synchronous. Preserve durability ordering asynchronously: terminal
+  // continuation WAL first, then release the exact shared replacement owner. Until both land the
+  // stale owner merely blocks another replacement, which is the safe failure mode.
+  void changedNow()
+    .then(() => releaseSessionReplacementTransfer(entry.sessionId, continuationTransfer(entry)))
+    .catch((err) => logWarn(
+      `continuation ${entry.token.slice(0, 8)} could not durably release replacement ownership — ${err instanceof Error ? err.message : String(err)}`
+    ));
   logWarn(`continuation ${entry.token.slice(0, 8)} abandoned — ${reason}`);
   noteAbandoned(entry, reason);
   return true;
@@ -1702,6 +1742,27 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
     // likely to hit it. Re-armed from now rather than from the original claim, because what
     // matters is how long from *here* that chat still has to appear.
     if (entry.state === 'claimed') noteResumeClaim(entry.token);
+    if (entry.state !== 'committed' && entry.state !== 'aborted') {
+      let ownsTransfer = false;
+      try {
+        ownsTransfer = await claimSessionReplacementTransfer(entry.sessionId, continuationTransfer(entry));
+      } catch (err) {
+        logWarn(`continuation ${entry.token.slice(0, 8)} could not restore replacement ownership — ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (!ownsTransfer) {
+        // Another durable transaction owns replacement. Keep the restored continuation terminal
+        // so no later bridge pickup can open C beside that owner; the repaired snapshot is fsynced
+        // below before bridge startup exposes any browser command.
+        entry.state = 'aborted';
+        entry.error = 'Recovery found another provider-replacement transaction already owns this session.';
+        endResumeClaim(entry.token);
+        cancelPrimeTransfer(entry.from);
+      }
+    } else {
+      // Crash after terminal continuation WAL but before owner release: clear only this exact
+      // token. A newer continuation/recovery owner is untouched by the compare-and-swap.
+      await releaseSessionReplacementTransfer(entry.sessionId, continuationTransfer(entry)).catch(() => false);
+    }
     byToken.set(entry.token, entry);
   }
   try {

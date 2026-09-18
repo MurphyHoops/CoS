@@ -1797,7 +1797,7 @@ var CLF_DOM = (() => {
     }, false);
   }
 
-  async function send({ acceptanceTimeoutMs = 30000, stillCurrent = () => true, matchesUser = null, observeEvidence = null, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null } = {}) {
+  async function send({ acceptanceTimeoutMs = 30000, stillCurrent = () => true, matchesUser = null, observeEvidence = null, clearAcceptedDraft = true, beforeSend = null, onAttempt = null, acceptUserReceipt = null } = {}) {
     try {
       const box = composer();
       if (!box || !box.isConnected || !stillCurrent() || generating() || stopButton()) return false;
@@ -1892,6 +1892,12 @@ var CLF_DOM = (() => {
                 !sendButtonEnabled(button) || box.getAttribute('aria-disabled') === 'true' ||
                 box.getAttribute('contenteditable') === 'false') return finish(false);
             attempted = true;
+            // This is the exact irreversible-dispatch boundary. Callers that need to distinguish
+            // "native Send never happened" from "the click may have crossed but acceptance proof
+            // was lost" must observe it here, after every final route/editor/button recheck and
+            // immediately before button.click(). The observer is notification only; it cannot
+            // grant authority or cancel a send that already reached this boundary.
+            try { if (onAttempt) onAttempt(); } catch { /* diagnostics must not change delivery */ }
             // The deadline bounds readiness, not an already-dispatched receipt.
             // Keep this same observer and exact send lifetime until the provider
             // publishes its identity; never click again because that is delayed.

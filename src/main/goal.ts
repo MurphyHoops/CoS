@@ -470,6 +470,35 @@ export function snapshotGoalReplies(): GoalRepliesSnapshot {
   };
 }
 
+/** Crash-safe A→B move for the exact durable Goal reply debt owned by this session. */
+export async function moveGoalReplyNow(
+  fromConversationId: string,
+  toConversationId: string,
+  sessionId: string
+): Promise<boolean> {
+  if (!fromConversationId || !toConversationId || fromConversationId === toConversationId || !sessionId) return false;
+  const source = goalReplies.get(fromConversationId);
+  if (!source) {
+    const already = goalReplies.get(toConversationId);
+    return !already || already.sessionId === sessionId;
+  }
+  if (source.sessionId !== sessionId) return false;
+  const beforeTarget = goalReplies.get(toConversationId);
+  const moved: GoalReplyObligation = { ...source, conversationId: toConversationId };
+  goalReplies.delete(fromConversationId);
+  goalReplies.set(toConversationId, moved);
+  try {
+    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+    return true;
+  } catch (error) {
+    goalReplies.delete(toConversationId);
+    goalReplies.set(fromConversationId, source);
+    if (beforeTarget) goalReplies.set(toConversationId, beforeTarget);
+    persistGoalRepliesSoon();
+    throw error;
+  }
+}
+
 export function restoreGoalReplies(snapshot: GoalRepliesSnapshot | null): void {
   goalReplies.clear();
   if (!snapshot || snapshot.version !== 1 || !Array.isArray(snapshot.replies)) return;
@@ -703,6 +732,12 @@ export interface GoalObjectivesSnapshot {
  * user type it again.
  */
 const goalObjectives = new Map<string, string>();
+let goalObjectiveWrites: Promise<unknown> = Promise.resolve();
+function serialGoalObjective<T>(work: () => Promise<T>): Promise<T> {
+  const result = goalObjectiveWrites.then(work, work);
+  goalObjectiveWrites = result.catch(() => undefined);
+  return result;
+}
 
 export function snapshotGoalObjectives(): GoalObjectivesSnapshot {
   return {
@@ -757,19 +792,44 @@ export function setGoalObjective(conversationId: string, text: string): string {
  * supersede durable.ts's retained failed generation with the still-authoritative snapshot.
  */
 export async function setGoalObjectiveNow(conversationId: string, text: string): Promise<string> {
-  const before = goalObjectives.get(conversationId);
-  const goal = text.trim();
-  goalObjectives.delete(conversationId);
-  if (goal) goalObjectives.set(conversationId, goal);
-  try {
-    await writeDurableNow(GOAL_OBJECTIVES_STATE, snapshotGoalObjectives());
-    return goal;
-  } catch (error) {
+  return serialGoalObjective(async () => {
+    const before = goalObjectives.get(conversationId);
+    const goal = text.trim();
     goalObjectives.delete(conversationId);
-    if (before) goalObjectives.set(conversationId, before);
-    writeDurableSoon(GOAL_OBJECTIVES_STATE, snapshotGoalObjectives());
-    throw error;
-  }
+    if (goal) goalObjectives.set(conversationId, goal);
+    try {
+      await writeDurableNow(GOAL_OBJECTIVES_STATE, snapshotGoalObjectives());
+      return goal;
+    } catch (error) {
+      goalObjectives.delete(conversationId);
+      if (before) goalObjectives.set(conversationId, before);
+      writeDurableSoon(GOAL_OBJECTIVES_STATE, snapshotGoalObjectives());
+      throw error;
+    }
+  });
+}
+
+
+/** Crash-safe A→B move for Emergency Resume. Repeating an already-moved state is success. */
+export async function moveGoalObjectiveNow(fromConversationId: string, toConversationId: string): Promise<boolean> {
+  if (!fromConversationId || !toConversationId || fromConversationId === toConversationId) return false;
+  return serialGoalObjective(async () => {
+    const source = goalObjectives.get(fromConversationId);
+    if (!source) return true;
+    const beforeTarget = goalObjectives.get(toConversationId);
+    goalObjectives.delete(fromConversationId);
+    goalObjectives.set(toConversationId, source);
+    try {
+      await writeDurableNow(GOAL_OBJECTIVES_STATE, snapshotGoalObjectives());
+      return true;
+    } catch (error) {
+      goalObjectives.delete(toConversationId);
+      goalObjectives.set(fromConversationId, source);
+      if (beforeTarget) goalObjectives.set(toConversationId, beforeTarget);
+      writeDurableSoon(GOAL_OBJECTIVES_STATE, snapshotGoalObjectives());
+      throw error;
+    }
+  });
 }
 
 export function clearGoalObjective(conversationId: string): void {
@@ -1020,6 +1080,30 @@ export function clearGoalSwitch(conversationId: string): void {
 }
 
 /** Moves one chat-owned switch to the replacement conversation used by Compact & Resume. */
+
+/** Crash-safe switch counterpart to moveGoalObjectiveNow. */
+export async function moveGoalSwitchNow(fromConversationId: string, toConversationId: string): Promise<boolean> {
+  if (!fromConversationId || !toConversationId || fromConversationId === toConversationId) return false;
+  return serialGoalSwitch(async () => {
+    if (isGoalDecisionChat(fromConversationId) || isGoalDecisionChat(toConversationId)) return false;
+    const source = goalSwitches.get(fromConversationId);
+    if (!source) return true;
+    const beforeTarget = goalSwitches.get(toConversationId);
+    goalSwitches.delete(fromConversationId);
+    goalSwitches.set(toConversationId, source);
+    try {
+      await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitches());
+      return true;
+    } catch (error) {
+      goalSwitches.delete(toConversationId);
+      goalSwitches.set(fromConversationId, source);
+      if (beforeTarget) goalSwitches.set(toConversationId, beforeTarget);
+      writeDurableSoon(GOAL_SWITCHES_STATE, snapshotGoalSwitches());
+      throw error;
+    }
+  });
+}
+
 export function moveGoalSwitch(fromConversationId: string, toConversationId: string): boolean {
   if (!fromConversationId || !toConversationId || fromConversationId === toConversationId) return false;
   if (isGoalDecisionChat(fromConversationId) || isGoalDecisionChat(toConversationId)) return false;
@@ -1198,11 +1282,11 @@ export function retireGoalDrafts(retireReplies = false): number {
  * chat's goal therefore has to reach the request already running, or the last thing typed
  * into the conversation would be a message written against the goal the user just replaced.
  */
-export function retireGoalDraftsFor(conversationId: string): boolean {
+export function retireGoalDraftsFor(conversationId: string, preserveReply = false): boolean {
   const draft = drafts.get(conversationId);
   const pending = goalReplies.get(conversationId)?.state === 'pending';
   if (!draft || draft.acknowledged) {
-    if (pending) handleGoalReply(conversationId);
+    if (pending && !preserveReply) handleGoalReply(conversationId);
     return pending;
   }
   draft.acknowledged = true;
@@ -1210,7 +1294,7 @@ export function retireGoalDraftsFor(conversationId: string): boolean {
   if (draft.settledAt === 0) draft.settledAt = Date.now();
   draft.text = '';
   draft.reply = '';
-  handleGoalReply(conversationId);
+  if (!preserveReply) handleGoalReply(conversationId);
   notifyGoalChange();
   return true;
 }
@@ -1341,6 +1425,7 @@ export function resetGoalStateForTests(): void {
   goalReplies.clear();
   goalObjectives.clear();
   goalSwitches.clear();
+  goalObjectiveWrites = Promise.resolve();
   goalSwitchWrites = Promise.resolve();
   legacyCommittedResumeCache.clear();
   modelCache = null;

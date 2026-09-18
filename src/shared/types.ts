@@ -299,6 +299,13 @@ export interface MultiAgentSettings {
    * recovered, whatever this says.
    */
   recoverAgentTabs: boolean;
+  /**
+   * Automatically move a durable local session to a fresh ChatGPT conversation when bounded
+   * same-chat recovery cannot restore the current provider executor. Kept separate from
+   * recoverAgentTabs: that switch controls whether ordinary/agent tabs may be reopened at all,
+   * while this one authorizes the stronger session-preserving Emergency Resume transaction.
+   */
+  selfHealingSessions: boolean;
 }
 
 /** The user's own additions to what each MCP connector tells the model about itself. */

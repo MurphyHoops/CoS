@@ -832,7 +832,7 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
     await worker.fireAlarm(); await worker.fireAlarm();
     expect(worker.tabsCreate).not.toHaveBeenCalled();
     expect(worker.tabsReload).not.toHaveBeenCalled();
-    expect(asked.every(item => item === 'status')).toBe(true);
+    expect(asked.every(item => item === 'status' || item === `failed:${OTHER}`)).toBe(true);
     await worker.registerTab(42);
     await worker.send({ type: 'bind', conversationId: OTHER }, 42);
     await worker.fireAlarm();
@@ -862,8 +862,8 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
   });
 
   it.each(['unattributed', 'assistant-error'].flatMap(reason =>
-    ['unresolved', 'resolved-during-scan', 'claim-unavailable'].map(mode => ({ reason, mode }))))(
-    'claims $reason recovery after the tab scan: $mode', async ({ reason, mode }) => {
+    ['unresolved', 'resolved-before-action', 'claim-unavailable'].map(mode => ({ reason, mode }))))(
+    'claims $reason recovery before resolving a fresh tab target: $mode', async ({ reason, mode }) => {
       let armed = false;
       let handed = false;
       let resolved = false;
@@ -875,6 +875,7 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
           trace.push('claim');
           expect(init.method).toBe('POST');
           expect(JSON.parse(String(init.body))).toEqual({ token: 'attribution-attempt' });
+          if (mode === 'resolved-before-action') resolved = true;
           return mode === 'claim-unavailable' ? response(503, {}) : response(200, { allowed: !resolved });
         }
         if (url.pathname === '/status') {
@@ -892,7 +893,6 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
         tabsQuery: async () => {
           if (handed) {
             trace.push('scan');
-            if (mode === 'resolved-during-scan') resolved = true;
           }
           return [{ id: 21, url: `https://chatgpt.com/c/${CHAT}` }];
         } });
@@ -901,9 +901,9 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
       await worker.fireAlarm();
       armed = true;
       await worker.fireAlarm();
-      expect(trace.indexOf('scan')).toBeGreaterThan(trace.indexOf('handout'));
-      expect(trace.indexOf('claim')).toBeGreaterThan(trace.indexOf('scan'));
+      expect(trace.indexOf('claim')).toBeGreaterThan(trace.indexOf('handout'));
       if (mode === 'unresolved') {
+        expect(trace.indexOf('scan')).toBeGreaterThan(trace.indexOf('claim'));
         expect(worker.tabsReload).toHaveBeenCalledExactlyOnceWith(21);
         expect(trace).toContain('repaired');
       } else {
@@ -913,6 +913,85 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
       expect(worker.tabsCreate).not.toHaveBeenCalled();
     }
   );
+
+  it('re-resolves the target when its tab changes conversation while /repairs/claim awaits', async () => {
+    let handed = false;
+    let claimEntered!: () => void;
+    const atClaim = new Promise<void>((resolve) => { claimEntered = resolve; });
+    let releaseClaim!: () => void;
+    const holdClaim = new Promise<void>((resolve) => { releaseClaim = resolve; });
+    let tabs = [{ id: 21, url: `https://chatgpt.com/c/${CHAT}` }];
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/status') {
+        if (!handed) {
+          handed = true;
+          return response(200, { repairs: [{ conversationId: CHAT, token: 'claim-route-race', requiresClaim: true }] });
+        }
+        return response(200, { repairs: [] });
+      }
+      if (url.pathname === '/repairs/claim') {
+        claimEntered();
+        await holdClaim;
+        return response(200, { allowed: true });
+      }
+      return response(200, { ok: true, repairs: [] });
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
+      tabsQuery: async () => tabs
+    });
+
+    const repairing = worker.fireAlarm();
+    await atClaim;
+    tabs = [{ id: 21, url: `https://chatgpt.com/c/${OTHER}` }];
+    releaseClaim();
+    await repairing;
+
+    expect(worker.tabsReload).not.toHaveBeenCalledWith(21);
+    expect(worker.tabsCreate).toHaveBeenCalledTimes(1);
+    expect(String(worker.tabsCreate.mock.calls[0]?.[0]?.url)).toContain(`/c/${CHAT}`);
+  });
+
+  it('re-resolves a missing conversation that appears while /repairs/claim awaits', async () => {
+    let handed = false;
+    let claimEntered!: () => void;
+    const atClaim = new Promise<void>((resolve) => { claimEntered = resolve; });
+    let releaseClaim!: () => void;
+    const holdClaim = new Promise<void>((resolve) => { releaseClaim = resolve; });
+    let tabs: Array<{ id: number; url: string }> = [];
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/status') {
+        if (!handed) {
+          handed = true;
+          return response(200, { repairs: [{ conversationId: CHAT, token: 'claim-appearance-race', requiresClaim: true }] });
+        }
+        return response(200, { repairs: [] });
+      }
+      if (url.pathname === '/repairs/claim') {
+        claimEntered();
+        await holdClaim;
+        return response(200, { allowed: true });
+      }
+      return response(200, { ok: true, repairs: [] });
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
+      tabsQuery: async () => tabs
+    });
+
+    const repairing = worker.fireAlarm();
+    await atClaim;
+    tabs = [{ id: 22, url: `https://chatgpt.com/c/${CHAT}` }];
+    releaseClaim();
+    await repairing;
+
+    expect(worker.tabsReload).toHaveBeenCalledExactlyOnceWith(22);
+    expect(worker.tabsCreate).not.toHaveBeenCalled();
+  });
 
   /**
    * Two tabs of one chat used to end the repair: neither was reloaded and the duplicate stayed
@@ -1713,8 +1792,8 @@ describe('extension command delivery', () => {
     // The page identifies itself, because a command belongs to one page: a second tab on
     // the same marker is a different claimant and the app refuses it.
     expect(bodies).toEqual([
-      { id: 'cmd-1', client: 'page-1' },
-      { id: 'cmd-gone', client: 'page-1' }
+      { id: 'cmd-1', client: 'page-1', recoveryOwner: 'recovery:cmd-1:tab:1' },
+      { id: 'cmd-gone', client: 'page-1', recoveryOwner: 'recovery:cmd-gone:tab:1' }
     ]);
   });
 

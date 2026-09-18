@@ -6,6 +6,8 @@
  * agree on exactly.
  */
 
+import type { SelfHealingRecoveryState } from './recovery.js';
+
 /** Where an event came from. The extension is untrusted UI observation; mcp is ours. */
 export type EventSource = 'extension' | 'mcp' | 'app';
 
@@ -449,7 +451,7 @@ export type NewSessionEvent = SessionEvent extends infer Event
  * queued to the conversation that command became.
  */
 export interface SessionOrigin {
-  kind: 'resume' | 'worker' | 'helper' | 'desktop';
+  kind: 'resume' | 'recovery' | 'worker' | 'helper' | 'desktop';
   /** The session this chat continues. Null when the source session no longer exists. */
   fromSessionId: string | null;
   /** Agent id for a worker chat ("worker-1"). Null for a resume. */
@@ -483,10 +485,31 @@ export function originTitle(origin: SessionOrigin, source: string | null): strin
     const task = clip(origin.task, 60);
     return task ? `${who} · ${task}` : who;
   }
+  if (origin.kind === 'recovery') {
+    const from = clip((source ?? '').replace(new RegExp(`^(?:${RESUMED_PREFIX})+`), ''), 80);
+    return from ? `Recovered · ${from}` : 'Recovered session';
+  }
   // A resumed chat is itself resumable, and often is. Stacking the prefix each time
   // would bury the part of the name that identifies the work.
   const from = clip((source ?? '').replace(new RegExp(`^(?:${RESUMED_PREFIX})+`), ''), 80);
   return from ? `${RESUMED_PREFIX}${from}` : 'Resumed session';
+}
+
+/**
+ * One durable owner for any provider-conversation replacement of a local session.
+ *
+ * Compact & Resume and Self-Healing both ultimately move the same durable session from one
+ * disposable provider executor to another. They therefore cannot own separate browser-opening
+ * locks: whichever transaction acquires this record first is the only one allowed to create or
+ * submit a replacement until it commits or durably gives up.
+ */
+export interface SessionReplacementTransfer {
+  kind: 'continuation' | 'recovery';
+  transactionId: string;
+  sourceConversationId: string;
+  /** Recovery generation is part of Self-Healing's CAS; continuations do not have one. */
+  recoveryGeneration: number | null;
+  acquiredAt: number;
 }
 
 export interface SessionSummary {
@@ -597,6 +620,10 @@ export interface SessionSummary {
   } | null;
   /** Agents seen in this session, prime first. Empty when no swarm ran. */
   agents: string[];
+  /** Current/last provider failure episode. Null until Self-healing Sessions acts here. */
+  recovery?: SelfHealingRecoveryState | null;
+  /** Exclusive provider-replacement transaction owner, shared by continuation and recovery. */
+  replacementTransfer?: SessionReplacementTransfer | null;
   /** Set only for a chat this app opened itself. Null for one the user started. */
   origin: SessionOrigin | null;
 }

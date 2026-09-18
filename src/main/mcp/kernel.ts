@@ -88,10 +88,11 @@ import {
 import { requestCorrelation } from '../session/correlation.js';
 import { BLOCKED_CHAT_REFUSAL, anyChatBlocked, isChatBlocked } from '../session/blocked-chats.js';
 import { anyContinuationOpen, compactingConversation } from '../session/continuation.js';
+import { anyRecoveryFenceActive, recoveryFenceActive } from '../session/recovery-fence.js';
 import { acknowledgeBackgroundExecOutput, backgroundExecRecoveryNotices, offerBackgroundExecOutput } from '../codex/ownership.js';
 import { DEFAULT_MAX_OUTPUT_TOKENS } from '../codex/unified-exec-constants.js';
 import { unattributedRepairEta } from '../bridge.js';
-import { conversationAttachment, readOverflowText } from '../session/store.js';
+import { conversationAttachment, hasSupersededConversationHistory, readOverflowText } from '../session/store.js';
 import { sessionFinishDeadline } from '../session/finish.js';
 import type { StoredText, ToolOutcome } from '../../shared/session.js';
 
@@ -632,7 +633,14 @@ async function dispatchTracked(
   // now means the page never proved it, not that the page had not proved it yet.
   //
   // A chat being compacted is refused on the same terms, so it waits on the same terms.
-  if (!context.caller.conversationId && (anyChatBlocked() || anyContinuationOpen()) && requestId) {
+  const supersededIdentityMayMatter =
+    !context.caller.conversationId && Boolean(requestId) && await hasSupersededConversationHistory();
+  if (!context.caller.conversationId && (
+    anyChatBlocked() ||
+    anyContinuationOpen() ||
+    anyRecoveryFenceActive() ||
+    supersededIdentityMayMatter
+  ) && requestId) {
     setCallerConversation(
       context,
       await awaitFreshCallOrigin(name, startedAt, identityWindow(REQUEST_ID_GRACE_MS), { requestId })
@@ -641,6 +649,7 @@ async function dispatchTracked(
   const supersededConversation = context.caller.conversationId
     ? (await conversationAttachment(context.caller.conversationId, context.caller.sessionId ?? null)) === 'superseded'
     : false;
+  const recoveringConversation = recoveryFenceActive(context.caller.conversationId);
   // Two things about liveness, both before the agent is resolved so that the answer this
   // call gets is the state this call itself established.
   //
@@ -656,17 +665,17 @@ async function dispatchTracked(
   // thought asleep takes the free execution slot back for that family, so the liveness
   // bookkeeping below sees the same run it would have seen had the parking not happened. A
   // chat the user stopped from the app is refused below anyway and reclaims nothing.
-  if (!supersededConversation && !isFinish && !isChatBlocked(context.caller.conversationId)) {
+  if (!supersededConversation && !recoveringConversation && !isFinish && !isChatBlocked(context.caller.conversationId)) {
     reactivateDormantRunForConversation(context.caller.conversationId);
   }
-  const quietWorkers = supersededConversation ? [] : sleepSilentDetachedWorkers();
+  const quietWorkers = supersededConversation || recoveringConversation ? [] : sleepSilentDetachedWorkers();
   for (const quiet of quietWorkers) {
     if (quiet.report) await recordAgentMessage(quiet.report, 'sent', quiet.info.conversationId);
   }
   // And this call is itself first-hand evidence that its own conversation is alive. That is
   // what undoes a worker given up on because its tab went away — the turn never stopped, so
   // the call arrives from a chat the app had written off, and the write-off was wrong.
-  const alive = supersededConversation ? null : noteAgentAlive(context.caller.conversationId);
+  const alive = supersededConversation || recoveringConversation ? null : noteAgentAlive(context.caller.conversationId);
   if (alive?.report) await recordAgentMessage(alive.report, 'sent', context.caller.conversationId);
   // A prime message accepted while a worker's tab was closed could not safely be injected while
   // that server-side turn might still be running. If the silence check above has now proved the
@@ -743,7 +752,7 @@ async function dispatchTracked(
   // handler reads the queue. New queued input is still offered only with its result.
   if (!nested) await acknowledgeToolInput(context.caller.sessionId, context.caller.conversationId, requestId, startedAt)
     .catch(() => logWarn('Prior user input receipt could not be saved; its existing claim is preserved'));
-  if (!nested && requestId && !blockedChat && !supersededConversation && !compacting) {
+  if (!nested && requestId && !blockedChat && !supersededConversation && !recoveringConversation && !compacting) {
     const explicitPoll = name === 'write_stdin' && args && typeof args === 'object'
       ? (args as { session_id?: number }).session_id : undefined;
     await acknowledgeBackgroundExecOutput(context.caller.sessionId, startedAt, explicitPoll);
@@ -757,6 +766,12 @@ async function dispatchTracked(
   const result = await runInCallContext(context, () =>
       blockedChat
         ? Promise.resolve(fail(BLOCKED_CHAT_REFUSAL))
+        : recoveringConversation
+        ? Promise.resolve(
+            fail(
+              'RECOVERY_IN_PROGRESS: Self-healing is replacing this ChatGPT executor. No local tool was run. Do not retry this operation in the old chat; continue only in the replacement chat.'
+            )
+          )
         : compacting
         ? Promise.resolve(fail(COMPACTION_IN_PROGRESS_REFUSAL))
         : supersededConversation
@@ -819,7 +834,7 @@ async function dispatchTracked(
   // retry after a lost result. The SDK exposes the JSON-RPC id, but a model-issued retry is
   // a new MCP request with a new id, so that id cannot prove the previous finish result was
   // seen. The broker therefore re-offers rather than assuming; see acknowledgeOffers.
-  const acknowledgedForConversation = supersededConversation || nested
+  const acknowledgedForConversation = supersededConversation || recoveringConversation || nested
     ? null
     : acknowledgeOffersForConversation(
         context.caller.conversationId,
@@ -842,12 +857,12 @@ async function dispatchTracked(
   const baseResult = surface === 'plugins' && !handlerRan ? pluginManager.redactResult(result) as ToolResult : result;
   let delivered = nested ? baseResult : withUnattributedNotice(
     context.caller.conversationId,
-    withInbox(context.caller.conversationId, context.agent, baseResult, isFinish),
+    withInbox(context.caller.conversationId, recoveringConversation ? null : context.agent, baseResult, isFinish),
     context.caller.requestId
   );
   // Ordinary tools carry direct user input, but only the explicit finish signal
   // advances a planned stage. Successful work is not evidence that a stage is done.
-  const userInput = nested ? { messages: [], reminder: '' } : await offerToolInput(context.caller.sessionId, context.caller.conversationId, context.caller.requestId, startedAt, name === 'session_finish' && !result.isError).catch(() => {
+  const userInput = nested || recoveringConversation ? { messages: [], reminder: '' } : await offerToolInput(context.caller.sessionId, context.caller.conversationId, context.caller.requestId, startedAt, name === 'session_finish' && !result.isError).catch(() => {
     logWarn('User input could not be attached; the completed tool result is preserved');
     return { messages: [], reminder: '' };
   });
@@ -860,7 +875,7 @@ async function dispatchTracked(
     if (userInput.reminder) attachments.push({ type: 'text', text: '\n\n' + userInput.reminder });
     delivered = { ...delivered, content: [...delivered.content, ...attachments] };
   }
-  if (!nested && handlerRan && !blockedChat && !supersededConversation && !compacting) {
+  if (!nested && handlerRan && !blockedChat && !supersededConversation && !recoveringConversation && !compacting) {
     delivered = await withBackgroundExecRecovery(context, delivered);
   }
   if (!nested) delivered = await withIdentityRecoveredNotice(context, delivered);

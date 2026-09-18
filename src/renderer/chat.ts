@@ -1184,7 +1184,13 @@ async function refreshSessionControls(): Promise<void> {
   paintAutomationSwitch();
   $<HTMLButtonElement>('compactSession').disabled = !!controls.blocked || !!controls.job?.busy;
   $('cancelCompaction').hidden = !controls.job?.busy;
-  ui($('sessionControlStatus'), 'textContent', () => controls.blocked === 'worker' ? t("This sub-agent is managed by its prime.") : controls.blocked === 'blocked' ? t("This chat is blocked.") : controls.job?.busy ? t("Compaction is running in ChatGPT.") : '');
+  ui($('sessionControlStatus'), 'textContent', () => {
+    const control = controls.blocked === 'worker' ? t("This sub-agent is managed by its prime.") :
+      controls.blocked === 'blocked' ? t("This chat is blocked.") :
+      controls.job?.busy ? t("Compaction is running in ChatGPT.") : '';
+    const healing = controls.selfHealingStatus ? `${t('Self-healing')} · ${t(controls.selfHealingStatus)}` : '';
+    return [control, healing].filter(Boolean).join(' · ');
+  });
 }
 
 async function loadDetail(navigate = false, olderBefore?: number, newerFrom?: number): Promise<void> {
@@ -2805,7 +2811,8 @@ export function chatSettingsPatch(current: Config): {
       enabled: $<HTMLInputElement>('homeMaEnabled').checked,
       maxWorkers: number('maWorkers', current.multiAgent.maxWorkers, 1, 8),
       allowUnattributedCalls: $<HTMLInputElement>('allowUnattributedCalls').checked,
-      recoverAgentTabs: $<HTMLInputElement>('recoverAgentTabs').checked
+      recoverAgentTabs: $<HTMLInputElement>('recoverAgentTabs').checked,
+      selfHealingSessions: $<HTMLInputElement>('selfHealingSessions').checked
     },
     goal: {
       enabled: current.goal.enabled, mode: current.goal.mode,
@@ -3179,6 +3186,7 @@ const CHAT_INPUTS = [
   'maWorkers',
   'allowUnattributedCalls',
   'recoverAgentTabs',
+  'selfHealingSessions',
   'goalProvider',
   'goalBaseUrl',
   'goalCustomModel',
@@ -3213,6 +3221,11 @@ export function chatApply(state: AppState, previous?: Config): void {
     $<HTMLInputElement>('recoverAgentTabs'),
     config.multiAgent.recoverAgentTabs,
     previous?.multiAgent.recoverAgentTabs
+  );
+  applyChatChecked(
+    $<HTMLInputElement>('selfHealingSessions'),
+    config.multiAgent.selfHealingSessions,
+    previous?.multiAgent.selfHealingSessions
   );
 
   applyChatValue($<HTMLSelectElement>('workerModel'), config.multiAgent.defaultModel ?? '', previous?.multiAgent.defaultModel);

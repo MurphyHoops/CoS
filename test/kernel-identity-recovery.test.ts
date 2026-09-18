@@ -7,7 +7,9 @@ vi.mock('../src/main/session/recorder.js', async original => ({
   recordToolCall: fixture.record
 }));
 vi.mock('../src/main/session/store.js', async original => ({
-  ...await original<typeof import('../src/main/session/store.js')>(), conversationAttachment: fixture.attachment
+  ...await original<typeof import('../src/main/session/store.js')>(),
+  conversationAttachment: fixture.attachment,
+  hasSupersededConversationHistory: vi.fn(async () => false)
 }));
 vi.mock('../src/main/session/input.js', () => ({ offerToolInput: async () => ({ messages: [], reminder: '' }), acknowledgeToolInput: async () => {}, TOOL_INPUT_HEADER: '' }));
 vi.mock('../src/main/session/blocked-chats.js', () => ({

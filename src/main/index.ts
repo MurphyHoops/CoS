@@ -62,6 +62,7 @@ import {
   setContinuationRecoveryHooks,
   type ContinuationSnapshot
 } from './session/continuation.js';
+import { reconcileSelfHealingAfterRestart } from './session/self-healing.js';
 import { runShutdownSequence } from './shutdown.js';
 import { applyStagedUpdate, startUpdateChecks } from './update.js';
 import { UI_BASE_ZOOM, windowLayoutForWorkArea, titleBarOverlayForTheme } from './window-layout.js';
@@ -392,6 +393,14 @@ void app.whenReady().then(async () => {
   const savedContinuations = await readDurable<ContinuationSnapshot>(CONTINUATIONS_STATE);
   if (windowActivation.isDisabled()) return;
   await restoreContinuations(savedContinuations);
+  if (windowActivation.isDisabled()) return;
+
+  // Self-healing recovery owns MCP admission as well as browser delivery. Rebuild every durable
+  // hard-recovery fence and finish any already-committed A→B projection before IPC can expose a
+  // Connect action or auto-connect can start the Core server. Doing this only inside bridge
+  // command restore leaves a startup window where old chat A is still the durable attachment and
+  // can issue one more local mutation before its recovery fence exists.
+  await reconcileSelfHealingAfterRestart();
   if (windowActivation.isDisabled()) return;
 
   // Strict CSP for our own page. There is no remote content and no inline script.

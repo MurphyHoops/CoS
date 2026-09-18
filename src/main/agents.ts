@@ -14,6 +14,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import type { SelfHealingAgentLineage } from '../shared/recovery.js';
 import type { AgentInfo, AgentMessage, AgentState, ReasoningEffort, SwarmState } from '../shared/session.js';
 import { REASONING_EFFORTS, isReasoningEffort } from '../shared/session.js';
 import { getConfig } from './config.js';
@@ -609,6 +610,26 @@ function dormantAgentForConversation(
     }
   }
   return found;
+}
+
+function dormantRunForLineage(runId: string): DormantRun | null {
+  let found: DormantRun | null = null;
+  for (const dormant of dormantRuns.values()) {
+    const prime = dormant.agents.get(PRIME_ID);
+    if (prime?.info.runId !== runId) continue;
+    if (found) return null;
+    found = dormant;
+  }
+  return found;
+}
+
+function matchesRecoveryLineage(agent: Agent, ownerPrimeConversationId: string, lineage: SelfHealingAgentLineage): boolean {
+  return agent.info.role === lineage.role &&
+    agent.info.id === lineage.agentId &&
+    agent.info.runId === lineage.runId &&
+    agent.info.createdAt === lineage.createdAt &&
+    (agent.info.role !== 'worker' || agent.info.task === lineage.task) &&
+    ownerPrimeConversationId === lineage.primeConversationId;
 }
 
 /**
@@ -3420,14 +3441,27 @@ export function hasDormantWorkerLeases(): boolean {
  */
 export function repairPrimeConversationAfterRecovery(
   fromConversationId: string,
-  toConversationId: string
+  toConversationId: string,
+  lineage?: SelfHealingAgentLineage
 ): boolean {
-  const run = runForConversation(fromConversationId) ?? runForConversation(toConversationId);
+  if (lineage && (lineage.role !== 'prime' || lineage.agentId !== PRIME_ID)) return false;
+  if (lineage && lineage.primeConversationId !== fromConversationId) return false;
+  const run = lineage?.runId
+    ? runs.get(lineage.runId) ?? null
+    : runForConversation(fromConversationId) ?? runForConversation(toConversationId);
   if (!fromConversationId || !toConversationId || fromConversationId === toConversationId) return false;
 
   if (run) {
     const prime = run.agents.get(PRIME_ID);
+    if (lineage && (!prime || prime.info.role !== 'prime' || prime.info.id !== lineage.agentId ||
+        prime.info.runId !== lineage.runId || prime.info.createdAt !== lineage.createdAt)) return false;
+    // A prior reconciliation may already have published this exact run's A→B broker projection
+    // before its swarm fsync failed. The durable recovery lineage still names source A by design;
+    // once this same run/Prime incarnation already names B, retry only owes persistence and must
+    // not require A to reappear in memory. A foreign B cannot satisfy the exact run+createdAt
+    // lineage above, and the source identity is separately pinned to `lineage.primeConversationId`.
     if (prime && run.primeConversationId === toConversationId && prime.info.conversationId === toConversationId) return true;
+    if (lineage && !matchesRecoveryLineage(prime!, run.primeConversationId, lineage)) return false;
     if (prime && run.primeConversationId === fromConversationId && prime.info.conversationId === fromConversationId) {
       if (conversationOwnedOutside(run.agents, fromConversationId, toConversationId)) return false;
       run.primeConversationId = toConversationId;
@@ -3442,11 +3476,18 @@ export function repairPrimeConversationAfterRecovery(
     }
   }
 
-  const already = dormantRunForPrime(toConversationId);
+  const lineageDormant = lineage ? dormantRunForLineage(lineage.runId) : null;
+  const already = lineageDormant ?? dormantRunForPrime(toConversationId);
+  if (lineage) {
+    const prime = already?.agents.get(PRIME_ID);
+    if (already && (!prime || prime.info.role !== 'prime' || prime.info.id !== lineage.agentId ||
+        prime.info.runId !== lineage.runId || prime.info.createdAt !== lineage.createdAt)) return false;
+  }
   if (already?.agents.get(PRIME_ID)?.info.conversationId === toConversationId) return true;
-  const dormant = dormantRunForPrime(fromConversationId);
+  const dormant = lineageDormant ?? dormantRunForPrime(fromConversationId);
   const prime = dormant?.agents.get(PRIME_ID);
   if (!dormant || !prime || prime.info.conversationId !== fromConversationId) return false;
+  if (lineage && !matchesRecoveryLineage(prime, dormant.primeConversationId, lineage)) return false;
   if (conversationOwnedOutside(dormant.agents, fromConversationId, toConversationId)) return false;
   dormantRuns.delete(fromConversationId);
   dormant.primeConversationId = toConversationId;
@@ -3458,6 +3499,73 @@ export function repairPrimeConversationAfterRecovery(
     `multi-agent: recovery repaired dormant worker ownership from conversation ${fromConversationId} to ${toConversationId}`
   );
   changed();
+  return true;
+}
+
+/**
+ * Recovery-only worker counterpart to the prime projection repair above.
+ *
+ * Normal worker binding is intentionally immutable: a worker chat is its identity for the life
+ * of an ordinary run. Emergency Resume is the one authenticated exception. The durable local
+ * session has already proven A→B before this hook is called; `(runId, agentId, from)` then fences
+ * which worker projection may follow it. A fresh destination must be unowned. Repeating the same
+ * proven repair is idempotent, while every other attempted move fails closed.
+ */
+export function repairWorkerConversationAfterRecovery(
+  agentId: string,
+  runId: string,
+  fromConversationId: string,
+  toConversationId: string,
+  lineage?: SelfHealingAgentLineage
+): boolean {
+  if (!agentId || !runId || !fromConversationId || !toConversationId || fromConversationId === toConversationId) return false;
+  if (lineage && (lineage.role !== 'worker' || lineage.agentId !== agentId || lineage.runId !== runId)) return false;
+  const run = runs.get(runId);
+  const agent = run?.agents.get(agentId);
+  if (run && agent && agent.info.role === 'worker') {
+    if (lineage && !matchesRecoveryLineage(agent, run.primeConversationId, lineage)) return false;
+    if (agent.info.conversationId === toConversationId) return true;
+    if (agent.info.conversationId !== fromConversationId) return false;
+    if (run.primeConversationId === toConversationId) return false;
+    // The browser/session transaction already checks local-session ownership. The broker must
+    // independently prove B is not another Prime/worker identity before publishing its projection.
+    if (conversationOwnedOutside(run.agents, fromConversationId, toConversationId)) return false;
+
+    agent.info.conversationId = toConversationId;
+    agent.info.state = 'active';
+    agent.info.detachedAt = null;
+    agent.info.revivable = false;
+    agent.info.lastSeenAt = Date.now();
+    agent.info.finishedAt = null;
+    agent.info.sleptAt = null;
+    agent.info.result = null;
+    consecutiveWakeFailures.delete(fromConversationId);
+    consecutiveWakeFailures.delete(toConversationId);
+    logInfo(`multi-agent: recovery moved ${agentId} from conversation ${fromConversationId} to ${toConversationId}`);
+    changed('critical');
+    return true;
+  }
+
+  // Restart/feature-disable can park a family before session reconciliation runs. Preserve the
+  // parked lifecycle state exactly; recovery is moving this worker's executor identity, not
+  // granting it a slot or waking it. The durable session move already proves A→B.
+  const dormantFound = dormantAgentForConversation(fromConversationId) ?? dormantAgentForConversation(toConversationId);
+  const dormant = dormantFound?.owner;
+  const dormantAgent = dormantFound?.agent;
+  if (!dormant || !dormantAgent || dormantAgent.info.role !== 'worker' || dormantAgent.info.id !== agentId ||
+      dormantAgent.info.runId !== runId) return false;
+  if (lineage && !matchesRecoveryLineage(dormantAgent, dormant.primeConversationId, lineage)) return false;
+  if (dormantAgent.info.conversationId === toConversationId) return true;
+  if (dormantAgent.info.conversationId !== fromConversationId) return false;
+  if (dormant.primeConversationId === toConversationId) return false;
+  if (conversationOwnedOutside(dormant.agents, fromConversationId, toConversationId)) return false;
+  dormantAgent.info.conversationId = toConversationId;
+  dormantAgent.info.detachedAt = null;
+  dormantAgent.info.lastSeenAt = Date.now();
+  consecutiveWakeFailures.delete(fromConversationId);
+  consecutiveWakeFailures.delete(toConversationId);
+  logInfo(`multi-agent: recovery moved dormant ${agentId} from conversation ${fromConversationId} to ${toConversationId}`);
+  changed('critical');
   return true;
 }
 

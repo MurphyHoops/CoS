@@ -755,8 +755,8 @@
       return !revoked;
     };
   }
-  function sendSubmittedText(stillCurrent, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null) {
-    return CLF_DOM.send({ stillCurrent, clearAcceptedDraft, beforeSend, acceptUserReceipt, matchesUser: matchesSubmittedUser,
+  function sendSubmittedText(stillCurrent, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null, onAttempt = null) {
+    return CLF_DOM.send({ stillCurrent, clearAcceptedDraft, beforeSend, onAttempt, acceptUserReceipt, matchesUser: matchesSubmittedUser,
       observeEvidence: check => { pageViewChecks.add(check); return () => pageViewChecks.delete(check); } });
   }
   const GOAL_MARKER_INSTRUCTION = '\n\nFor this Goal session only: at the end of each final reply, write exactly one separate last line: [[COS_GOAL:COMPLETE]] if the entire requested task is finished, or [[COS_GOAL:CONTINUE]] if requested work remains. Do not claim completion for partial work. If user input is required, explain it and omit both markers.';
@@ -1574,6 +1574,7 @@
     // such transaction. Carrying it across an SPA move silently unrecorded the next chat —
     // its first message, its title, its turn — until the tab was reloaded.
     continuationJournalPending = false;
+    recoveryJournalPending = false;
     commandJournalGate = false;
     nativeBusy = false;
     nativePhase = '';
@@ -2050,6 +2051,7 @@
         // marker has already disappeared. reconcileContinuationMarker() releases the gate on
         // the app's answer, committed or refused; only an unreachable app keeps it shut.
         const continuation = text.match(CONTINUATION_MARKER);
+        const emergencyResume = text.match(EMERGENCY_RESUME_MARKER);
         // The app's settled disposition outlives this DOM row. A remount or a later
         // quotation of its marker cannot turn a committed chat back into a shadow.
         const settledContinuation = continuation && [...reconciledContinuations.keys()].some(
@@ -2057,6 +2059,10 @@
         );
         if (continuation && continuation[1] === 'RESUME' && bootstrap !== 'resume' && !settledContinuation) {
           continuationJournalPending = true;
+          commandJournalGate = true;
+        }
+        if (emergencyResume && bootstrap !== 'recovery' && !reconciledRecoveries.has(`${emergencyResume[1]}\u0000${conversationId || ''}`)) {
+          recoveryJournalPending = true;
           commandJournalGate = true;
         }
         markSeen(key, reaction);
@@ -2468,7 +2474,7 @@
     // while an exact send receipt is pending; the usual route/message checks still decide it.
     const pendingSendEvidence = pageViewChecks.size > 0 && (desktopInputBusy ||
       userSendReceipt && Date.now() - userSendReceipt.at < USER_SEND_RECEIPT_MS);
-    if (continuationJournalPending || generating || pendingSendEvidence) {
+    if (continuationJournalPending || recoveryJournalPending || generating || pendingSendEvidence) {
       void refreshFiber();
     } else if (fiberTerminalMessageId && nowGenerating) {
       const terminalTurn = currentAssistantTurn(observedTurns);
@@ -3831,6 +3837,9 @@
     CLF_DOM.presentUserPrompts?.(message => userMessageSource(message)?.text ?? null);
     for (const check of pageViewChecks) void check();
     completeDesktopDecision();
+    const recoveryReconciliation = reconcileRecoveryMarkers();
+    if (recoveryReconciliation) await recoveryReconciliation;
+    if (epoch !== askedEpoch || conversationId !== askedConversation) return false;
     const markedTurns = markedContinuationTurns();
     const continuationReconciliation = reconcileContinuationMarkers(markedTurns);
     if (continuationReconciliation) await continuationReconciliation;
@@ -6157,7 +6166,7 @@
       // finished and the page has been repainted with what the draft is doing.
       goalConfig = data.goal && typeof data.goal === 'object' ? data.goal : null;
       if (goalConfig) goalDraft = goalConfig.draft || null;
-      const nextBootstrap = data.bootstrap === 'resume' || data.bootstrap === 'worker' ? data.bootstrap : null;
+      const nextBootstrap = data.bootstrap === 'resume' || data.bootstrap === 'worker' || data.bootstrap === 'recovery' ? data.bootstrap : null;
       bootstrapOwner = nextBootstrap && typeof data.bootstrapMessageId === 'string' && data.bootstrapMessageId
         ? { conversationId: forId, epoch: forEpoch, messageId: data.bootstrapMessageId } : null;
       bootstrap = nextBootstrap;
@@ -6168,6 +6177,9 @@
       // says so; a session that attribution opened for a stranger does not.
       if (continuationJournalPending && bootstrap === 'resume' && observed.session) {
         releaseContinuationJournal();
+      }
+      if (recoveryJournalPending && bootstrap === 'recovery' && observed.session) {
+        releaseRecoveryJournal();
       }
       bootstrapAgent = typeof data.bootstrapAgent === 'string' && data.bootstrapAgent ? data.bootstrapAgent : null;
       if (job && job.busy) pressedAt = 0;
@@ -8632,6 +8644,7 @@
   }
 
   const CONTINUATION_MARKER = /^\s*\[\[CLF-(HANDOFF|RESUME):([A-Za-z0-9_-]{16,64})\]\](?:\s|$)/;
+  const EMERGENCY_RESUME_MARKER = /^\s*\[\[CLF-EMERGENCY-RESUME:([0-9a-f-]{8,64})\]\](?:\s|$)/i;
   const continuationReconciliations = new Map();
   /**
    * Proof key → how the app answered the marker: `committed` is ownership proof for the
@@ -8640,6 +8653,84 @@
    */
   const reconciledContinuations = new Map();
   let continuationJournalPending = false;
+  const recoveryReconciliations = new Map();
+  const reconciledRecoveries = new Set();
+  let recoveryJournalPending = false;
+
+  /** Stable ChatGPT-authored Emergency Resume messages visible in the current Fiber snapshot. */
+  function markedRecoveryMessages(turns = [...fiberTurns.values()]) {
+    const found = new Map();
+    let ambiguous = false;
+    for (const turn of turns) {
+      for (const message of turn.messages || []) {
+        if (message.role !== 'user' || message.stable !== true) continue;
+        const match = String(message.rawText || '').match(EMERGENCY_RESUME_MARKER);
+        if (!match) continue;
+        const proof = { episodeId: match[1], messageId: message.rawMessageId || message.messageId };
+        if (found.has(match[1])) {
+          found.set(match[1], null);
+          ambiguous = true;
+        } else found.set(match[1], proof);
+      }
+    }
+    return { proofs: [...found.values()].filter(proof => proof?.messageId), ambiguous };
+  }
+
+  /**
+   * Commits a replacement from the server-authored recovery marker after page/ACK lifetime loss.
+   * No text is ever replayed here. The app re-validates the durable episode and performs the same
+   * rebind CAS as the ordinary command ACK.
+   */
+  function reconcileRecoveryMarkers(marked = markedRecoveryMessages()) {
+    if (!conversationId || (marked.proofs.length === 0 && !marked.ambiguous)) return null;
+    if (marked.ambiguous) {
+      // Two stable user rows carrying one recovery episode are evidence of duplicate delivery or
+      // transcript corruption, never authority to guess which replacement to commit. Hold normal
+      // journaling closed until the app independently reports this conversation as an already
+      // committed recovery destination; do not send either marker as a recovery proof.
+      recoveryJournalPending = true;
+      commandJournalGate = true;
+      return Promise.resolve(false);
+    }
+    return (async () => {
+      for (const proof of marked.proofs) {
+        const owner = conversationId;
+        const key = `${proof.episodeId}\u0000${owner}`;
+        if (reconciledRecoveries.has(key)) continue;
+        const existing = recoveryReconciliations.get(key);
+        if (existing) { await existing; continue; }
+        recoveryJournalPending = true;
+        commandJournalGate = true;
+        const work = (async () => {
+          const reply = await ask({
+            type: 'recovery_reconcile',
+            conversationId: owner,
+            episodeId: proof.episodeId,
+            messageId: proof.messageId,
+            client: RUN_ID
+          });
+          if (!alive || conversationId !== owner || CLF_DOM.conversationId() !== owner) return false;
+          if (reply?.ok === true && reply.data?.committed === true) {
+            reconciledRecoveries.add(key);
+            releaseRecoveryJournal();
+            return true;
+          }
+          // Only an explicit terminal/superseded disposition may retire this journal. A document
+          // reload changes RUN_ID and can legitimately produce an ownership conflict while the
+          // same recovery transaction is still reconciling; treating every 404/409 as final was
+          // exactly the gate-release race that admitted a shadow B.
+          if (reply && (reply.status === 404 || reply.status === 409) && reply.data?.disposition === 'terminal') {
+            reconciledRecoveries.add(key);
+            releaseRecoveryJournal();
+          }
+          return false;
+        })().finally(() => recoveryReconciliations.delete(key));
+        recoveryReconciliations.set(key, work);
+        await work;
+      }
+      return true;
+    })();
+  }
 
   /**
    * The turn that answered a marked prompt, or null while there is not one yet.
@@ -8774,7 +8865,13 @@
 
   function releaseContinuationJournal() {
     continuationJournalPending = false;
-    commandJournalGate = false;
+    if (!recoveryJournalPending) commandJournalGate = false;
+    void flush();
+  }
+
+  function releaseRecoveryJournal() {
+    recoveryJournalPending = false;
+    if (!continuationJournalPending) commandJournalGate = false;
     void flush();
   }
 
@@ -9909,7 +10006,7 @@
     } finally {
       reportClaim(false);
       if (commandAttempt === attempt) commandAttempt = null;
-      if (gateJournal && !continuationJournalPending) commandJournalGate = false;
+      if (gateJournal && !continuationJournalPending && !recoveryJournalPending) commandJournalGate = false;
       void flush();
     }
   }
@@ -10118,6 +10215,7 @@
     }
     if (await failIfRetargeted()) return;
     const resumeMarker = boot.type === 'resume' ? String(boot.text || '').match(CONTINUATION_MARKER) : null;
+    const recoveryMarker = boot.type === 'recovery' ? String(boot.text || '').match(EMERGENCY_RESUME_MARKER) : null;
     // The last custody writes await HTTP. They cannot preserve the composer or SPA route
     // that was checked above; prove both again after each write and at the native click.
     const exactBootstrapDraft = () => squeeze(CLF_DOM.composer()?.textContent) === expectedText;
@@ -10164,15 +10262,50 @@
         return;
       }
     }
+    if (boot.type === 'recovery' && !recoveryMarker) {
+      return void (await fail('the recovery bootstrap had no valid Emergency Resume marker'));
+    }
     if (!stillOnTarget() || !exactBootstrapDraft()) { await rejectChangedBootstrap(); return; }
     // The destination Resume prompt is the first authored evidence in a brand-new chat.
     // Record it before send() clicks so reportMessages can open B's turn immediately instead
     // of waiting until Fiber eventually exposes the first connector request.
+    if (boot.type === 'recovery') {
+      // From the native click onward, the old document can no longer prove that no replacement
+      // was created. Keep B's recorder journal closed until either the command ACK or the stable
+      // Emergency Resume marker commits the same durable A→B transaction.
+      recoveryJournalPending = true;
+      commandJournalGate = true;
+    }
     rememberUserSend();
-    if (!(await sendSubmittedText(() => !attempt?.cancelled && sendingBootstrap(), false))) {
+    let recoverySendAttempted = false;
+    const authorizeRecoveryDispatch = boot.type === 'recovery'
+      ? async (sendCurrent) => {
+          const armed = await ask({ type: 'recovery_send', id: boot.id, action: 'dispatch' });
+          return Boolean(armed?.ok === true && armed?.data?.armed === true && sendCurrent() && sendingBootstrap());
+        }
+      : null;
+    if (!(await sendSubmittedText(
+      () => !attempt?.cancelled && sendingBootstrap(),
+      false,
+      authorizeRecoveryDispatch,
+      null,
+      boot.type === 'recovery' ? () => { recoverySendAttempted = true; } : null
+    ))) {
       // Once send() was invoked, a missing/cleared draft cannot prove that no click
       // happened. Only the exact pre-click check above may release the dispatch.
-      if (boot.type === 'resume') {
+      if (boot.type === 'recovery' && !recoverySendAttempted) {
+        // The native adapter never crossed its exact button.click boundary. Tell the app that
+        // positive fact before releasing anything locally. If the durable release fails, retain
+        // both the draft and journal gate: this document cannot turn an uncertain app boundary
+        // into replay authority merely because it knows its own click did not happen.
+        const released = await ask({ type: 'recovery_send', id: boot.id, action: 'release' }).catch(() => null);
+        if (released?.ok === true && released?.data?.released === true) {
+          releaseRecoveryJournal();
+          await bootstrapDraft.clear();
+        }
+        return;
+      }
+      if (boot.type === 'resume' || boot.type === 'recovery') {
         // Retain the armed ticket and journal gate for exact marker reconciliation; never
         // replay an ambiguous click or let ordinary events create its shadow session.
         return;
@@ -10218,7 +10351,7 @@
     // clock the app is running, so this page never outlives the command it is working on.
     for (let tries = 0; tries < 80; tries++) {
       await sleep(500);
-      const found = boot.type === 'resume' ? bootstrapConversation() : CLF_DOM.conversationId();
+      const found = boot.type === 'resume' || boot.type === 'recovery' ? bootstrapConversation() : CLF_DOM.conversationId();
       if (found) {
         if (boot.type === 'resume') rememberResumeGoalPending(found, boot.id);
         publishBootstrapSelection(found);

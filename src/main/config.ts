@@ -154,7 +154,10 @@ const DEFAULT_MULTI_AGENT: MultiAgentSettings = {
   allowUnattributedCalls: false,
   // Off: Goal/Loop chats are always recovered, and reopening anything else — a worker, a prime,
   // a plain chat that once called a tool — is the user's choice to make.
-  recoverAgentTabs: false
+  recoverAgentTabs: false,
+  // Conservative migration/default: replacing a provider conversation is a stronger action
+  // than reopening its tab, so existing installs opt in explicitly.
+  selfHealingSessions: false
 };
 /** Fresh-install exposure. Kept separate from migration defaults on purpose. */
 const ALL_FIRST_LAUNCH_CAPABILITIES: Capabilities = Object.fromEntries(
@@ -340,7 +343,8 @@ const configSchema = z.object({
     defaultReasoning: z.enum(['', ...REASONING_EFFORTS]).optional(),
       maxWorkers: z.number().int().min(1).max(8).optional().default(DEFAULT_MULTI_AGENT.maxWorkers),
       allowUnattributedCalls: z.boolean().optional().default(DEFAULT_MULTI_AGENT.allowUnattributedCalls),
-      recoverAgentTabs: z.boolean().optional().default(DEFAULT_MULTI_AGENT.recoverAgentTabs)
+      recoverAgentTabs: z.boolean().optional().default(DEFAULT_MULTI_AGENT.recoverAgentTabs),
+      selfHealingSessions: z.boolean().optional().default(DEFAULT_MULTI_AGENT.selfHealingSessions)
     })
     .optional()
     .default({ ...DEFAULT_MULTI_AGENT }),

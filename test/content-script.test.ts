@@ -12403,6 +12403,83 @@ describe('folding away the chat’s opening instruction', () => {
 });
 
 describe('the fresh chat the app opened', () => {
+  const RECOVERY_EPISODE = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const RECOVERY_TEXT = `[[CLF-EMERGENCY-RESUME:${RECOVERY_EPISODE}]]\n\nRecover the durable local session.`;
+
+  it('fails and releases a recovery bootstrap when native Send was definitely never attempted', async () => {
+    let clicks = 0;
+    live = await harness(
+      'https://chatgpt.com/?clf=cmd-recovery-not-attempted#clf=cmd-recovery-not-attempted',
+      {
+        redeem: () => ({
+          ok: true,
+          command: { id: 'cmd-recovery-not-attempted', type: 'recovery', text: RECOVERY_TEXT, agent: null }
+        }),
+        ack: () => ({ ok: true }),
+        recovery_send: (message: any) => message.action === 'release'
+          ? ({ ok: true, data: { released: true } })
+          : ({ ok: true, data: { armed: true } })
+      },
+      (document) => {
+        const send = document.querySelector<HTMLButtonElement>('[data-testid="send-button"]')!;
+        send.disabled = true;
+        send.setAttribute('aria-disabled', 'true');
+        send.addEventListener('click', () => { clicks++; });
+      }
+    );
+
+    await settle(500);
+    await new Promise(resolve => setTimeout(resolve, 0)); // fire the native 30s send-readiness deadline in the harness
+    await settle();
+
+    expect(clicks).toBe(0);
+    expect(live.sent.filter((message) => message.type === 'ack')).toEqual([]);
+    expect(live.sent.filter((message) => message.type === 'recovery_send')).toContainEqual(
+      expect.objectContaining({ id: 'cmd-recovery-not-attempted', action: 'release' })
+    );
+    expect(composerText(live.document)).toBe('');
+  });
+
+  it('does not failed-ACK or resend after native Recovery Send was attempted but acceptance stayed ambiguous', async () => {
+    let clicks = 0;
+    const destination = 'abababab-cdcd-4efe-8123-343434343434';
+    live = await harness(
+      'https://chatgpt.com/?clf=cmd-recovery-ambiguous#clf=cmd-recovery-ambiguous',
+      {
+        redeem: () => ({
+          ok: true,
+          command: { id: 'cmd-recovery-ambiguous', type: 'recovery', text: RECOVERY_TEXT, agent: null }
+        }),
+        ack: () => ({ ok: true }),
+        recovery_send: () => ({ ok: true, data: { armed: true } })
+      },
+      (document, dom) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          clicks++;
+          // The click crossed, but neither the exact authored user row nor an ACK became visible.
+          dom.reconfigure({ url: `https://chatgpt.com/c/${destination}` });
+        });
+      }
+    );
+
+    await settle(500);
+    await new Promise(resolve => setTimeout(resolve, 0)); // settle the attempted-but-unacknowledged native send
+    await settle();
+    expect(clicks).toBe(1);
+    expect(live.sent.filter((message) => message.type === 'ack')).toEqual([]);
+
+    // Ordinary observations in the possible replacement stay behind the recovery journal gate;
+    // they cannot mint a shadow local session while marker/ACK reconciliation is unresolved.
+    live.hook.observe();
+    await settle();
+    userTurn(live.document, 'after-ambiguous-recovery', 'ordinary message after ambiguous bootstrap');
+    live.hook.observe();
+    await settle();
+    await live.hook.flush();
+    expect(clicks).toBe(1);
+    expect(emitted(live.sent, 'user_message')).toHaveLength(0);
+  });
+
   it('delivers the bootstrap before unrelated status restoration can stall startup', async () => {
     let releaseStatus: () => void = () => undefined;
     const statusHeld = new Promise((resolve) => {
@@ -14289,6 +14366,143 @@ app-owned prompt`, { sent: false });
       'the new chat’s first question'
     ]);
     expect(messages.filter((entry) => entry.conversationId === CHAT).every((entry) => entry.event.text.startsWith(destinationMarker))).toBe(true);
+  });
+});
+
+describe('reconciling Emergency Resume markers', () => {
+  const EPISODE = '12345678-1234-4abc-8def-123456789abc';
+  const CHAT = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  const marker = `[[CLF-EMERGENCY-RESUME:${EPISODE}]]`;
+  const activityReply = () => ({
+    ok: true,
+    data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null }
+  });
+  const recoveryTurn = (messages = [{
+    messageId: 'recovery-user',
+    rawMessageId: 'recovery-user-raw',
+    role: 'user',
+    stable: true,
+    rawText: `${marker}\n\napp-owned emergency bootstrap`,
+    renderedHtml: ''
+  }]) => ({
+    turnId: 'recovery-opening-turn',
+    endMessageId: null,
+    calls: [],
+    messages
+  });
+
+  it('commits one stable recovery marker before ordinary journaling and never replays the bootstrap', async () => {
+    live = await harness(`https://chatgpt.com/c/${CHAT}`, {
+      activity: activityReply,
+      recovery_reconcile: () => ({ ok: true, data: { committed: true, conversationId: CHAT } })
+    });
+    const section = assistantTurn(live.document, 'recovery-opening-turn', []);
+    await bindFiberTurns([{ section, turn: recoveryTurn() }]);
+    await live.hook.flush();
+
+    const reconcileAt = live.sent.findIndex(message => message.type === 'recovery_reconcile');
+    const eventsAt = live.sent.findIndex(message => message.type === 'events');
+    expect(reconcileAt).toBeGreaterThanOrEqual(0);
+    if (eventsAt >= 0) expect(reconcileAt).toBeLessThan(eventsAt);
+    expect(live.sent.filter(message => message.type === 'recovery_reconcile')).toEqual([
+      expect.objectContaining({
+        conversationId: CHAT,
+        episodeId: EPISODE,
+        messageId: 'recovery-user-raw'
+      })
+    ]);
+    expect(live.sent.filter(message => message.type === 'ack')).toEqual([]);
+
+    await bindFiberTurns([{ section, turn: recoveryTurn() }]);
+    expect(live.sent.filter(message => message.type === 'recovery_reconcile')).toHaveLength(1);
+  });
+
+  it('keeps the recovery journal gate through a temporary app failure and retries the same stable proof later', async () => {
+    let answer: any = { ok: false, status: 503, error: 'app_restarting' };
+    live = await harness(`https://chatgpt.com/c/${CHAT}`, {
+      activity: activityReply,
+      recovery_reconcile: () => answer
+    });
+    const section = assistantTurn(live.document, 'recovery-opening-turn', []);
+    await bindFiberTurns([{ section, turn: recoveryTurn() }]);
+
+    userTurn(live.document, 'queued-behind-recovery', 'ordinary message while recovery is unresolved');
+    live.hook.observe(); await settle(); await live.hook.flush();
+    expect(emitted(live.sent, 'user_message')).toHaveLength(0);
+
+    answer = { ok: true, data: { committed: true, conversationId: CHAT } };
+    await bindFiberTurns([{ section, turn: recoveryTurn() }]);
+    await live.hook.flush();
+    expect(live.sent.filter(message => message.type === 'recovery_reconcile')).toHaveLength(2);
+    expect(emitted(live.sent, 'user_message').map(({ event }) => event.text))
+      .toContain('ordinary message while recovery is unresolved');
+  });
+
+  it('keeps the recovery gate on owner_changed and reconciles after a destination document reload', async () => {
+    let answer: any = {
+      ok: false,
+      status: 409,
+      error: 'recovery_command_owner_changed',
+      data: { disposition: 'retain' }
+    };
+    live = await harness(`https://chatgpt.com/c/${CHAT}`, {
+      activity: activityReply,
+      recovery_reconcile: () => answer
+    });
+    const section = assistantTurn(live.document, 'recovery-opening-turn', []);
+    await bindFiberTurns([{ section, turn: recoveryTurn() }]);
+
+    userTurn(live.document, 'queued-after-owner-change', 'ordinary message must stay behind reloaded recovery');
+    live.hook.observe(); await settle(); await live.hook.flush();
+    expect(emitted(live.sent, 'user_message')).toHaveLength(0);
+    expect(live.sent.filter(message => message.type === 'recovery_reconcile')).toHaveLength(1);
+
+    // A document reload changes the ephemeral client/RUN_ID, not the durable recovery
+    // transaction. The replacement retries the same stable marker and only then opens its gate.
+    answer = { ok: true, data: { committed: true, conversationId: CHAT } };
+    await bindFiberTurns([{ section, turn: recoveryTurn() }]);
+    await live.hook.flush();
+    expect(live.sent.filter(message => message.type === 'recovery_reconcile')).toHaveLength(2);
+    expect(emitted(live.sent, 'user_message').map(({ event }) => event.text))
+      .toContain('ordinary message must stay behind reloaded recovery');
+  });
+
+  it('releases a stale recovery marker gate on a durable 409 refusal', async () => {
+    live = await harness(`https://chatgpt.com/c/${CHAT}`, {
+      activity: activityReply,
+      recovery_reconcile: () => ({ ok: false, status: 409, error: 'recovery_not_current', data: { disposition: 'terminal' } })
+    });
+    const section = assistantTurn(live.document, 'recovery-opening-turn', []);
+    await bindFiberTurns([{ section, turn: recoveryTurn() }]);
+    userTurn(live.document, 'after-stale-recovery', 'ordinary message after stale recovery proof');
+    live.hook.observe(); await settle(); await live.hook.flush();
+
+    expect(live.sent.filter(message => message.type === 'recovery_reconcile')).toHaveLength(1);
+    expect(emitted(live.sent, 'user_message').map(({ event }) => event.text))
+      .toContain('ordinary message after stale recovery proof');
+  });
+
+  it('fails closed when one recovery episode appears in two stable authored messages', async () => {
+    live = await harness(`https://chatgpt.com/c/${CHAT}`, {
+      activity: activityReply,
+      recovery_reconcile: () => ({ ok: true, data: { committed: true, conversationId: CHAT } })
+    });
+    const section = assistantTurn(live.document, 'recovery-opening-turn', []);
+    await bindFiberTurns([{ section, turn: recoveryTurn([
+      {
+        messageId: 'recovery-user-a', rawMessageId: 'recovery-user-a-raw', role: 'user', stable: true,
+        rawText: `${marker}\nfirst copy`, renderedHtml: ''
+      },
+      {
+        messageId: 'recovery-user-b', rawMessageId: 'recovery-user-b-raw', role: 'user', stable: true,
+        rawText: `${marker}\nsecond copy`, renderedHtml: ''
+      }
+    ]) }]);
+    userTurn(live.document, 'after-duplicate-recovery', 'must stay behind ambiguous duplicate recovery');
+    live.hook.observe(); await settle(); await live.hook.flush();
+
+    expect(live.sent.filter(message => message.type === 'recovery_reconcile')).toHaveLength(0);
+    expect(emitted(live.sent, 'user_message')).toHaveLength(0);
   });
 });
 /**
