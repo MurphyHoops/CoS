@@ -242,6 +242,34 @@ export function longRunStatus(sessionId: string): {
   };
 }
 
+export type LongRunMessageAuthority = 'unmanaged' | 'current' | 'stale';
+
+/**
+ * Final delivery fence for app-owned worker revival messages.
+ *
+ * Ordinary agent messages use short random ids. Long-run worker continuations use the full v4
+ * UUID minted as WorkObligation.inputId. Treat an orphaned UUID as stale rather than unmanaged:
+ * if one durable ledger was lost/corrupt while the broker survived, fail closed instead of
+ * turning an old automatic continuation into an ordinary prime message.
+ */
+export function longRunMessageAuthority(
+  inputId: string,
+  conversationId: string
+): LongRunMessageAuthority {
+  const longRunId = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(inputId);
+  if (!longRunId) return 'unmanaged';
+  const work = [...obligations.values()].find((row) => row.inputId === inputId);
+  if (!work) return 'stale';
+  const epoch = epochs.get(work.sessionId);
+  return work.conversationId === conversationId &&
+    (work.state === 'dispatching' || work.state === 'queued') &&
+    !!epoch &&
+    epoch.conversationId === conversationId &&
+    epoch.generation === work.epochGeneration
+    ? 'current'
+    : 'stale';
+}
+
 export async function armLongRunWaitNow(input: ArmLongRunWaitInput): Promise<LongRunWaitContract> {
   return serial(async () => {
     if (!validSessionId(input.sessionId) || !validConversationId(input.conversationId)) {
