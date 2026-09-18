@@ -7896,7 +7896,21 @@ describe('unattributed activity recovery', () => {
       expect(await maintenance(reload!.token, 'reloaded')).toBeNull();
       expect((await sessionControlsFor(sessionId)).selfHealingStatus).toBe('Reloading');
 
-      await vi.advanceTimersByTimeAsync(SELF_HEAL_POST_RELOAD_MS);
+      // A reload can make the same server-side open turn visible again. That is probation
+      // evidence, not proof that the task recovered: it must not refund the one-reload budget or
+      // move the durable episode back to healthy.
+      await vi.advanceTimersByTimeAsync(1_000);
+      await events(PRIME, [{
+        kind: 'assistant_message',
+        time: Date.now(),
+        turnId: 'prime-self-heal-silent',
+        messageId: 'same-open-turn-after-reload',
+        text: 'The same provider turn is visible again but has not finished.',
+        state: 'streaming'
+      }]);
+      expect((await getSession(sessionId))?.recovery?.phase).toBe('soft_recovery');
+
+      await vi.advanceTimersByTimeAsync(SELF_HEAL_POST_RELOAD_MS - 1_000);
       await sweepStaleSwarm(Date.now());
       const recovery = pendingCommands().find((entry) => entry.what === `recovery:${sessionId}`);
       expect(recovery).toBeTruthy();
