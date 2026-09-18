@@ -72,6 +72,35 @@ describe('durable long-run authority', () => {
     expect(longRunStatus(SESSION).work?.state).toBe('queued');
   });
 
+  it('treats an ambiguous repeat arm as idempotent and refuses a different concurrent wait', async () => {
+    const first = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-source',
+      kind: 'github_run',
+      repository: 'MurphyHoops/UEOT',
+      runId: 35352566122
+    });
+    const generation = executionEpochFor(SESSION)!.generation;
+    const repeat = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-source',
+      kind: 'github_run',
+      repository: 'MurphyHoops/UEOT',
+      runId: 35352566122
+    });
+    expect(repeat.id).toBe(first.id);
+    expect(executionEpochFor(SESSION)?.generation).toBe(generation);
+    await expect(armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-source',
+      kind: 'timer',
+      dueAt: Date.now() + 5_000
+    })).rejects.toThrow('long_run_wait_already_active');
+  });
+
   it('moves work and wait with A to B and fences the stale A epoch', async () => {
     const wait = await armLongRunWaitNow({
       sessionId: SESSION,
