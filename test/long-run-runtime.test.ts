@@ -151,6 +151,22 @@ describe('local long-run supervisor', () => {
     });
   });
 
+  it('does not dispatch autonomous work while recovery_failed may still hold ambiguous-send fences', async () => {
+    mocks.goalSwitchFor.mockReturnValue({ enabled: true, mode: 'goal', own: true, afterTurn: false });
+    mocks.getSession.mockResolvedValue({
+      id: SESSION,
+      conversationId: CHAT,
+      recovery: { phase: 'recovery_failed' },
+      origin: { kind: 'desktop' }
+    });
+    const work = await ensureRecoveryWorkNow(SESSION, CHAT, 'recovery:episode:failed');
+
+    await pollLongRunRuntime(work!.createdAt + 90_001);
+
+    expect(mocks.enqueueInput).not.toHaveBeenCalled();
+    expect(longRunStatus(SESSION).work).toMatchObject({ id: work!.id, state: 'owed' });
+  });
+
   it('keeps recovery debt dormant when neither Goal nor an agent owns autonomy', async () => {
     const work = await ensureRecoveryWorkNow(SESSION, CHAT, 'recovery:episode:2');
 
