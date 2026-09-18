@@ -302,7 +302,8 @@ export function longRunWaitBlocksTools(
   if (wait!.state === 'waiting' && work!.state === 'waiting') return true;
   if (
     (work!.reason !== 'wait_resolved' && work!.reason !== 'wait_failed') ||
-    (work!.state !== 'owed' && work!.state !== 'dispatching' && work!.state !== 'queued')
+    (work!.state !== 'owed' && work!.state !== 'dispatching' &&
+      work!.state !== 'queued' && work!.state !== 'fulfilled')
   ) return false;
   // New waits pin both the exact ChatGPT workflow id and the durable provider turn. Either
   // witness is sufficient to prove that the old executor still owns this call: request identity
