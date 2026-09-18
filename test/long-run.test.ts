@@ -13,6 +13,7 @@ import {
   executionEpochFor,
   executionTicketCurrent,
   leaseLongRunWorkNow,
+  longRunSourceRequestFenced,
   longRunStatus,
   longRunWaitBlocksTools,
   markLongRunWorkQueuedNow,
@@ -60,6 +61,36 @@ describe('durable long-run authority', () => {
     expect(await cancelLongRunNow(SESSION, CHAT_A, 'test_cancel')).toBe(true);
     expect(anyLongRunWaitActive()).toBe(false);
     expect(longRunWaitBlocksTools(SESSION, CHAT_A)).toBe(false);
+  });
+
+  it('keeps the exact source request fenced without depending on correlation recovery', async () => {
+    const sourceRequestId = 'wfr-durable-source-request';
+    const wait = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-durable-source',
+      sourceRequestId,
+      kind: 'timer',
+      dueAt: Date.now() + 1_000
+    });
+    expect(longRunSourceRequestFenced(sourceRequestId)).toBe(true);
+    expect(longRunSourceRequestFenced('wfr-unrelated-request')).toBe(false);
+
+    const ticket = captureExecutionTicket(SESSION, CHAT_A)!;
+    expect(await resolveLongRunWaitNow(SESSION, wait.id, ticket, 'timer resolved')).toBe(true);
+    expect(longRunSourceRequestFenced(sourceRequestId)).toBe(true);
+
+    expect(await noteLongRunProgressNow(
+      SESSION,
+      CHAT_A,
+      Date.now() + 2_000,
+      'turn-continuation',
+      'mcp',
+      'wfr-new-continuation'
+    )).toBe(true);
+    // Fulfilment retires the source executor permanently; only explicit pre-takeover cancel can
+    // release this exact workflow id.
+    expect(longRunSourceRequestFenced(sourceRequestId)).toBe(true);
   });
 
   it('uses the exact source request id after resolution even when recorder turn state is already closed', async () => {
