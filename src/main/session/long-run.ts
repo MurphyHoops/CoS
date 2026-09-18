@@ -1,0 +1,808 @@
+/**
+ * Durable long-run execution control.
+ *
+ * ChatGPT conversations are disposable executors.  This ledger is the small piece of state that
+ * says what the durable session still owes, which provider conversation currently holds that
+ * authority, and which generation every delayed side effect was admitted under.
+ *
+ * It deliberately does not inspect DOM/provider liveness.  Observations may supply evidence, but
+ * only transitions in this file grant or revoke long-run execution authority.
+ */
+
+import { randomUUID } from 'node:crypto';
+import { writeDurableNow, writeDurableSoon } from '../durable.js';
+
+export const LONG_RUN_STATE = 'long-run';
+
+export type LongRunWorkReason =
+  | 'recovery_resume'
+  | 'wait_resolved'
+  | 'wait_failed';
+
+export type LongRunWorkState =
+  | 'waiting'
+  | 'owed'
+  | 'dispatching'
+  | 'queued'
+  | 'fulfilled'
+  | 'cancelled';
+
+export interface ExecutionEpoch {
+  sessionId: string;
+  conversationId: string;
+  generation: number;
+  updatedAt: number;
+}
+
+export interface ExecutionTicket {
+  sessionId: string;
+  conversationId: string;
+  generation: number;
+}
+
+export interface WorkObligation {
+  id: string;
+  sessionId: string;
+  conversationId: string;
+  epochGeneration: number;
+  reason: LongRunWorkReason;
+  state: LongRunWorkState;
+  sourceTurnId: string | null;
+  /** Exact ChatGPT MCP workflow id for the source provider turn. New wait admissions always set it. */
+  sourceRequestId?: string | null;
+  source: string | null;
+  inputId: string | null;
+  result: string | null;
+  createdAt: number;
+  updatedAt: number;
+  issuedAt: number | null;
+}
+
+export type LongRunWaitKind = 'github_run' | 'process' | 'timer';
+export type LongRunWaitState = 'waiting' | 'resolved' | 'failed' | 'cancelled';
+
+export interface LongRunWaitContract {
+  id: string;
+  sessionId: string;
+  conversationId: string;
+  epochGeneration: number;
+  obligationId: string;
+  kind: LongRunWaitKind;
+  repository: string | null;
+  runId: number | null;
+  processId: number | null;
+  dueAt: number | null;
+  description: string | null;
+  state: LongRunWaitState;
+  attempts: number;
+  nextCheckAt: number;
+  lastError: string | null;
+  result: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface LongRunSnapshot {
+  version: 1;
+  savedAt: number;
+  epochs: ExecutionEpoch[];
+  obligations: WorkObligation[];
+  waits: LongRunWaitContract[];
+}
+
+export interface ArmLongRunWaitInput {
+  sessionId: string;
+  conversationId: string;
+  sourceTurnId: string;
+  sourceRequestId?: string | null;
+  kind: LongRunWaitKind;
+  repository?: string | null;
+  runId?: number | null;
+  processId?: number | null;
+  dueAt?: number | null;
+  description?: string | null;
+}
+
+const epochs = new Map<string, ExecutionEpoch>();
+const obligations = new Map<string, WorkObligation>();
+const waits = new Map<string, LongRunWaitContract>();
+let chain: Promise<unknown> = Promise.resolve();
+
+function serial<T>(work: () => Promise<T>): Promise<T> {
+  const next = chain.then(work, work);
+  chain = next.then(() => undefined, () => undefined);
+  return next;
+}
+
+function validSessionId(value: unknown): value is string {
+  return typeof value === 'string' && /^[\w-]{8,64}$/.test(value);
+}
+
+function validConversationId(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-z-]{8,256}$/i.test(value);
+}
+
+function validGeneration(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) > 0;
+}
+
+function clip(value: string | null | undefined, max = 500): string | null {
+  if (!value) return null;
+  return value.slice(0, max);
+}
+
+function cloneEpoch(row: ExecutionEpoch): ExecutionEpoch { return { ...row }; }
+function cloneWork(row: WorkObligation): WorkObligation { return { ...row }; }
+function cloneWait(row: LongRunWaitContract): LongRunWaitContract { return { ...row }; }
+
+export function snapshotLongRunState(): LongRunSnapshot {
+  return {
+    version: 1,
+    savedAt: Date.now(),
+    epochs: [...epochs.values()].map(cloneEpoch),
+    obligations: [...obligations.values()].map(cloneWork),
+    waits: [...waits.values()].map(cloneWait)
+  };
+}
+
+function persistSoon(): void {
+  writeDurableSoon(LONG_RUN_STATE, snapshotLongRunState());
+}
+
+export function restoreLongRunState(snapshot: LongRunSnapshot | null): void {
+  epochs.clear();
+  obligations.clear();
+  waits.clear();
+  if (!snapshot || snapshot.version !== 1) return;
+
+  for (const raw of Array.isArray(snapshot.epochs) ? snapshot.epochs : []) {
+    if (!validSessionId(raw?.sessionId) || !validConversationId(raw?.conversationId) ||
+        !validGeneration(raw?.generation) || !Number.isSafeInteger(raw?.updatedAt) || raw.updatedAt <= 0) continue;
+    const current = epochs.get(raw.sessionId);
+    if (!current || raw.generation > current.generation ||
+        (raw.generation === current.generation && raw.updatedAt > current.updatedAt)) {
+      epochs.set(raw.sessionId, cloneEpoch(raw));
+    }
+  }
+
+  for (const raw of Array.isArray(snapshot.obligations) ? snapshot.obligations : []) {
+    if (!raw || !validSessionId(raw.sessionId) || !validConversationId(raw.conversationId) ||
+        !validGeneration(raw.epochGeneration) || typeof raw.id !== 'string' || !raw.id ||
+        !['recovery_resume', 'wait_resolved', 'wait_failed'].includes(raw.reason) ||
+        !['waiting', 'owed', 'dispatching', 'queued', 'fulfilled', 'cancelled'].includes(raw.state) ||
+        !Number.isSafeInteger(raw.createdAt) || raw.createdAt <= 0 ||
+        !Number.isSafeInteger(raw.updatedAt) || raw.updatedAt <= 0) continue;
+    const epoch = epochs.get(raw.sessionId);
+    if (!epoch || epoch.conversationId !== raw.conversationId || epoch.generation !== raw.epochGeneration) continue;
+    const current = obligations.get(raw.sessionId);
+    const normalized = cloneWork({
+      ...raw,
+      sourceRequestId: typeof raw.sourceRequestId === 'string' && raw.sourceRequestId.length > 0
+        ? raw.sourceRequestId.slice(0, 200)
+        : null
+    });
+    if (!current || raw.updatedAt > current.updatedAt) obligations.set(raw.sessionId, normalized);
+  }
+
+  for (const raw of Array.isArray(snapshot.waits) ? snapshot.waits : []) {
+    if (!raw || !validSessionId(raw.sessionId) || !validConversationId(raw.conversationId) ||
+        !validGeneration(raw.epochGeneration) || typeof raw.id !== 'string' || !raw.id ||
+        !['github_run', 'process', 'timer'].includes(raw.kind) ||
+        !['waiting', 'resolved', 'failed', 'cancelled'].includes(raw.state) ||
+        typeof raw.obligationId !== 'string' || !raw.obligationId ||
+        !Number.isSafeInteger(raw.createdAt) || raw.createdAt <= 0 ||
+        !Number.isSafeInteger(raw.updatedAt) || raw.updatedAt <= 0 ||
+        !Number.isSafeInteger(raw.nextCheckAt) || raw.nextCheckAt < 0) continue;
+    const epoch = epochs.get(raw.sessionId);
+    if (!epoch || epoch.conversationId !== raw.conversationId || epoch.generation !== raw.epochGeneration) continue;
+    const current = waits.get(raw.sessionId);
+    if (!current || raw.updatedAt > current.updatedAt) waits.set(raw.sessionId, cloneWait(raw));
+  }
+}
+
+function epochForWrite(sessionId: string, conversationId: string, bump: boolean): ExecutionEpoch {
+  const current = epochs.get(sessionId);
+  if (current && current.conversationId !== conversationId) {
+    throw new Error('long_run_executor_mismatch');
+  }
+  const now = Date.now();
+  const next: ExecutionEpoch = current
+    ? { ...current, generation: bump ? current.generation + 1 : current.generation, updatedAt: now }
+    : { sessionId, conversationId, generation: 1, updatedAt: now };
+  epochs.set(sessionId, next);
+  return next;
+}
+
+export function executionEpochFor(sessionId: string): ExecutionEpoch | null {
+  const row = epochs.get(sessionId);
+  return row ? cloneEpoch(row) : null;
+}
+
+export function captureExecutionTicket(sessionId: string, conversationId: string): ExecutionTicket | null {
+  const row = epochs.get(sessionId);
+  if (!row || row.conversationId !== conversationId) return null;
+  return { sessionId, conversationId, generation: row.generation };
+}
+
+export function executionTicketCurrent(ticket: ExecutionTicket): boolean {
+  const row = epochs.get(ticket.sessionId);
+  return !!row && row.conversationId === ticket.conversationId && row.generation === ticket.generation;
+}
+
+export function longRunWorkFor(sessionId: string): WorkObligation | null {
+  const row = obligations.get(sessionId);
+  return row ? cloneWork(row) : null;
+}
+
+export function longRunWaitFor(sessionId: string): LongRunWaitContract | null {
+  const row = waits.get(sessionId);
+  return row ? cloneWait(row) : null;
+}
+
+/**
+ * Exact stale-workflow fence that does not depend on browser/request-correlation recovery.
+ *
+ * session_wait durably captured this request id while its caller identity was proven. If a crash
+ * loses the separately-debounced correlation index, the same server-side workflow may still call
+ * the connector after restart. Matching the durable source id is sufficient to reject that old
+ * executor; a different request id is never classified by this helper.
+ */
+export function longRunSourceRequestFenced(requestId: string | null | undefined): boolean {
+  if (!requestId) return false;
+  for (const work of obligations.values()) {
+    if (work.sourceRequestId !== requestId) continue;
+    if (work.reason !== 'wait_resolved' && work.reason !== 'wait_failed') continue;
+    if (work.state !== 'cancelled') return true;
+  }
+  return false;
+}
+
+export function longRunStatus(sessionId: string): {
+  epoch: ExecutionEpoch | null;
+  work: WorkObligation | null;
+  wait: LongRunWaitContract | null;
+} {
+  return {
+    epoch: executionEpochFor(sessionId),
+    work: longRunWorkFor(sessionId),
+    wait: longRunWaitFor(sessionId)
+  };
+}
+
+/** Whether any durable wait/debt can still fence its original provider turn. */
+export function anyLongRunWaitActive(): boolean {
+  for (const work of obligations.values()) {
+    const epoch = epochs.get(work.sessionId);
+    const wait = waits.get(work.sessionId);
+    if (!epoch || !wait ||
+        epoch.conversationId !== work.conversationId ||
+        wait.conversationId !== work.conversationId ||
+        wait.obligationId !== work.id ||
+        wait.epochGeneration !== epoch.generation ||
+        work.epochGeneration !== epoch.generation) continue;
+    if (wait.state === 'waiting' && work.state === 'waiting') return true;
+    if (
+      (work.reason === 'wait_resolved' || work.reason === 'wait_failed') &&
+      !!work.sourceTurnId &&
+      (work.state === 'owed' || work.state === 'dispatching' || work.state === 'queued')
+    ) return true;
+  }
+  return false;
+}
+
+/**
+ * Hard provider-turn boundary for a WaitContract.
+ *
+ * Waiting always fences ordinary tools. Resolution does not hand authority back to the old source
+ * turn: the continuation may already be queued while that provider turn is still winding down.
+ * Once the durable recorder proves a different active turn, that new executor may consume the
+ * continuation normally.
+ */
+export function longRunWaitBlocksTools(
+  sessionId: string,
+  conversationId: string,
+  activeTurnId: string | null = null,
+  requestId: string | null = null
+): boolean {
+  const epoch = epochs.get(sessionId);
+  const work = obligations.get(sessionId);
+  const wait = waits.get(sessionId);
+  const exact = !!epoch &&
+    !!work &&
+    !!wait &&
+    epoch.conversationId === conversationId &&
+    work.conversationId === conversationId &&
+    wait.conversationId === conversationId &&
+    wait.obligationId === work.id &&
+    wait.epochGeneration === epoch.generation &&
+    work.epochGeneration === epoch.generation;
+  if (!exact) return false;
+  if (wait!.state === 'waiting' && work!.state === 'waiting') return true;
+  if (
+    (work!.reason !== 'wait_resolved' && work!.reason !== 'wait_failed') ||
+    (work!.state !== 'owed' && work!.state !== 'dispatching' &&
+      work!.state !== 'queued' && work!.state !== 'fulfilled')
+  ) return false;
+  // New waits pin the exact ChatGPT MCP workflow id. The correlation contract guarantees
+  // every connector call in one provider turn carries that same request id, while activeTurnId is
+  // a browser/recorder projection that may lag the first call of the replacement turn. Therefore a
+  // different proven request id is sufficient to admit the continuation immediately. Only legacy
+  // snapshots that predate sourceRequestId fall back to activeTurnId.
+  if (work!.sourceRequestId) return !requestId || requestId === work!.sourceRequestId;
+  return !!work!.sourceTurnId && activeTurnId === work!.sourceTurnId;
+}
+
+export type LongRunMessageAuthority = 'unmanaged' | 'current' | 'stale';
+
+/**
+ * Final delivery fence for app-owned worker revival messages.
+ *
+ * Ordinary agent messages use short random ids. Long-run worker continuations use the full v4
+ * UUID minted as WorkObligation.inputId. Treat an orphaned UUID as stale rather than unmanaged:
+ * if one durable ledger was lost/corrupt while the broker survived, fail closed instead of
+ * turning an old automatic continuation into an ordinary prime message.
+ */
+export function longRunMessageAuthority(
+  inputId: string,
+  conversationId: string
+): LongRunMessageAuthority {
+  const longRunId = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(inputId);
+  if (!longRunId) return 'unmanaged';
+  const work = [...obligations.values()].find((row) => row.inputId === inputId);
+  if (!work) return 'stale';
+  const epoch = epochs.get(work.sessionId);
+  return work.conversationId === conversationId &&
+    (work.state === 'dispatching' || work.state === 'queued') &&
+    !!epoch &&
+    epoch.conversationId === conversationId &&
+    epoch.generation === work.epochGeneration
+    ? 'current'
+    : 'stale';
+}
+
+export async function armLongRunWaitNow(input: ArmLongRunWaitInput): Promise<LongRunWaitContract> {
+  return serial(async () => {
+    if (!validSessionId(input.sessionId) || !validConversationId(input.conversationId)) {
+      throw new Error('long_run_identity_invalid');
+    }
+    if (typeof input.sourceTurnId !== 'string' || input.sourceTurnId.length === 0 || input.sourceTurnId.length > 256) {
+      throw new Error('long_run_source_turn_invalid');
+    }
+    if (input.sourceRequestId !== undefined && input.sourceRequestId !== null &&
+        (typeof input.sourceRequestId !== 'string' || input.sourceRequestId.length === 0 || input.sourceRequestId.length > 200)) {
+      throw new Error('long_run_source_request_invalid');
+    }
+    if (input.kind === 'github_run') {
+      if (!input.repository || !/^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(input.repository) ||
+          typeof input.runId !== 'number' || !Number.isSafeInteger(input.runId) || input.runId <= 0) {
+        throw new Error('long_run_github_wait_invalid');
+      }
+    } else if (input.kind === 'process') {
+      if (typeof input.processId !== 'number' || !Number.isSafeInteger(input.processId) || input.processId <= 0) {
+        throw new Error('long_run_process_wait_invalid');
+      }
+    } else if (input.kind === 'timer') {
+      if (typeof input.dueAt !== 'number' || !Number.isSafeInteger(input.dueAt) || input.dueAt <= Date.now()) {
+        throw new Error('long_run_timer_wait_invalid');
+      }
+    }
+
+    const beforeEpoch = epochs.get(input.sessionId);
+    const beforeWork = obligations.get(input.sessionId);
+    const beforeWait = waits.get(input.sessionId);
+    if (beforeWait?.state === 'waiting') {
+      // A lost tool response may cause the model to repeat the exact session_wait call. The source
+      // turn and external target are the semantic identity. Timer retries intentionally ignore a
+      // freshly recomputed dueAt, otherwise one transport retry silently extends the deadline.
+      const sameTarget =
+        beforeWait.conversationId === input.conversationId &&
+        beforeWait.kind === input.kind &&
+        beforeWork?.state === 'waiting' &&
+        beforeWait.obligationId === beforeWork.id &&
+        beforeWork.sourceTurnId === input.sourceTurnId &&
+        (input.sourceRequestId == null || beforeWork.sourceRequestId === input.sourceRequestId) &&
+        (input.kind !== 'github_run' ||
+          (beforeWait.repository === input.repository && beforeWait.runId === input.runId)) &&
+        (input.kind !== 'process' || beforeWait.processId === input.processId);
+      if (sameTarget) return cloneWait(beforeWait);
+      throw new Error('long_run_wait_already_active');
+    }
+    const epoch = epochForWrite(input.sessionId, input.conversationId, true);
+    const now = Date.now();
+    const obligation: WorkObligation = {
+      id: randomUUID(),
+      sessionId: input.sessionId,
+      conversationId: input.conversationId,
+      epochGeneration: epoch.generation,
+      reason: 'wait_resolved',
+      state: 'waiting',
+      sourceTurnId: input.sourceTurnId,
+      sourceRequestId: input.sourceRequestId ?? null,
+      source: input.kind === 'github_run' ? `github:${input.repository}:${input.runId}`
+        : input.kind === 'process' ? `process:${input.processId}`
+          : `timer:${input.dueAt}`,
+      inputId: null,
+      result: null,
+      createdAt: now,
+      updatedAt: now,
+      issuedAt: null
+    };
+    const wait: LongRunWaitContract = {
+      id: randomUUID(),
+      sessionId: input.sessionId,
+      conversationId: input.conversationId,
+      epochGeneration: epoch.generation,
+      obligationId: obligation.id,
+      kind: input.kind,
+      repository: input.kind === 'github_run' ? input.repository! : null,
+      runId: input.kind === 'github_run' ? input.runId! : null,
+      processId: input.kind === 'process' ? input.processId! : null,
+      dueAt: input.kind === 'timer' ? input.dueAt! : null,
+      description: clip(input.description, 300),
+      state: 'waiting',
+      attempts: 0,
+      nextCheckAt: now,
+      lastError: null,
+      result: null,
+      createdAt: now,
+      updatedAt: now
+    };
+    obligations.set(input.sessionId, obligation);
+    waits.set(input.sessionId, wait);
+    try {
+      await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState());
+    } catch (error) {
+      if (beforeEpoch) epochs.set(input.sessionId, beforeEpoch); else epochs.delete(input.sessionId);
+      if (beforeWork) obligations.set(input.sessionId, beforeWork); else obligations.delete(input.sessionId);
+      if (beforeWait) waits.set(input.sessionId, beforeWait); else waits.delete(input.sessionId);
+      persistSoon();
+      throw error;
+    }
+    return cloneWait(wait);
+  });
+}
+
+export async function deferLongRunWaitNow(
+  sessionId: string,
+  waitId: string,
+  ticket: ExecutionTicket,
+  nextCheckAt: number,
+  error: string | null
+): Promise<boolean> {
+  return serial(async () => {
+    const wait = waits.get(sessionId);
+    if (!wait || wait.id !== waitId || wait.state !== 'waiting' || !executionTicketCurrent(ticket) ||
+        wait.epochGeneration !== ticket.generation) return false;
+    const before = cloneWait(wait);
+    const next = {
+      ...wait,
+      // attempts is the consecutive monitor-failure budget. A successful observation that merely
+      // says "still pending" resets that budget; otherwise a long healthy CI run would make one
+      // later transient gh/process error look like the sixth failure.
+      attempts: error ? wait.attempts + 1 : 0,
+      nextCheckAt: Math.max(Date.now(), nextCheckAt),
+      lastError: clip(error, 500),
+      updatedAt: Date.now()
+    };
+    waits.set(sessionId, next);
+    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    catch (err) { waits.set(sessionId, before); persistSoon(); throw err; }
+    return true;
+  });
+}
+
+export async function resolveLongRunWaitNow(
+  sessionId: string,
+  waitId: string,
+  ticket: ExecutionTicket,
+  result: string,
+  failed = false
+): Promise<boolean> {
+  return serial(async () => {
+    const wait = waits.get(sessionId);
+    const work = obligations.get(sessionId);
+    if (!wait || !work || wait.id !== waitId || wait.obligationId !== work.id ||
+        wait.state !== 'waiting' || work.state !== 'waiting' || !executionTicketCurrent(ticket) ||
+        wait.epochGeneration !== ticket.generation || work.epochGeneration !== ticket.generation) return false;
+    const beforeWait = cloneWait(wait);
+    const beforeWork = cloneWork(work);
+    const now = Date.now();
+    waits.set(sessionId, {
+      ...wait,
+      state: failed ? 'failed' : 'resolved',
+      result: clip(result, 2_000),
+      lastError: failed ? clip(result, 500) : null,
+      updatedAt: now
+    });
+    obligations.set(sessionId, {
+      ...work,
+      reason: failed ? 'wait_failed' : 'wait_resolved',
+      state: 'owed',
+      result: clip(result, 2_000),
+      updatedAt: now
+    });
+    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    catch (err) {
+      waits.set(sessionId, beforeWait);
+      obligations.set(sessionId, beforeWork);
+      persistSoon();
+      throw err;
+    }
+    return true;
+  });
+}
+
+export async function cancelLongRunNow(
+  sessionId: string,
+  conversationId: string,
+  reason = 'cancelled'
+): Promise<boolean> {
+  return serial(async () => {
+    const epoch = epochs.get(sessionId);
+    const heldWork = obligations.get(sessionId);
+    const heldWait = waits.get(sessionId);
+    if (!epoch && !heldWork && !heldWait) return true;
+    if (epoch && epoch.conversationId !== conversationId) return false;
+    // Cancellation is also retry-safe: an ACK loss must not manufacture a fresh execution
+    // generation after authority was already revoked.
+    if ((heldWork?.state === 'cancelled' || !heldWork) &&
+        (heldWait?.state === 'cancelled' || !heldWait)) return true;
+    const beforeEpoch = epoch ? cloneEpoch(epoch) : null;
+    const beforeWork = heldWork ? cloneWork(heldWork) : null;
+    const beforeWait = heldWait ? cloneWait(heldWait) : null;
+    const nextEpoch = epochForWrite(sessionId, conversationId, true);
+    const now = Date.now();
+    const work = obligations.get(sessionId);
+    const wait = waits.get(sessionId);
+    if (work) obligations.set(sessionId, { ...work, epochGeneration: nextEpoch.generation, state: 'cancelled',
+      result: clip(reason, 500), updatedAt: now });
+    if (wait) waits.set(sessionId, { ...wait, epochGeneration: nextEpoch.generation, state: 'cancelled',
+      result: clip(reason, 500), updatedAt: now });
+    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    catch (err) {
+      if (beforeEpoch) epochs.set(sessionId, beforeEpoch); else epochs.delete(sessionId);
+      if (beforeWork) obligations.set(sessionId, beforeWork); else obligations.delete(sessionId);
+      if (beforeWait) waits.set(sessionId, beforeWait); else waits.delete(sessionId);
+      persistSoon();
+      throw err;
+    }
+    return true;
+  });
+}
+
+export async function ensureRecoveryWorkNow(
+  sessionId: string,
+  conversationId: string,
+  source: string,
+  sourceTurnId: string | null = null
+): Promise<WorkObligation | null> {
+  return serial(async () => {
+    if (!validSessionId(sessionId) || !validConversationId(conversationId)) return null;
+    const activeWait = waits.get(sessionId);
+    if (activeWait?.state === 'waiting') return obligations.get(sessionId) ? cloneWork(obligations.get(sessionId)!) : null;
+
+    const beforeEpoch = epochs.get(sessionId);
+    const beforeWork = obligations.get(sessionId);
+    const epoch = epochForWrite(sessionId, conversationId, false);
+    const existing = obligations.get(sessionId);
+    if (existing && existing.epochGeneration === epoch.generation &&
+        existing.state !== 'cancelled' && existing.state !== 'fulfilled') {
+      // A resolved/failed external wait is already the concrete continuation this durable task
+      // owes. Recovery must not replace its CI/process/timer result with a generic "continue"
+      // message. Likewise, once any recovery continuation owns a stable outbox id, replacing it
+      // would create a second delivery identity after an ambiguous enqueue/send boundary.
+      if (existing.reason !== 'recovery_resume' ||
+          existing.state === 'dispatching' || existing.state === 'queued' ||
+          existing.source === source) {
+        return cloneWork(existing);
+      }
+      // An older recovery episode that never reached dispatch may be refreshed below so the new
+      // executor receives a fresh probation clock and source identity.
+    }
+
+    const now = Date.now();
+    const next: WorkObligation = {
+      id: randomUUID(),
+      sessionId,
+      conversationId,
+      epochGeneration: epoch.generation,
+      reason: 'recovery_resume',
+      state: 'owed',
+      sourceTurnId,
+      sourceRequestId: null,
+      source: clip(source, 300),
+      inputId: null,
+      result: null,
+      createdAt: now,
+      updatedAt: now,
+      issuedAt: null
+    };
+    obligations.set(sessionId, next);
+    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    catch (err) {
+      if (beforeEpoch) epochs.set(sessionId, beforeEpoch); else epochs.delete(sessionId);
+      if (beforeWork) obligations.set(sessionId, beforeWork); else obligations.delete(sessionId);
+      persistSoon();
+      throw err;
+    }
+    return cloneWork(next);
+  });
+}
+
+export async function moveLongRunStateNow(
+  sessionId: string,
+  fromConversationId: string,
+  toConversationId: string
+): Promise<boolean> {
+  return serial(async () => {
+    const current = epochs.get(sessionId);
+    if (!current) return true;
+    if (current.conversationId === toConversationId) {
+      // This API is a durability barrier, not merely an in-memory move. A previous attempt may
+      // have published B in memory after its fsync failed; an idempotent retry must therefore
+      // write the current snapshot now rather than treating "already B" as proof of durability.
+      await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState());
+      return true;
+    }
+    if (current.conversationId !== fromConversationId) return false;
+
+    const beforeEpoch = cloneEpoch(current);
+    const beforeWork = obligations.get(sessionId) ? cloneWork(obligations.get(sessionId)!) : null;
+    const beforeWait = waits.get(sessionId) ? cloneWait(waits.get(sessionId)!) : null;
+    const now = Date.now();
+    const generation = current.generation + 1;
+    epochs.set(sessionId, { sessionId, conversationId: toConversationId, generation, updatedAt: now });
+    const work = obligations.get(sessionId);
+    const wait = waits.get(sessionId);
+    if (work && work.state !== 'fulfilled' && work.state !== 'cancelled') {
+      obligations.set(sessionId, { ...work, conversationId: toConversationId, epochGeneration: generation, updatedAt: now });
+    }
+    if (wait && wait.state === 'waiting') {
+      waits.set(sessionId, { ...wait, conversationId: toConversationId, epochGeneration: generation, updatedAt: now });
+    }
+    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    catch (err) {
+      epochs.set(sessionId, beforeEpoch);
+      if (beforeWork) obligations.set(sessionId, beforeWork); else obligations.delete(sessionId);
+      if (beforeWait) waits.set(sessionId, beforeWait); else waits.delete(sessionId);
+      persistSoon();
+      throw err;
+    }
+    return true;
+  });
+}
+
+/** Non-blocking projection for Compact & Resume; Emergency Resume uses the fsynced variant above. */
+export function moveLongRunState(
+  sessionId: string,
+  fromConversationId: string,
+  toConversationId: string
+): boolean {
+  const current = epochs.get(sessionId);
+  if (!current) return true;
+  if (current.conversationId === toConversationId) return true;
+  if (current.conversationId !== fromConversationId) return false;
+  const generation = current.generation + 1;
+  const now = Date.now();
+  epochs.set(sessionId, { sessionId, conversationId: toConversationId, generation, updatedAt: now });
+  const work = obligations.get(sessionId);
+  const wait = waits.get(sessionId);
+  if (work && work.state !== 'fulfilled' && work.state !== 'cancelled') {
+    obligations.set(sessionId, { ...work, conversationId: toConversationId, epochGeneration: generation, updatedAt: now });
+  }
+  if (wait && wait.state === 'waiting') {
+    waits.set(sessionId, { ...wait, conversationId: toConversationId, epochGeneration: generation, updatedAt: now });
+  }
+  persistSoon();
+  return true;
+}
+
+export function dueLongRunWaits(now = Date.now()): LongRunWaitContract[] {
+  return [...waits.values()]
+    .filter((row) => row.state === 'waiting' && row.nextCheckAt <= now)
+    .map(cloneWait);
+}
+
+export function dispatchableLongRunWork(): WorkObligation[] {
+  return [...obligations.values()]
+    .filter((row) => row.state === 'owed' || row.state === 'dispatching')
+    .map(cloneWork);
+}
+
+export async function leaseLongRunWorkNow(
+  sessionId: string,
+  conversationId: string
+): Promise<{ work: WorkObligation; ticket: ExecutionTicket } | null> {
+  return serial(async () => {
+    const epoch = epochs.get(sessionId);
+    const work = obligations.get(sessionId);
+    if (!epoch || !work || epoch.conversationId !== conversationId ||
+        work.conversationId !== conversationId || work.epochGeneration !== epoch.generation ||
+        (work.state !== 'owed' && work.state !== 'dispatching')) return null;
+
+    if (work.state === 'dispatching' && work.inputId) {
+      return { work: cloneWork(work), ticket: { sessionId, conversationId, generation: epoch.generation } };
+    }
+
+    const before = cloneWork(work);
+    const next: WorkObligation = {
+      ...work,
+      state: 'dispatching',
+      inputId: work.inputId ?? randomUUID(),
+      issuedAt: work.issuedAt ?? Date.now(),
+      updatedAt: Date.now()
+    };
+    obligations.set(sessionId, next);
+    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    catch (err) { obligations.set(sessionId, before); persistSoon(); throw err; }
+    return {
+      work: cloneWork(next),
+      ticket: { sessionId, conversationId, generation: epoch.generation }
+    };
+  });
+}
+
+export async function markLongRunWorkQueuedNow(
+  sessionId: string,
+  obligationId: string,
+  ticket: ExecutionTicket,
+  inputId: string
+): Promise<boolean> {
+  return serial(async () => {
+    const work = obligations.get(sessionId);
+    if (!work || work.id !== obligationId || work.state !== 'dispatching' ||
+        work.inputId !== inputId || !executionTicketCurrent(ticket) ||
+        work.epochGeneration !== ticket.generation) return false;
+    const before = cloneWork(work);
+    obligations.set(sessionId, { ...work, state: 'queued', updatedAt: Date.now() });
+    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    catch (err) { obligations.set(sessionId, before); persistSoon(); throw err; }
+    return true;
+  });
+}
+
+export async function noteLongRunProgressNow(
+  sessionId: string,
+  conversationId: string,
+  progressAt: number,
+  turnId: string | null,
+  evidence: 'mcp' | 'terminal',
+  requestId: string | null = null
+): Promise<boolean> {
+  return serial(async () => {
+    const epoch = epochs.get(sessionId);
+    const work = obligations.get(sessionId);
+    if (!epoch || !work || epoch.conversationId !== conversationId || work.conversationId !== conversationId ||
+        work.epochGeneration !== epoch.generation ||
+        !['owed', 'dispatching', 'queued'].includes(work.state) ||
+        !Number.isFinite(progressAt) || progressAt <= work.createdAt) return false;
+    // Recovery continuation is proven only by a new local MCP call. A provider final can be the
+    // short "recovered" answer that exposed the original liveness bug and must not erase debt.
+    if (work.reason === 'recovery_resume' && evidence !== 'mcp') return false;
+    if (work.reason === 'wait_resolved' || work.reason === 'wait_failed') {
+      // MCP progress follows the same exact workflow boundary as admission. For new waits, a
+      // different proven request id certifies the replacement provider turn even if the browser's
+      // activeTurnId projection still names the source briefly. Legacy waits without request
+      // identity retain the conservative source-turn check. Terminal-only evidence has no request
+      // id, so it must still prove a different durable turn.
+      if (evidence === 'mcp' && work.sourceRequestId) {
+        if (!requestId || requestId === work.sourceRequestId) return false;
+      } else if (work.sourceTurnId && (!turnId || turnId === work.sourceTurnId)) {
+        return false;
+      }
+    }
+
+    const before = cloneWork(work);
+    obligations.set(sessionId, { ...work, state: 'fulfilled', updatedAt: Date.now() });
+    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    catch (err) { obligations.set(sessionId, before); persistSoon(); throw err; }
+    return true;
+  });
+}
+
+export function resetLongRunStateForTests(): void {
+  epochs.clear();
+  obligations.clear();
+  waits.clear();
+  chain = Promise.resolve();
+}

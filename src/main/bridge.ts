@@ -18,7 +18,7 @@ export { setBrowserWorkArea } from './browser-window-layout.js';
 import { pendingBrowserPreferenceRequest, acknowledgeBrowserPreferences } from './browser-preferences.js';
 import { sessionFinishHeld, releaseSessionFinish, getSessionFinishDraft, sessionFinishWaiting } from './session/finish.js';
 import { observeUsage } from './session/usage.js';
-import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, completeBrowserDecision, listInputs, fileSilenceInput, hasQueuedAfterTurnInput, inputBeforeGoal, pendingQueuedPickups, deferSilenceInput, revokeSilenceInputs } from './session/input.js';
+import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, completeBrowserDecision, listInputs, cancelInput, fileSilenceInput, hasQueuedAfterTurnInput, inputBeforeGoal, pendingQueuedPickups, deferSilenceInput, revokeSilenceInputs } from './session/input.js';
 /**
  * The local bridge between the Chrome extension and this app.
  *
@@ -146,6 +146,7 @@ import {
   primeConversationGone,
   primeConversation,
   requestWorkerRevivals,
+  retireWorkerContinuationIfUnsent,
   rollbackWorkerRevivalClaim,
   releaseQuiescentRun,
   retiredWorkerForConversation,
@@ -213,6 +214,12 @@ import { conversationHasMcpCallSince } from './session/store.js';
 import { sessionWorkingAt } from '../shared/session-activity.js';
 import { requestCorrelation } from './session/correlation.js';
 import { bindAgentWorkspace } from './workspace.js';
+import {
+  cancelLongRunNow,
+  longRunMessageAuthority,
+  longRunWorkFor,
+  noteLongRunProgressNow
+} from './session/long-run.js';
 
 /** Fixed candidates so the extension can find the app without being told a port. */
 export const DEFAULT_PORTS = [8765, 8766, 8767, 8768, 8769];
@@ -3911,11 +3918,27 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (command.spec.type === 'resume' && !(resumeFence && sendUnattempted(resumeFence.destinationSend))) {
       return json(res, 409, { error: 'command_already_sent', final: true }, origin);
     }
-    if (command.spec.type === 'revive' && !revivalFor(command.spec.agent, command.spec.runId)) {
-      // tidyCommands() above normally retires these. This is the fail-closed twin of that:
-      // an empty revival has no message of the prime's to type, and a page must never be
-      // handed a command that would put nothing, or scaffolding alone, into a real chat.
-      return json(res, 404, { error: 'no_such_command' }, origin);
+    if (command.spec.type === 'revive') {
+      const revival = revivalFor(command.spec.agent, command.spec.runId);
+      if (!revival) {
+        // tidyCommands() above normally retires these. This is the fail-closed twin of that:
+        // an empty revival has no message of the prime's to type, and a page must never be
+        // handed a command that would put nothing, or scaffolding alone, into a real chat.
+        return json(res, 404, { error: 'no_such_command' }, origin);
+      }
+      if (!revivalLongRunAuthorityCurrent(revival)) {
+        // A durable browser owner means an earlier redeem crossed the command-lease boundary.
+        // Its HTTP response may have been lost after payload disclosure, so stale long-run
+        // authority cannot prove this wake was unsent. Preserve the exact command + broker row as
+        // ambiguous custody until the existing deadline/reconciliation path settles it.
+        if (command.owner !== null) {
+          return json(res, 409, { error: 'command_authority_revoked', final: true }, origin);
+        }
+        await cleanupRevokedLongRunRevival(revival, 'its durable long-run authority was revoked before browser redeem');
+        retire(command, 'its durable long-run authority was revoked before browser redeem');
+        requestWorkerRevivals([command.spec.agent], command.spec.runId);
+        return json(res, 404, { error: 'no_such_command' }, origin);
+      }
     }
     if (
       reportedConversation &&
@@ -3952,11 +3975,24 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (command.spec.type === 'revive') {
       const claimed = await persistRevivalRedeem(command, client, claimedAt);
       if (claimed === 'stale') {
-        // A proven MCP call won `waking -> active` before this browser claimed the wake. No
-        // payload has escaped, so the page must not type the same queued words as a second user
-        // message. Retire the now-meaningless bridge command without failing the active worker.
-        retire(command, 'its worker became active before the browser claimed the wake');
+        // A proven MCP call, Stop, or another certified progress event won before browser
+        // payload disclosure. Retire the command and remove any still-unsent long-run row.
+        const revival = revivalFor(command.spec.agent, command.spec.runId);
+        if (revival) {
+          await cleanupRevokedLongRunRevival(revival, 'its durable long-run authority changed during browser redeem');
+        }
+        retire(command, 'its worker or durable long-run authority changed before browser claim completed');
+        requestWorkerRevivals([command.spec.agent], command.spec.runId);
         return json(res, 404, { error: 'no_such_command' }, origin);
+      }
+      if (claimed === 'authority-stale-after-lease') {
+        // The durable browser lease exists, so this redeem (or an earlier same-owner response)
+        // could already have exposed the payload. Renew the live timer exactly once from the
+        // durable claimedAt boundary, then preserve ambiguous custody without re-issuing text.
+        // Later retries are rejected by the preflight owner/stale fence above and cannot extend it.
+        armDeadline(command);
+        changed();
+        return json(res, 409, { error: 'command_authority_revoked', final: true }, origin);
       }
       if (claimed === 'taken') return json(res, 409, { error: 'command_taken' }, origin);
       if (claimed === 'broker-not-durable') {
@@ -5279,7 +5315,13 @@ async function persistCommandLease(
   });
 }
 
-type RevivalRedeemResult = 'ok' | 'stale' | 'taken' | 'broker-not-durable' | 'lease-not-durable';
+type RevivalRedeemResult =
+  | 'ok'
+  | 'stale'
+  | 'authority-stale-after-lease'
+  | 'taken'
+  | 'broker-not-durable'
+  | 'lease-not-durable';
 
 /**
  * Makes `/commands/redeem` the wake arbitration cut, including process crashes.
@@ -5318,7 +5360,8 @@ async function persistRevivalRedeem(
     // Re-check after waiting for a prior redeemer. An MCP call is allowed to win only before
     // the browser-owned broker claim is installed.
     const revival = revivalFor(command.spec.agent, command.spec.runId);
-    if (!revival || revival.conversationId !== command.spec.conversationId) return 'stale';
+    if (!revival || revival.conversationId !== command.spec.conversationId ||
+        !revivalLongRunAuthorityCurrent(revival)) return 'stale';
     if (!claimWorkerRevival(command.spec.agent, command.spec.conversationId, command.spec.runId)) return 'stale';
 
     let brokerDurable = false;
@@ -5346,6 +5389,40 @@ async function persistRevivalRedeem(
       return 'broker-not-durable';
     }
 
+    // Stop/progress may have revoked the long-run obligation while the broker fsync above was
+    // in flight. Before any command lease exists, no browser payload has escaped and the claim
+    // can be rolled back. A same-owner retry may already have a durable lease from an earlier
+    // response, however; that is ambiguous custody and must never be rolled back.
+    const afterBroker = revivalFor(command.spec.agent, command.spec.runId);
+    if (!afterBroker || !revivalLongRunAuthorityCurrent(afterBroker)) {
+      if (command.owner !== null) return 'authority-stale-after-lease';
+      const rolledBack = rollbackWorkerRevivalClaim(
+        command.spec.agent,
+        command.spec.conversationId,
+        command.spec.runId
+      );
+      if (rolledBack) {
+        try {
+          await persistCriticalSwarmNow();
+        } catch (err) {
+          logWarn(
+            `bridge: could not persist authority-revocation rollback for ${specKey(command.spec)} — ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+        if (afterBroker) {
+          // afterBroker still names the exact authority rows that were present while this browser
+          // claim was in flight. Once the claim is rolled back, no payload can have escaped, so a
+          // revoked long-run row is provably unsent and may be retired. Recomputing revivalFor()
+          // here would lose that stale UUID because planning correctly filters revoked rows.
+          await cleanupRevokedLongRunRevival(
+            afterBroker,
+            'its durable long-run authority was revoked while the browser claim fsync was pending'
+          );
+        }
+      }
+      return 'stale';
+    }
+
     if (!(await persistCommandLease(command, client, claimedAt))) {
       // Do NOT roll the broker claim back here. It is already the authoritative durable cut.
       // Keeping the worker browser-owned prevents an MCP call from taking the queued text while
@@ -5353,6 +5430,16 @@ async function persistRevivalRedeem(
       // owner remains the only one allowed to finish the wake.
       if (command.owner && command.owner !== client) return 'taken';
       return 'lease-not-durable';
+    }
+
+    // The command lease is now durable but the HTTP response has still not exposed the payload.
+    // Re-check once more to close the Stop/progress race during that second fsync. Do not roll
+    // back here: a same-owner prior redeem may already have received the text, so the lease is
+    // ambiguous custody. Keeping it inert until its existing deadline is safer than pretending
+    // that potentially delivered work can be unsent.
+    const afterLease = revivalFor(command.spec.agent, command.spec.runId);
+    if (!afterLease || !revivalLongRunAuthorityCurrent(afterLease)) {
+      return 'authority-stale-after-lease';
     }
     return 'ok';
   } finally {
@@ -6098,9 +6185,15 @@ function grantActivity(conversationId: string, sessionId: string, at = Date.now(
   const ownership = turn ?? (previous?.sessionId === sessionId ? previous : { turnId: null, model: 'unknown' as const });
   if (ownership.model === 'pro' && (isChatBlocked(conversationId) || stopRequestedFor(conversationId))) return;
   const evidenceAt = previous?.sessionId === sessionId && previous.turnId === ownership.turnId ? Math.max(previous.evidenceAt, at) : at;
-  const mcpBacked = ownership.mcpBacked || (previous?.sessionId === sessionId && previous.turnId === ownership.turnId && previous.mcpBacked);
+  const sameTurn = previous?.sessionId === sessionId && previous.turnId === ownership.turnId;
+  const mcpBacked = ownership.mcpBacked || (sameTurn && previous?.mcpBacked);
+  // Activity is a projection, not recovery authority. A reloaded document commonly reports the
+  // same still-open provider turn again; keep the spent soft-recovery marker across that replay
+  // instead of silently refunding the one-reload budget.
+  const selfHealingSoft = sameTurn ? previous?.selfHealingSoft : undefined;
   activeUntil.set(conversationId, { sessionId, evidenceAt, until: evidenceAt + (ownership.model === 'pro' ? PRO_SILENCE_MS : window), turnId: ownership.turnId, model: ownership.model,
-    ...(mcpBacked ? { mcpBacked: true } : {}) });
+    ...(mcpBacked ? { mcpBacked: true } : {}),
+    ...(selfHealingSoft ? { selfHealingSoft } : {}) });
   awaitingReturn.delete(conversationId);
   armSilenceSweep();
   void considerAutomaticCompaction(conversationId, sessionId);
@@ -6834,13 +6927,35 @@ async function noteRecoveryObservations(
   const ended = observations.findLast(item => item.kind === 'turn_end');
   if (sessionId && ended?.outcome === 'stopped') {
     await cancelSelfHealingForStopNow(sessionId, conversationId);
+    await cancelLongRunNow(sessionId, conversationId, 'manual_stop');
+    const cancelledWork = longRunWorkFor(sessionId);
+    if (cancelledWork?.state === 'cancelled' && cancelledWork.inputId) {
+      await cancelInput(cancelledWork.inputId);
+    }
   }
   const successfulTerminal = activity.terminal && (!ended || ended.outcome === 'completed');
-  if (sessionId && activity.meaningful && (activity.working || successfulTerminal)) {
+  const softProbation = recorded?.recovery?.phase === 'soft_recovery' &&
+    recorded.recovery.previousConversationId === conversationId &&
+    recorded.recovery.replacementConversationId === null;
+  // During the bounded post-reload probation, "the old turn is working again" is evidence but not
+  // a recovery certificate: provider/Fiber replay can produce exactly that signal and then stall
+  // again. A canonical completed terminal may retire soft recovery; otherwise the one-reload
+  // budget remains spent and the durable deadline still escalates to Emergency Resume.
+  const recoveryCertified = softProbation ? successfulTerminal : (activity.working || successfulTerminal);
+  if (sessionId && activity.meaningful && recoveryCertified) {
     await noteSelfHealingProgress(
       sessionId,
       conversationId,
       Math.max(1, activity.at ?? ended?.time ?? Date.now())
+    );
+  }
+  if (sessionId && successfulTerminal) {
+    await noteLongRunProgressNow(
+      sessionId,
+      conversationId,
+      Math.max(1, ended?.time ?? activity.at ?? Date.now()),
+      ended?.turnId ?? null,
+      'terminal'
     );
   }
   const thinkingFailed = ended?.outcome === 'failed' && ended.reason === 'thinking_failed' &&
@@ -7192,24 +7307,37 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
   const spent: string[] = [];
   const compacting = new Set(pendingContinuations().map((entry) => entry.from));
   for (const [conversationId, grant] of activeUntil) {
-    if (grant.selfHealingSoft) {
-      if (grant.until > now) continue;
+    // The session WAL, not this in-memory activity projection, owns the post-reload budget.
+    // Reconstructing from it also closes the restart/reload race where the page reports the same
+    // open turn and grantActivity() refreshes the ordinary silence clock. Provider activity may
+    // prove liveness, but it cannot extend this deadline without a certified recovery transition.
+    if (grant.selfHealingSoft || getConfig().multiAgent.selfHealingSessions) {
       const session = await getSession(grant.sessionId);
       const recovery = session?.recovery;
-      if (
+      const durableSoft =
         session?.conversationId === conversationId &&
         session.lastTurnOutcome !== 'stopped' &&
         recovery?.phase === 'soft_recovery' &&
-        recovery.failureEpisodeId === grant.selfHealingSoft.episodeId &&
-        recovery.recoveryGeneration === grant.selfHealingSoft.generation &&
         recovery.previousConversationId === conversationId &&
-        recovery.replacementConversationId === null
-      ) {
+        recovery.replacementConversationId === null;
+      if (durableSoft) {
+        grant.selfHealingSoft = {
+          episodeId: recovery.failureEpisodeId,
+          generation: recovery.recoveryGeneration
+        };
+        const dueAt = (recovery.lastRecoveryAt ?? recovery.updatedAt) + SELF_HEAL_POST_RELOAD_MS;
+        grant.until = Math.min(grant.until, dueAt);
+        if (now < dueAt) {
+          deferred = true;
+          continue;
+        }
         spent.push(conversationId);
-      } else if (activeUntil.get(conversationId) === grant) {
-        activeUntil.delete(conversationId);
+        continue;
       }
-      continue;
+      // A genuinely certified completion may already have retired the WAL while this projection
+      // still carries its old marker. Drop only the marker; the ordinary open-turn watch, if any,
+      // remains valid and continues through the normal path below.
+      if (grant.selfHealingSoft) delete grant.selfHealingSoft;
     }
     if (compacting.has(conversationId)) continue;
     if (grant.until > now) continue;
@@ -7826,6 +7954,8 @@ function noteCallAttribution(
     // when Chrome, the tab or a reload destroyed the page's local turn projection.
     const sourceTurnId = filedSession?.activeTurnId ?? previous?.turnId ??
       goalPendingReplyFor(conversationId)?.silenceSourceTurnId ?? filedSession?.finishTurn?.turnId ?? null;
+    void noteLongRunProgressNow(sessionId, conversationId, startedAt, sourceTurnId, 'mcp', requestId)
+      .catch(error => logWarn(`long-run: could not persist certified MCP progress: ${String(error)}`));
     void revokeSilenceInputs(sessionId).catch(error => logWarn(`input: could not withdraw silence pickup: ${String(error)}`));
     void revokeSilenceLoop(conversationId).catch(error => logWarn(`goal: could not withdraw silence pickup: ${String(error)}`));
     grantActivity(conversationId, sessionId, continuingMcp ? Date.now() : pro ? Math.min(Date.now(), startedAt) : Date.now(), CHAT_SILENCE_MS,
@@ -8640,6 +8770,37 @@ function bootstrapText(spec: CommandSpec, summary: string): string {
 /** The broker's current plan for waking one worker, or null once it is no longer waking. */
 function revivalFor(agent: string, runId: string): WorkerRevival | null {
   return pendingWorkerRevivals().find((revival) => revival.id === agent && revival.runId === runId) ?? null;
+}
+
+function revivalAuthorityMessageIds(revival: WorkerRevival): readonly string[] {
+  return revival.authorityMessageIds ?? revival.messageIds;
+}
+
+function revivalLongRunAuthorityCurrent(revival: WorkerRevival): boolean {
+  const authority = revivalAuthorityMessageIds(revival);
+  return authority.length > 0 && authority.every(
+    (messageId) => longRunMessageAuthority(messageId, revival.conversationId) !== 'stale'
+  );
+}
+
+async function cleanupRevokedLongRunRevival(revival: WorkerRevival, reason: string): Promise<void> {
+  let retiredAny = false;
+  for (const messageId of revivalAuthorityMessageIds(revival)) {
+    if (longRunMessageAuthority(messageId, revival.conversationId) !== 'stale') continue;
+    if (retireWorkerContinuationIfUnsent(revival.conversationId, messageId, reason) === 'retired') {
+      retiredAny = true;
+    }
+  }
+  if (!retiredAny) return;
+  try {
+    await persistCriticalSwarmNow();
+  } catch (error) {
+    // Safety does not depend on cleanup persistence: redeem rechecks the long-run ledger and
+    // refuses stale authority. This write merely prevents the stale broker row returning later.
+    logWarn(
+      `bridge: could not persist revoked worker-continuation cleanup — ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
 }
 
 /**

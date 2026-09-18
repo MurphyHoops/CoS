@@ -31,6 +31,7 @@ import {
   thawPrimeTransfer
 } from '../agents.js';
 import { goalObjectiveFor, goalSwitchFor } from '../goal.js';
+import { ensureRecoveryWorkNow } from './long-run.js';
 import { logInfo, logWarn } from '../logger.js';
 import { bindAgentWorkspace } from '../workspace.js';
 import { publishRecoveryRebindProjectionDurably } from './rebind.js';
@@ -137,7 +138,17 @@ export async function beginSelfHealingEpisode(
   if (session.replacementTransfer?.kind === 'continuation') return null;
   const previous = session.recovery;
   const now = Date.now();
-  const observedProgress = lastProgressAt ?? session.lastToolCallAt ?? session.lastTurnEndAt ?? session.lastAssistantFinalAt ?? null;
+  // Recovery progress is a monotonic evidence frontier, not a precedence chain. Using `??`
+  // here let an older tool-call timestamp mask a newer terminal/final timestamp, so replayed
+  // activity after a reload could appear to advance the episode. Freeze the newest canonical
+  // boundary that was already durable when this failure generation began.
+  const observedProgress = Math.max(
+    0,
+    lastProgressAt ?? 0,
+    session.lastToolCallAt ?? 0,
+    session.lastTurnEndAt ?? 0,
+    session.lastAssistantFinalAt ?? 0
+  ) || null;
   if (previous?.previousConversationId === conversationId) {
     if (previous.phase === 'hard_recovery' || previous.phase === 'reconciling') return previous;
     if (previous.phase === 'suspected_stall' || previous.phase === 'soft_recovery') {
@@ -204,7 +215,11 @@ export async function noteSelfHealingProgress(
   const held = session?.recovery;
   if (!session || session.conversationId !== conversationId || !held) return false;
   if (held.phase === 'hard_recovery' || held.phase === 'reconciling') return false;
-  if (progressAt <= (held.lastProgressAt ?? 0) && held.phase === 'healthy') return false;
+  // A recovery phase is authority-bearing state. Re-observing the same provider work after a
+  // reload must never retire it. Only evidence strictly beyond the episode's durable frontier
+  // can do so; bridge-level probation decides which kinds of evidence are strong enough while
+  // soft recovery is active.
+  if (progressAt <= (held.lastProgressAt ?? 0)) return false;
   const next: SelfHealingRecoveryState = {
     ...held,
     phase: 'healthy',
@@ -687,6 +702,17 @@ async function markRecoveryRecovered(
   conversationId: string,
   recovery: SelfHealingRecoveryState
 ): Promise<boolean> {
+  // Goal/Loop is durable autonomy authority. Before the recovery fence is retired, record that the
+  // same task still owes forward progress in B. The Emergency Resume bootstrap gets a grace
+  // window; if it never makes a new local MCP call, the local long-run supervisor files one stable
+  // continuation instead of letting the recovered conversation become an idle endpoint.
+  if (goalSwitchFor(conversationId).enabled || recovery.agentLineage !== null) {
+    await ensureRecoveryWorkNow(
+      sessionId,
+      conversationId,
+      `recovery:${recovery.failureEpisodeId}:${recovery.recoveryGeneration}`
+    );
+  }
   const next: SelfHealingRecoveryState = {
     ...recovery,
     phase: 'recovered',

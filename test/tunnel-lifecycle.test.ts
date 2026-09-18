@@ -87,18 +87,22 @@ vi.mock('node:fs', async (importOriginal) => {
       rm: async (target: string, options?: { recursive?: boolean }) => {
         if (options?.recursive) {
           for (const key of [...fixture.files.keys()]) {
-            if (key === target || key.startsWith(`${target}/`)) fixture.files.delete(key);
+            if (
+              key === target ||
+              key.startsWith(`${target}/`) ||
+              key.startsWith(`${target}\\`)
+            ) fixture.files.delete(key);
           }
           fixture.health.url = null;
           return;
         }
         fixture.files.delete(target);
-        if (target.endsWith('/health.url')) fixture.health.url = null;
+        if (/[\\/]health\.url$/.test(target)) fixture.health.url = null;
       },
       readFile: async (target: string) => {
         const saved = fixture.files.get(target);
         if (saved !== undefined) return saved;
-        if (target.endsWith('/health.url') && fixture.health.url) return fixture.health.url;
+        if (/[\\/]health\.url$/.test(target) && fixture.health.url) return fixture.health.url;
         throw Object.assign(new Error('ENOENT: no such file'), { code: 'ENOENT' });
       }
     }

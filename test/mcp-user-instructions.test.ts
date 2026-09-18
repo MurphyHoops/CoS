@@ -96,8 +96,10 @@ describe('the user’s own connector instructions', () => {
     expect(text).not.toMatch(/functions\.|tool_search|approval auto-review|user-requested computer shutdown/);
     expect(text).toContain('/skills/<id>/SKILL.md');
     expect(text).not.toContain('Use update_plan');
+    expect(text).not.toContain('session_wait');
     const recorded = serverInstructions({ ...ctx, sessionTools: true }, 'core', 'win32');
     expect(recorded).toContain('Use update_plan');
+    expect(recorded).toContain('session_wait');
     expect(recorded).not.toMatch(/session action=|update_cursor|recorded history/);
     const withoutCommands = serverInstructions({ ...ctx, caps: { ...ctx.caps, command: false } }, 'core', 'linux');
     expect(withoutCommands).toContain('find searches');

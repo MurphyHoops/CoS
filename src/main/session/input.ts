@@ -19,6 +19,7 @@ import { noteChatOrigin } from './recorder.js';
 import { isAstraModel, isProModel } from '../../shared/chat-models.js';
 import { inFlightToolCalls } from '../mcp/call-context.js';
 import { automaticFinishEnabled, consumeGoalReplyForInputNow } from '../goal.js';
+import { longRunWorkFor } from './long-run.js';
 import { finishInstruction } from '../../shared/finish.js';
 import { attachmentSchema, validateInputAttachments, normalizeInputAttachments } from './input-attachments.js';
 import { MAX_CHATGPT_MESSAGE_CHARS } from '../../shared/user-prompt.js';
@@ -88,6 +89,8 @@ const entrySchema = inputArgs.extend({
   /** Canonical message exists even when optional image assets could not be saved. */
   historyAnchored: z.boolean().optional(),
   completedTurnId: z.string().max(256).optional(),
+  /** Local long-run authority checked again at the final browser/tool delivery boundary. */
+  longRunObligationId: z.string().uuid().optional(),
   queueOrder: z.number().int().nonnegative().optional()
 });
 export type InputEntry = z.infer<typeof entrySchema>;
@@ -149,8 +152,19 @@ export async function sessionInputPolicy(sessionId: string, observedActivity?: I
     browserAllowed: !session.activeTurnId && !activity.possible && !activity.exact && !executing && (!astra || terminal),
     settled: settled && !executing && (session.lastToolCallAt ?? 0) <= (completed?.completedAt ?? end?.time ?? 0) };
 }
+async function longRunInputCurrent(entry: InputEntry): Promise<boolean> {
+  if (!entry.longRunObligationId) return true;
+  if (!entry.sessionId) return false;
+  const work = longRunWorkFor(entry.sessionId);
+  return !!work &&
+    work.id === entry.longRunObligationId &&
+    work.inputId === entry.id &&
+    (work.state === 'dispatching' || work.state === 'queued');
+}
+
 async function browserInputAllowed(entry: InputEntry): Promise<boolean> {
   if (entry.error?.startsWith('Local chat setup failed:')) return false;
+  if (!(await longRunInputCurrent(entry))) return false;
   // Authored Inject-now custody never changes transports. Its exact turn either
   // offers it from an MCP response or expires it visibly below.
   if (entry.delivery === 'tool') return false;
@@ -197,6 +211,7 @@ export function hasEligibleToolInput(sessionId: string, finishBoundary = false):
     const head = current.find(row => row.sessionId === sessionId && queuedFollowup(row) && ['queued', 'tool'].includes(row.state));
     for (const row of current) {
       if (row.sessionId !== sessionId || row.dueAt > Date.now()) continue;
+      if (!(await longRunInputCurrent(row))) continue;
       if (row.attachments?.length && row.attachmentDelivery !== 'tool' && row.delivery !== 'tool') continue;
       if (row.mode === 'after-turn' || (row.mode === 'finish' && !finishBoundary)) continue;
       if (row.mode === 'finish' && row !== head) continue;
@@ -381,6 +396,28 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
     if (row.finishOwner && !terminal(row) && !(await finishInputCurrent(row)))
       return { ...row, state: 'cancelled', error: 'Automatic follow-up cancelled because its active turn or setting changed.' };
     if (row.purpose === 'decision') return row;
+    // Long-run continuations carry their own execution epoch. If newer certified progress,
+    // Stop, or a rebind revoked that authority before native Send/tool delivery, retire the
+    // provably-unsent row instead of leaving a permanent ghost in the outbox.
+    if (row.longRunObligationId && !(await longRunInputCurrent(row))) {
+      if (row.state === 'queued' || (row.state === 'browser' && row.sendAuthorizedAt === undefined)) {
+        return { ...row, state: 'cancelled', error: 'Automatic continuation retired because durable execution authority advanced.' };
+      }
+      if (row.state === 'browser' && row.sendAuthorizedAt !== undefined) {
+        // Send crossed the irreversible browser boundary, so replay is forbidden. Once a newer
+        // certified progress/Stop/cancel has revoked this long-run obligation, however, keeping
+        // the ambiguous row nonterminal forever would pin the durable session's only input slot.
+        // Retire it as a tombstone instead: a late browser ACK is still accepted below and can
+        // confirm that the original Send landed, but no path may resend these bytes.
+        return {
+          ...row,
+          state: 'cancelled',
+          error:
+            'Automatic continuation authority advanced after Send was authorized. Delivery is unconfirmed; ' +
+            'the message may already have been sent and will not be resent.'
+        };
+      }
+    }
     if (row.state === 'queued' && row.delivery === 'tool' && row.toolTurnId) {
       const session = row.sessionId ? await getSession(row.sessionId) : null;
       const activity = session ? deliveryHooks?.activity?.(session) : null;
@@ -544,7 +581,11 @@ async function materializeOpening(entry: InputEntry): Promise<void> {
     throw new Error('Reserved opening session belongs to another ChatGPT conversation');
   if (entry.projectId && session.projectId !== entry.projectId) await assignSessionProject(session.id, entry.projectId);
 }
-export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwner']): Promise<InputEntry> {
+export function enqueueInput(
+  raw: InputArgs,
+  finishOwner?: InputEntry['finishOwner'],
+  longRunObligationId?: string
+): Promise<InputEntry> {
   return serial(async () => {
     const input = inputArgs.parse(raw);
     if (input.stages !== undefined && JSON.stringify([input.text, ...input.stages]).length > 12000)
@@ -553,6 +594,8 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
     const prior = current.find((entry) => entry.id === input.id);
     if (prior) {
       if (JSON.stringify(inputArgs.parse({ ...prior, sessionId: prior.opening ? prior.requestedSessionId ?? null : prior.sessionId, mode: prior.requestedMode ?? prior.mode })) !== JSON.stringify(input)) throw new Error('Message id already belongs to different input');
+      if (longRunObligationId && prior.longRunObligationId !== longRunObligationId)
+        throw new Error('Message id already belongs to different long-run authority');
       if (!terminal(prior)) await materializeOpening(prior);
       return { ...prior };
     }
@@ -594,7 +637,9 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
     const directTurn = !toolDelivery && input.mode === 'auto' && !finishOwner && input.dueAt <= Date.now() ? policy?.directTurn : null;
     const entry: InputEntry = { ...input, ...(toolImages ? { toolImages } : {}), ...(directTurn ? { directTurn } : {}),
       ...(injectionOwner ? { toolTurnId: injectionOwner.turnId } : {}), ...(transportIntent ? { transportIntent } : {}),
-      ...(requestedMode !== input.mode ? { requestedMode } : {}), ...(finishOwner ? { finishOwner } : {}), state: 'queued', owner: null, createdAt: Date.now(), conversationId: null };
+      ...(requestedMode !== input.mode ? { requestedMode } : {}), ...(finishOwner ? { finishOwner } : {}),
+      ...(longRunObligationId ? { longRunObligationId } : {}),
+      state: 'queued', owner: null, createdAt: Date.now(), conversationId: null };
     if (input.projectId) {
       await projectWorkspace(input.projectId);
       if (input.sessionId) {
@@ -845,7 +890,11 @@ export function noteInputStartupError(id: string, error: string | null): Promise
 async function eligibleStageEnd(entry: InputEntry): Promise<string | null> {
   if (!entry.sessionId) return null;
   const session = await getSession(entry.sessionId);
+  // Worker continuation delivery is owned exclusively by the durable agent revival broker.
+  // Never author a worker chat through the ordinary session-input outbox, even when the row
+  // carries long-run authority: that would bypass slot reservation and waking/ACK fencing.
   if (!session || session.origin?.kind === 'worker') return null;
+  if (entry.longRunObligationId && !(await longRunInputCurrent(entry))) return null;
   const [end] = await readRecentEvents(entry.sessionId, 1, { kinds: ['turn_start', 'turn_end'] });
   // A later native final cannot erase an actual busy rejection. Keep this
   // existing delay for the exact source turn until its native retry is due.
@@ -874,7 +923,11 @@ async function eligibleStageEnd(entry: InputEntry): Promise<string | null> {
   if (session.activeTurnId) return null;
   // A failure releases manual input immediately. Automatic follow-ups require
   // the confirmed refresh ticket above; only a real completion bypasses it.
-  if (end?.kind !== 'turn_end' || end.outcome !== 'completed' || !end.turnId || end.time < entry.createdAt) return null;
+  if (end?.kind !== 'turn_end' || end.outcome !== 'completed' || !end.turnId) return null;
+  // Normal after-turn rows are promises made before the turn ends, so an older completion is
+  // never their authority. Long-run rows are created *because* an external condition resolved
+  // after that turn already ended; their durable obligation is the missing temporal proof.
+  if (!entry.longRunObligationId && end.time < entry.createdAt) return null;
   if (!(await sessionInputPolicy(entry.sessionId)).settled) return null;
   return end.turnId;
 }
@@ -1253,6 +1306,7 @@ export function offerToolInput(sessionId: string | null | undefined, conversatio
     const activeToolTurn = session.activeTurnId ?? (observedActivity?.exact ? observedActivity.turnId : undefined);
     const prepareEntry = async (entry: InputEntry): Promise<InputEntry> => {
       if (entry.sessionId !== sessionId || entry.dueAt > Date.now()) return entry;
+      if (!(await longRunInputCurrent(entry))) return entry;
       if (entry.attachments?.length && entry.attachmentDelivery !== 'tool' && entry.delivery !== 'tool') return entry;
       if (entry.delivery === 'tool' && entry.toolTurnId !== activeToolTurn) return entry;
       if (entry.directTurn && entry.state === 'queued' && session.activeTurnId !== entry.directTurn.id) return entry;

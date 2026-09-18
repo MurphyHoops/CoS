@@ -80,6 +80,7 @@ const {
   stageFinishAgent,
   stageWorkerConversationFinish,
   stageMessages,
+  stageWorkerContinuation,
   stageSpawn,
   snapshotSwarm,
   spawn,
@@ -96,6 +97,11 @@ const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurab
 const { findSessionByConversation, initSessionStore, readRecentEvents, resetSessionStoreForTests } = await import(
   '../src/main/session/store.js'
 );
+const {
+  ensureRecoveryWorkNow,
+  leaseLongRunWorkNow,
+  resetLongRunStateForTests
+} = await import('../src/main/session/long-run.js');
 const { recordChatObservations, resetRecorderForTests } = await import('../src/main/session/recorder.js');
 const { resetWorkspaces, setWorkspaceFor, workspaceForChat } = await import('../src/main/workspace.js');
 const { DEFAULT_CAPABILITIES } = await import('../src/shared/types.js');
@@ -128,6 +134,7 @@ afterAll(async () => {
 beforeEach(() => {
   resetAgentsForTests();
   resetRecorderForTests();
+  resetLongRunStateForTests();
   resetWorkspaces();
   // The real app wires the broker's immediate persistence sink during startup. MCP endpoint
   // tests exercise that production contract rather than an intentionally half-wired broker;
@@ -964,6 +971,67 @@ describe('clearing one agent from the app', () => {
  * about that one chat surviving — the tab closing, the prime pausing, the app restarting —
  * and about the worker slot, which is the only genuinely scarce thing in the run.
  */
+describe('durable worker continuation broker', () => {
+  it('reuses one stable broker row when the long-run queued receipt is lost and retried', async () => {
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    finishAgent(worker.caller, 'first piece complete');
+    const work = await ensureRecoveryWorkNow('session-worker-continuation', 'c-worker-1', 'recovery:broker-stable-id');
+    const leased = await leaseLongRunWorkNow('session-worker-continuation', 'c-worker-1');
+    expect(leased?.work.id).toBe(work?.id);
+    const stableId = leased!.work.inputId!;
+    const text = 'Resume the same durable worker task after the external wait.';
+
+    const first = stageWorkerContinuation('c-worker-1', stableId, text)!;
+    expect(first.waking).toEqual(['worker-1']);
+    expect(await persistCriticalSwarmNow()).toBe(true);
+    first.commit();
+
+    expect(pendingCount('worker-1')).toBe(1);
+    expect(pendingWorkerRevivals()).toEqual([
+      expect.objectContaining({
+        id: 'worker-1',
+        conversationId: 'c-worker-1',
+        messageIds: [stableId]
+      })
+    ]);
+
+    // Simulate the crash window: swarm durability succeeded but the long-run ledger did not get
+    // its queued ACK. The same stable UUID must discover the existing row, not append another.
+    const retry = stageWorkerContinuation('c-worker-1', stableId, text)!;
+    expect(retry.waking).toEqual(['worker-1']);
+    expect(retry.messages).toEqual([expect.objectContaining({ id: stableId, text })]);
+    retry.rollback();
+
+    expect(pendingCount('worker-1')).toBe(1);
+    expect(pendingWorkerRevivals()[0]?.messageIds).toEqual([stableId]);
+    expect(
+      snapshotSwarm()?.agents.find(entry => entry.info.id === 'worker-1')?.queue.map(message => message.id)
+    ).toEqual([stableId]);
+  });
+
+  it('keeps an automatic worker continuation behind the configured worker-slot limit', async () => {
+    await setEnabled(true, 3);
+    try {
+      startSwarm(2);
+      const first = startWorker('worker-1');
+      startWorker('worker-2');
+      finishAgent(first.caller, 'worker one is sleeping');
+      await setEnabled(true, 1);
+
+      expect(() => stageWorkerContinuation(
+        'c-worker-1',
+        'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+        'Resume worker one after its wait.'
+      )).toThrow(/NO_FREE_SLOT|all 1 worker slots are busy/i);
+      expect(pendingCount('worker-1')).toBe(0);
+      expect(pendingWorkerRevivals()).toEqual([]);
+    } finally {
+      await setEnabled(true, 3);
+    }
+  });
+});
+
 describe('a worker that is sleeping', () => {
   it.each(['browser', 'call'] as const)('replaces old assignment metadata before %s revival and retains the old report', (delivery) => {
     startSwarm(1);

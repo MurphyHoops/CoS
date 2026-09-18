@@ -16,6 +16,7 @@ import {
   retireGoalDraftsFor
 } from '../goal.js';
 import { moveChatWorkspace } from '../workspace.js';
+import { moveLongRunState, moveLongRunStateNow } from './long-run.js';
 import { rebindConversation } from './recorder.js';
 
 export function publishSessionRebindProjection(
@@ -27,6 +28,7 @@ export function publishSessionRebindProjection(
   moveChatWorkspace(fromConversationId, toConversationId);
   moveGoalObjective(fromConversationId, toConversationId);
   moveGoalSwitch(fromConversationId, toConversationId);
+  moveLongRunState(sessionId, fromConversationId, toConversationId);
   // A's final belongs to the executor that was retired. B earns its own Goal/Loop reply debt.
   retireGoalDraftsFor(fromConversationId);
 }
@@ -54,6 +56,9 @@ export async function publishRecoveryRebindProjectionDurably(
   }
   if (!(await moveGoalReplyNow(fromConversationId, toConversationId, sessionId))) {
     throw new Error('Goal reply projection refused the recovery rebind');
+  }
+  if (!(await moveLongRunStateNow(sessionId, fromConversationId, toConversationId))) {
+    throw new Error('Long-run execution projection refused the recovery rebind');
   }
   // Provider-generated draft text is disposable; the durable reply obligation above is not.
   retireGoalDraftsFor(fromConversationId, true);
