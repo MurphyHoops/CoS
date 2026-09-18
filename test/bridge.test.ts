@@ -140,6 +140,7 @@ const {
   requestWorkerRevivals,
   spawn,
   stageMessages,
+  stageWorkerContinuation,
   pendingWorkerSpawns,
   onSwarmPersistNow,
   persistCriticalSwarmNow,
@@ -154,6 +155,15 @@ const {
 } = await import(
   '../src/main/agents.js'
 );
+const {
+  cancelLongRunNow,
+  ensureRecoveryWorkNow,
+  leaseLongRunWorkNow,
+  longRunStatus,
+  markLongRunWorkQueuedNow,
+  noteLongRunProgressNow,
+  resetLongRunStateForTests
+} = await import('../src/main/session/long-run.js');
 const { makeTempDir, removeTempDir, SAMPLE_BRIEF, faultGate } = await import('./helpers.js');
 const { resumeBootstrapText } = await import('../src/main/session/handoff.js');
 const { beginSelfHealingEpisode, setSelfHealingRecoveryHooksForTests } = await import('../src/main/session/self-healing.js');
@@ -315,6 +325,49 @@ async function waitForRevival(): Promise<{ id: string; conversationId: string }>
   return revival!;
 }
 
+async function prepareLongRunWorkerRevival(
+  conversationId: string,
+  text: string
+): Promise<{
+  sessionId: string;
+  workId: string;
+  inputId: string;
+  revivalId: string;
+  runId: string;
+}> {
+  await pair();
+  spawn({ workers: [{ task: 'sleep until the long-run supervisor resumes this worker' }], caller: { conversationId: PRIME_CHAT } });
+  const bootstrap = await redeem();
+  await request('POST', '/commands/ack', {
+    body: { id: bootstrap.id, status: 'sent', conversationId, agent: 'worker-1' }
+  });
+  finishAgent({ conversationId }, 'initial worker turn is complete');
+
+  const session = await createSession({ title: 'Long-run worker bridge race', conversationId });
+  const work = await ensureRecoveryWorkNow(session.id, conversationId, 'bridge-final-delivery-race', 'source-turn');
+  expect(work).not.toBeNull();
+  const leased = await leaseLongRunWorkNow(session.id, conversationId);
+  expect(leased?.work.inputId).toEqual(expect.any(String));
+  const inputId = leased!.work.inputId!;
+
+  const staged = stageWorkerContinuation(conversationId, inputId, text);
+  expect(staged).not.toBeNull();
+  expect(await persistCriticalSwarmNow()).toBe(true);
+  staged!.commit();
+  expect(await markLongRunWorkQueuedNow(session.id, leased!.work.id, leased!.ticket, inputId)).toBe(true);
+  expect(staged!.waking).toEqual(['worker-1']);
+  requestWorkerRevivals(staged!.waking, staged!.runId);
+  const revival = await waitForRevival();
+
+  return {
+    sessionId: session.id,
+    workId: leased!.work.id,
+    inputId,
+    revivalId: revival.id,
+    runId: staged!.runId
+  };
+}
+
 /**
  * The one page the app opened, redeeming the one command it was opened for.
  *
@@ -393,6 +446,7 @@ beforeEach(async () => {
   // just emptied — the previous test's cleanup showing up as the next test's first command.
   resetSwarm();
   resetBridgeForTests();
+  resetLongRunStateForTests();
   opened.length = 0;
   anonymousRedeemIndex = 0;
   // The app opens the chat itself, always: there is no queue for a tab to come and ask.
@@ -3543,6 +3597,130 @@ describe('delivering a bootstrap', () => {
     expect(swarmState().agents.find((agent) => agent.id === 'worker-1')?.state).toBe('active');
     // The browser already typed this as a real user message; it is acknowledgement-only now.
     expect(offerMessages('worker-1')).toEqual([]);
+  });
+
+  it('revokes a long-run worker wake that is stopped while its broker claim fsync is paused', async () => {
+    const conversationId = 'b1b1b1b1-7654-4210-8edc-ba9876543210';
+    const fixture = await prepareLongRunWorkerRevival(
+      conversationId,
+      'This continuation must never reach the browser after Stop wins the broker-fsync race.'
+    );
+
+    const gate = faultGate();
+    let writes = 0;
+    onSwarmPersistNow(async (snapshot) => {
+      writes++;
+      if (writes === 1) await gate.hold();
+      await writeDurableNow('swarm', snapshot);
+    });
+    try {
+      const redeeming = request('POST', '/commands/redeem', {
+        body: { id: fixture.revivalId, client: 'tab-stop-during-broker-fsync', conversationId }
+      });
+      await gate.entered;
+
+      expect(await cancelLongRunNow(fixture.sessionId, conversationId, 'manual Stop won during broker fsync')).toBe(true);
+      expect(longRunStatus(fixture.sessionId).work?.state).toBe('cancelled');
+
+      gate.release();
+      const reply = await redeeming;
+      expect(reply.status).toBe(404);
+      expect(reply.body).toMatchObject({ error: 'no_such_command' });
+      expect(reply.body.command).toBeUndefined();
+
+      await vi.waitFor(() => {
+        expect(pendingCommands().some((entry) => entry.id === fixture.revivalId)).toBe(false);
+        expect(pendingWorkerRevivals()).toEqual([]);
+      });
+      const worker = swarmStateForCaller({ conversationId: PRIME_CHAT }).agents.find((agent) => agent.id === 'worker-1');
+      expect(worker).toMatchObject({ state: 'sleeping', revivable: true, pending: 0 });
+      expect(snapshotSwarm()?.agents.find((entry) => entry.info.id === 'worker-1')?.queue).toEqual([]);
+    } finally {
+      gate.release();
+      onSwarmPersistNow((snapshot) => writeDurableNow('swarm', snapshot));
+    }
+  });
+
+  it('keeps revoked long-run worker custody ambiguous when authority changes during command-lease fsync', async () => {
+    const conversationId = 'b2b2b2b2-7654-4210-8edc-ba9876543210';
+    const fixture = await prepareLongRunWorkerRevival(
+      conversationId,
+      'This continuation crosses only the durable browser-lease boundary before authority changes.'
+    );
+    const client = 'tab-authority-revoked-during-command-lease';
+    const durable = await import('../src/main/durable.js');
+    const originalWrite = durable.writeDurableNow;
+    const gate = faultGate();
+    let heldLease = false;
+    const write = vi.spyOn(durable, 'writeDurableNow').mockImplementation(async (name, value) => {
+      if (!heldLease && name === 'bridge-commands') {
+        const row = (value as any)?.commands?.find((entry: any) =>
+          entry?.id === fixture.revivalId && entry?.phase === 'leased' && entry?.owner === client
+        );
+        if (row) {
+          heldLease = true;
+          await gate.hold();
+        }
+      }
+      return originalWrite(name, value);
+    });
+
+    try {
+      const redeeming = request('POST', '/commands/redeem', {
+        body: { id: fixture.revivalId, client, conversationId }
+      });
+      await gate.entered;
+
+      expect(await noteLongRunProgressNow(
+        fixture.sessionId,
+        conversationId,
+        Date.now() + 1_000,
+        'new-certified-worker-turn',
+        'mcp'
+      )).toBe(true);
+      expect(longRunStatus(fixture.sessionId).work?.state).toBe('fulfilled');
+
+      gate.release();
+      const reply = await redeeming;
+      expect(reply.status).toBe(409);
+      expect(reply.body).toMatchObject({ error: 'command_authority_revoked', final: true });
+      expect(reply.body.command).toBeUndefined();
+
+      const held = pendingCommands().find((entry) => entry.id === fixture.revivalId);
+      expect(held).toBeTruthy();
+      await flushDurable();
+      const durableAfterLease = await readDurable<any>('bridge-commands');
+      expect(durableAfterLease?.commands?.find((entry: any) => entry?.id === fixture.revivalId)).toMatchObject({
+        phase: 'leased',
+        owner: client
+      });
+      expect(swarmState().agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+        state: 'waking',
+        revivable: false,
+        pending: 1
+      });
+
+      // Model the first HTTP response being lost. A same-owner retry must not reinterpret stale
+      // authority as proof that the browser never received text: preserve the exact command and
+      // broker row under their original bounded deadline, and never expose payload again.
+      const retry = await request('POST', '/commands/redeem', {
+        body: { id: fixture.revivalId, client, conversationId }
+      });
+      expect(retry.status).toBe(409);
+      expect(retry.body).toMatchObject({ error: 'command_authority_revoked', final: true });
+      expect(retry.body.command).toBeUndefined();
+      expect(pendingCommands().some((entry) => entry.id === fixture.revivalId)).toBe(true);
+      const durableAfterRetry = await readDurable<any>('bridge-commands');
+      expect(durableAfterRetry?.commands?.find((entry: any) => entry?.id === fixture.revivalId)).toMatchObject({
+        phase: 'leased',
+        owner: client
+      });
+      expect(snapshotSwarm()?.agents.find((entry) => entry.info.id === 'worker-1')?.queue.map((row) => row.id))
+        .toEqual([fixture.inputId]);
+    } finally {
+      gate.release();
+      write.mockRestore();
+    }
   });
 
   it('returns no revival payload when the browser wake claim itself is not durable, then retries safely', async () => {
