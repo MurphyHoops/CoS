@@ -7,6 +7,9 @@ const mocks = vi.hoisted(() => ({
   runCommand: vi.fn(),
   goalSwitchFor: vi.fn(),
   agentInfoForOwnedConversation: vi.fn(),
+  persistCriticalSwarmNow: vi.fn(),
+  requestWorkerRevivals: vi.fn(),
+  stageWorkerContinuation: vi.fn(),
   backgroundExecObligations: vi.fn(),
   execOwner: vi.fn(),
   enqueueInput: vi.fn(),
@@ -17,7 +20,12 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../src/main/exec.js', () => ({ runCommand: mocks.runCommand }));
 vi.mock('../src/main/goal.js', () => ({ goalSwitchFor: mocks.goalSwitchFor }));
-vi.mock('../src/main/agents.js', () => ({ agentInfoForOwnedConversation: mocks.agentInfoForOwnedConversation }));
+vi.mock('../src/main/agents.js', () => ({
+  agentInfoForOwnedConversation: mocks.agentInfoForOwnedConversation,
+  persistCriticalSwarmNow: mocks.persistCriticalSwarmNow,
+  requestWorkerRevivals: mocks.requestWorkerRevivals,
+  stageWorkerContinuation: mocks.stageWorkerContinuation
+}));
 vi.mock('../src/main/codex/ownership.js', () => ({
   backgroundExecObligations: mocks.backgroundExecObligations,
   execOwner: mocks.execOwner
@@ -52,6 +60,9 @@ beforeEach(async () => {
 
   mocks.goalSwitchFor.mockReturnValue({ enabled: false, mode: 'goal', own: true, afterTurn: false });
   mocks.agentInfoForOwnedConversation.mockReturnValue(null);
+  mocks.persistCriticalSwarmNow.mockResolvedValue(true);
+  mocks.requestWorkerRevivals.mockReturnValue(1);
+  mocks.stageWorkerContinuation.mockReturnValue(null);
   mocks.backgroundExecObligations.mockReturnValue({ running: [], exitedUnread: [] });
   mocks.execOwner.mockReturnValue(null);
   mocks.enqueueInput.mockResolvedValue({ state: 'queued' });
@@ -131,8 +142,23 @@ describe('local long-run supervisor', () => {
     expect(mocks.enqueueInput.mock.calls[0]?.[0]?.text).toContain('completed with conclusion success');
   });
 
-  it('continues a recovered worker even when Goal is off', async () => {
-    mocks.agentInfoForOwnedConversation.mockReturnValue({ id: 'worker-1', role: 'worker' });
+  it('continues a recovered worker through the durable revival broker even when Goal is off', async () => {
+    mocks.agentInfoForOwnedConversation.mockReturnValue({
+      id: 'worker-1',
+      role: 'worker',
+      runId: 'run-1',
+      primeConversationId: 'prime-conversation',
+      state: 'sleeping'
+    });
+    const commit = vi.fn();
+    const rollback = vi.fn();
+    mocks.stageWorkerContinuation.mockImplementation((_conversationId: string, stableId: string) => ({
+      messages: [{ id: stableId }],
+      waking: ['worker-1'],
+      runId: 'run-1',
+      commit,
+      rollback
+    }));
     mocks.getSession.mockResolvedValue({
       id: SESSION,
       conversationId: CHAT,
@@ -143,11 +169,52 @@ describe('local long-run supervisor', () => {
 
     await pollLongRunRuntime(work!.createdAt + 90_001);
 
-    expect(mocks.enqueueInput).toHaveBeenCalledTimes(1);
+    expect(mocks.enqueueInput).not.toHaveBeenCalled();
+    expect(mocks.stageWorkerContinuation).toHaveBeenCalledTimes(1);
+    expect(mocks.stageWorkerContinuation).toHaveBeenCalledWith(
+      CHAT,
+      expect.any(String),
+      expect.stringContaining('CLF-CONTINUE')
+    );
+    const stableId = mocks.stageWorkerContinuation.mock.calls[0]?.[1];
+    expect(stableId).toBe(longRunStatus(SESSION).work?.inputId);
+    expect(mocks.persistCriticalSwarmNow).toHaveBeenCalledTimes(1);
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(rollback).not.toHaveBeenCalled();
+    expect(mocks.requestWorkerRevivals).toHaveBeenCalledWith(['worker-1'], 'run-1');
     expect(longRunStatus(SESSION).work).toMatchObject({
       id: work!.id,
       reason: 'recovery_resume',
       state: 'queued'
+    });
+  });
+
+  it('does not bypass the agent broker while a worker is still active', async () => {
+    mocks.agentInfoForOwnedConversation.mockReturnValue({
+      id: 'worker-1',
+      role: 'worker',
+      runId: 'run-1',
+      primeConversationId: 'prime-conversation',
+      state: 'active'
+    });
+    mocks.getSession.mockResolvedValue({
+      id: SESSION,
+      conversationId: CHAT,
+      recovery: null,
+      origin: { kind: 'worker' }
+    });
+    mocks.stageWorkerContinuation.mockReturnValue(null);
+    const work = await ensureRecoveryWorkNow(SESSION, CHAT, 'recovery:episode:active');
+
+    await pollLongRunRuntime(work!.createdAt + 90_001);
+
+    expect(mocks.enqueueInput).not.toHaveBeenCalled();
+    expect(mocks.stageWorkerContinuation).toHaveBeenCalledTimes(1);
+    expect(mocks.persistCriticalSwarmNow).not.toHaveBeenCalled();
+    expect(mocks.requestWorkerRevivals).not.toHaveBeenCalled();
+    expect(longRunStatus(SESSION).work).toMatchObject({
+      id: work!.id,
+      state: 'dispatching'
     });
   });
 
