@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   agentInfoForOwnedConversation: vi.fn(),
   persistCriticalSwarmNow: vi.fn(),
   requestWorkerRevivals: vi.fn(),
+  retireWorkerContinuationIfUnsent: vi.fn(),
   stageWorkerContinuation: vi.fn(),
   backgroundExecObligations: vi.fn(),
   execOwner: vi.fn(),
@@ -26,6 +27,7 @@ vi.mock('../src/main/agents.js', () => ({
   agentInfoForOwnedConversation: mocks.agentInfoForOwnedConversation,
   persistCriticalSwarmNow: mocks.persistCriticalSwarmNow,
   requestWorkerRevivals: mocks.requestWorkerRevivals,
+  retireWorkerContinuationIfUnsent: mocks.retireWorkerContinuationIfUnsent,
   stageWorkerContinuation: mocks.stageWorkerContinuation
 }));
 vi.mock('../src/main/codex/ownership.js', () => ({
@@ -40,7 +42,10 @@ const { initDurableStore, resetDurableForTests } = await import('../src/main/dur
 const {
   armLongRunWaitNow,
   ensureRecoveryWorkNow,
+  leaseLongRunWorkNow,
   longRunStatus,
+  markLongRunWorkQueuedNow,
+  noteLongRunProgressNow,
   resetLongRunStateForTests
 } = await import('../src/main/session/long-run.js');
 const {
@@ -65,6 +70,7 @@ beforeEach(async () => {
   mocks.agentInfoForOwnedConversation.mockReturnValue(null);
   mocks.persistCriticalSwarmNow.mockResolvedValue(true);
   mocks.requestWorkerRevivals.mockReturnValue(1);
+  mocks.retireWorkerContinuationIfUnsent.mockReturnValue('absent');
   mocks.stageWorkerContinuation.mockReturnValue(null);
   mocks.backgroundExecObligations.mockReturnValue({ running: [], exitedUnread: [] });
   mocks.execOwner.mockReturnValue(null);
@@ -190,6 +196,51 @@ describe('local long-run supervisor', () => {
       reason: 'recovery_resume',
       state: 'queued'
     });
+  });
+
+  it('reconciles a revoked provably-unsent worker continuation out of the durable broker', async () => {
+    mocks.agentInfoForOwnedConversation.mockReturnValue({
+      id: 'worker-1',
+      role: 'worker',
+      runId: 'run-1',
+      primeConversationId: 'prime-conversation',
+      state: 'sleeping'
+    });
+    mocks.getSession.mockResolvedValue({
+      id: SESSION,
+      conversationId: CHAT,
+      recovery: null,
+      origin: { kind: 'worker' }
+    });
+    mocks.retireWorkerContinuationIfUnsent.mockReturnValue('retired');
+
+    const work = await ensureRecoveryWorkNow(SESSION, CHAT, 'recovery:episode:cleanup');
+    const leased = await leaseLongRunWorkNow(SESSION, CHAT);
+    expect(leased?.work.inputId).toEqual(expect.any(String));
+    expect(await markLongRunWorkQueuedNow(
+      SESSION,
+      leased!.work.id,
+      leased!.ticket,
+      leased!.work.inputId!
+    )).toBe(true);
+    expect(await noteLongRunProgressNow(
+      SESSION,
+      CHAT,
+      work!.createdAt + 1,
+      'certified-new-turn',
+      'mcp'
+    )).toBe(true);
+    expect(longRunStatus(SESSION).work?.state).toBe('fulfilled');
+
+    await pollLongRunRuntime(work!.createdAt + 2);
+
+    expect(mocks.retireWorkerContinuationIfUnsent).toHaveBeenCalledWith(
+      CHAT,
+      leased!.work.inputId!,
+      expect.stringContaining('is fulfilled')
+    );
+    expect(mocks.persistCriticalSwarmNow).toHaveBeenCalledTimes(1);
+    expect(mocks.enqueueInput).not.toHaveBeenCalled();
   });
 
   it('parks worker continuation debt while multi-agent mode is disabled', async () => {
