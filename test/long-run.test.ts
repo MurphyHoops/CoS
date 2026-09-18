@@ -74,6 +74,13 @@ describe('durable long-run authority', () => {
     const ticket = captureExecutionTicket(SESSION, CHAT_A)!;
     expect(await resolveLongRunWaitNow(SESSION, wait.id, ticket, 'timer resolved')).toBe(true);
 
+    // Resolution may beat provider-turn completion. The source executor stays fenced until a
+    // distinct continuation turn becomes durable, otherwise an immediately-resolved CI/timer
+    // can hand authority back to the same polling turn we deliberately cut.
+    expect(anyLongRunWaitActive()).toBe(true);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, sourceTurnId)).toBe(true);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, 'turn-continuation')).toBe(false);
+
     const leased = await leaseLongRunWorkNow(SESSION, CHAT_A);
     expect(leased?.work.inputId).toEqual(expect.any(String));
     expect(await markLongRunWorkQueuedNow(
@@ -82,6 +89,8 @@ describe('durable long-run authority', () => {
       leased!.ticket,
       leased!.work.inputId!
     )).toBe(true);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, sourceTurnId)).toBe(true);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, 'turn-continuation')).toBe(false);
 
     expect(await noteLongRunProgressNow(
       SESSION,
