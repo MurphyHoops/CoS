@@ -193,7 +193,7 @@ async function dispatchWork(work: WorkObligation, now: number): Promise<void> {
       dueAt: Date.now(),
       model: null,
       reasoningEffort: null
-    });
+    }, undefined, leased.work.id);
   } catch (error) {
     // The obligation stays dispatching with the same stable input id. A later pass retries the
     // idempotent enqueue; if the outbox already committed before a lost response it returns the
