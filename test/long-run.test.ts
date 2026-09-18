@@ -10,6 +10,7 @@ import {
   deferLongRunWaitNow,
   ensureRecoveryWorkNow,
   executionEpochFor,
+  executionTicketCurrent,
   leaseLongRunWorkNow,
   longRunStatus,
   markLongRunWorkQueuedNow,
@@ -308,6 +309,82 @@ describe('durable long-run authority', () => {
     expect(longRunStatus(SESSION).work?.state).toBe('owed');
     expect(await noteLongRunProgressNow(SESSION, CHAT_A, Date.now() + 2, 'turn-recovered', 'mcp')).toBe(true);
     expect(longRunStatus(SESSION).work?.state).toBe('fulfilled');
+  });
+
+  it('survives repeated wait, restart, dispatch, progress and carrier migration generations without duplicate authority', async () => {
+    let conversationId = CHAT_A;
+    const stableInputs = new Set<string>();
+    let lastGeneration = 0;
+
+    for (let cycle = 0; cycle < 24; cycle++) {
+      const wait = await armLongRunWaitNow({
+        sessionId: SESSION,
+        conversationId,
+        sourceTurnId: `lifetime-source-${cycle}`,
+        kind: 'timer',
+        dueAt: Date.now() + 60_000 + cycle
+      });
+      const ticket = captureExecutionTicket(SESSION, conversationId)!;
+      expect(ticket.generation).toBeGreaterThan(lastGeneration);
+      lastGeneration = ticket.generation;
+
+      expect(await resolveLongRunWaitNow(
+        SESSION,
+        wait.id,
+        ticket,
+        `lifetime wait ${cycle} resolved`
+      )).toBe(true);
+
+      const leased = await leaseLongRunWorkNow(SESSION, conversationId);
+      const duplicateLease = await leaseLongRunWorkNow(SESSION, conversationId);
+      expect(leased?.work.inputId).toEqual(expect.any(String));
+      expect(duplicateLease?.work.inputId).toBe(leased?.work.inputId);
+      expect(stableInputs.has(leased!.work.inputId!)).toBe(false);
+      stableInputs.add(leased!.work.inputId!);
+
+      // Crash/restart between durable lease and publication must recover the same work identity,
+      // never mint a sibling continuation.
+      const snapshot = snapshotLongRunState();
+      resetLongRunStateForTests();
+      restoreLongRunState(snapshot);
+      const replay = await leaseLongRunWorkNow(SESSION, conversationId);
+      expect(replay?.work.inputId).toBe(leased?.work.inputId);
+      expect(replay?.ticket).toEqual(leased?.ticket);
+
+      expect(await markLongRunWorkQueuedNow(
+        SESSION,
+        replay!.work.id,
+        replay!.ticket,
+        replay!.work.inputId!
+      )).toBe(true);
+      expect(await noteLongRunProgressNow(
+        SESSION,
+        conversationId,
+        replay!.work.createdAt + 1_000 + cycle,
+        `lifetime-resume-${cycle}`,
+        'mcp'
+      )).toBe(true);
+      expect(longRunStatus(SESSION).work?.state).toBe('fulfilled');
+
+      // Periodically replace the disposable conversation carrier. The ticket from the prior
+      // executor must lose authority immediately while the single durable session continues.
+      if (cycle % 4 === 3) {
+        const nextConversation = conversationId === CHAT_A ? CHAT_B : CHAT_A;
+        const stale = captureExecutionTicket(SESSION, conversationId)!;
+        expect(await moveLongRunStateNow(SESSION, conversationId, nextConversation)).toBe(true);
+        expect(executionTicketCurrent(stale)).toBe(false);
+        conversationId = nextConversation;
+        lastGeneration = executionEpochFor(SESSION)!.generation;
+      }
+
+      const state = snapshotLongRunState();
+      expect(state.epochs).toHaveLength(1);
+      expect(state.obligations).toHaveLength(1);
+      expect(state.waits).toHaveLength(1);
+    }
+
+    expect(stableInputs).toHaveLength(24);
+    expect(executionEpochFor(SESSION)?.conversationId).toBe(conversationId);
   });
 
   it('Stop revokes wait and continuation authority by advancing the epoch', async () => {
