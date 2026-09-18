@@ -15,6 +15,7 @@ import {
   stageWorkerContinuation
 } from '../agents.js';
 import { goalSwitchFor } from '../goal.js';
+import { getConfig } from '../config.js';
 import { logInfo, logWarn } from '../logger.js';
 import { backgroundExecObligations, execOwner } from '../codex/ownership.js';
 import { enqueueInput } from './input.js';
@@ -198,6 +199,9 @@ async function dispatchWork(work: WorkObligation, now: number): Promise<void> {
   const agent = agentInfoForOwnedConversation(work.conversationId);
 
   if (agent?.role === 'worker') {
+    // Turning multi-agent mode off is an explicit user authority boundary. Keep the durable debt
+    // parked rather than waking a worker through an internal path the public broker has disabled.
+    if (!getConfig().multiAgent.enabled) return;
     // Worker chats have their own durable wake transaction and configured slot limit. Never
     // bypass that broker by dropping an ordinary after-turn browser input into a sleeping worker.
     // The long-run input UUID is reused as the broker message id, closing the crash window where
@@ -206,11 +210,12 @@ async function dispatchWork(work: WorkObligation, now: number): Promise<void> {
     try {
       staged = stageWorkerContinuation(work.conversationId, inputId, text);
     } catch (error) {
-      // NO_FREE_SLOT, an in-flight finish/transfer, or another broker arbitration condition is
-      // transient. Keep the same dispatching obligation and stable id for a later local pass.
-      logWarn(
-        `long-run: worker continuation for ${work.sessionId} will retry — ${error instanceof Error ? error.message : String(error)}`
-      );
+      // These are ordinary broker backpressure states, not faults. The five-second supervisor
+      // loop simply leaves the same stable obligation parked until the slot/transaction clears.
+      const detail = error instanceof Error ? error.message : String(error);
+      if (!/NO_FREE_SLOT|REVIVE_IN_PROGRESS|FINISH_IN_PROGRESS|OWNER_TRANSITION_IN_PROGRESS|switched off/i.test(detail)) {
+        logWarn(`long-run: worker continuation for ${work.sessionId} will retry — ${detail}`);
+      }
       return;
     }
     // An active/detached worker is still executing the turn that registered the wait, or has not
