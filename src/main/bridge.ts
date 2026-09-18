@@ -3927,6 +3927,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         return json(res, 404, { error: 'no_such_command' }, origin);
       }
       if (!revivalLongRunAuthorityCurrent(revival)) {
+        // A durable browser owner means an earlier redeem crossed the command-lease boundary.
+        // Its HTTP response may have been lost after payload disclosure, so stale long-run
+        // authority cannot prove this wake was unsent. Preserve the exact command + broker row as
+        // ambiguous custody until the existing deadline/reconciliation path settles it.
+        if (command.owner !== null) {
+          return json(res, 409, { error: 'command_authority_revoked', final: true }, origin);
+        }
         await cleanupRevokedLongRunRevival(revival, 'its durable long-run authority was revoked before browser redeem');
         retire(command, 'its durable long-run authority was revoked before browser redeem');
         requestWorkerRevivals([command.spec.agent], command.spec.runId);
@@ -5380,9 +5387,12 @@ async function persistRevivalRedeem(
     }
 
     // Stop/progress may have revoked the long-run obligation while the broker fsync above was
-    // in flight. No browser payload has escaped yet, so roll the claim back before proceeding.
+    // in flight. Before any command lease exists, no browser payload has escaped and the claim
+    // can be rolled back. A same-owner retry may already have a durable lease from an earlier
+    // response, however; that is ambiguous custody and must never be rolled back.
     const afterBroker = revivalFor(command.spec.agent, command.spec.runId);
     if (!afterBroker || !revivalLongRunAuthorityCurrent(afterBroker)) {
+      if (command.owner !== null) return 'authority-stale-after-lease';
       if (rollbackWorkerRevivalClaim(command.spec.agent, command.spec.conversationId, command.spec.runId)) {
         try {
           await persistCriticalSwarmNow();
