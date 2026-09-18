@@ -63,6 +63,15 @@ export function registerLongRunWaitTool(reg: SurfaceRegistrar): void {
     }
 
     if (!input.kind) return fail('action=arm requires kind.');
+    // The source provider turn is the causality boundary for this wait. Without a durable turn id
+    // the old turn's eventual final cannot be distinguished from the future continuation, so fail
+    // closed and let the model retry this one idempotent admission after recorder attribution lands.
+    if (!session.activeTurnId) {
+      return fail(
+        'WAIT_TURN_ID_PENDING: this turn is not durably identified yet, so no external wait was armed. ' +
+        'Retry session_wait once; do not start a polling loop or run replacement work.'
+      );
+    }
     if (input.kind === 'github_run') {
       if (!input.repository || !repoPattern.test(input.repository) || !input.run_id) {
         return fail('github_run requires repository=owner/repo and run_id.');
