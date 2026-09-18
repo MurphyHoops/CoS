@@ -249,16 +249,33 @@ export async function armLongRunWaitNow(input: ArmLongRunWaitInput): Promise<Lon
     }
     if (input.kind === 'github_run') {
       if (!input.repository || !/^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(input.repository) ||
-          !Number.isSafeInteger(input.runId) || Number(input.runId) <= 0) throw new Error('long_run_github_wait_invalid');
+          typeof input.runId !== 'number' || !Number.isSafeInteger(input.runId) || input.runId <= 0) {
+        throw new Error('long_run_github_wait_invalid');
+      }
     } else if (input.kind === 'process') {
-      if (!Number.isSafeInteger(input.processId) || Number(input.processId) <= 0) throw new Error('long_run_process_wait_invalid');
+      if (typeof input.processId !== 'number' || !Number.isSafeInteger(input.processId) || input.processId <= 0) {
+        throw new Error('long_run_process_wait_invalid');
+      }
     } else if (input.kind === 'timer') {
-      if (!Number.isSafeInteger(input.dueAt) || Number(input.dueAt) <= Date.now()) throw new Error('long_run_timer_wait_invalid');
+      if (typeof input.dueAt !== 'number' || !Number.isSafeInteger(input.dueAt) || input.dueAt <= Date.now()) {
+        throw new Error('long_run_timer_wait_invalid');
+      }
     }
 
     const beforeEpoch = epochs.get(input.sessionId);
     const beforeWork = obligations.get(input.sessionId);
     const beforeWait = waits.get(input.sessionId);
+    if (beforeWait?.state === 'waiting') {
+      const sameTarget =
+        beforeWait.conversationId === input.conversationId &&
+        beforeWait.kind === input.kind &&
+        (input.kind !== 'github_run' ||
+          (beforeWait.repository === input.repository && beforeWait.runId === input.runId)) &&
+        (input.kind !== 'process' || beforeWait.processId === input.processId) &&
+        (input.kind !== 'timer' || beforeWait.dueAt === input.dueAt);
+      if (sameTarget) return cloneWait(beforeWait);
+      throw new Error('long_run_wait_already_active');
+    }
     const epoch = epochForWrite(input.sessionId, input.conversationId, true);
     const now = Date.now();
     const obligation: WorkObligation = {
