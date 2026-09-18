@@ -749,7 +749,8 @@ export async function noteLongRunProgressNow(
   conversationId: string,
   progressAt: number,
   turnId: string | null,
-  evidence: 'mcp' | 'terminal'
+  evidence: 'mcp' | 'terminal',
+  requestId: string | null = null
 ): Promise<boolean> {
   return serial(async () => {
     const epoch = epochs.get(sessionId);
@@ -761,8 +762,14 @@ export async function noteLongRunProgressNow(
     // Recovery continuation is proven only by a new local MCP call. A provider final can be the
     // short "recovered" answer that exposed the original liveness bug and must not erase debt.
     if (work.reason === 'recovery_resume' && evidence !== 'mcp') return false;
-    if ((work.reason === 'wait_resolved' || work.reason === 'wait_failed') &&
-        work.sourceTurnId && (!turnId || turnId === work.sourceTurnId)) return false;
+    if (work.reason === 'wait_resolved' || work.reason === 'wait_failed') {
+      // The continuation must cross the same causal boundary that gates tool admission. A rejected
+      // late MCP request from the old workflow is still recorded for history, but it is evidence
+      // about the source executor—not proof that the queued continuation ran.
+      if (work.sourceTurnId && (!turnId || turnId === work.sourceTurnId)) return false;
+      if (evidence === 'mcp' && work.sourceRequestId &&
+          (!requestId || requestId === work.sourceRequestId)) return false;
+    }
 
     const before = cloneWork(work);
     obligations.set(sessionId, { ...work, state: 'fulfilled', updatedAt: Date.now() });
