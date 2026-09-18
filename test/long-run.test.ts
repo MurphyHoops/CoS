@@ -62,6 +62,26 @@ describe('durable long-run authority', () => {
     expect(longRunWaitBlocksTools(SESSION, CHAT_A)).toBe(false);
   });
 
+  it('uses the exact source request id after resolution even when recorder turn state is already closed', async () => {
+    const sourceRequestId = 'wfr-wait-source-request';
+    const wait = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-request-source',
+      sourceRequestId,
+      kind: 'timer',
+      dueAt: Date.now() + 1_000
+    });
+    const ticket = captureExecutionTicket(SESSION, CHAT_A)!;
+    expect(await resolveLongRunWaitNow(SESSION, wait.id, ticket, 'timer resolved')).toBe(true);
+
+    // Recorder may already have cleared activeTurnId by the time a delayed old MCP request lands.
+    // Exact request identity keeps that old workflow fenced while a new continuation request may run.
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, null, sourceRequestId)).toBe(true);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, null, null)).toBe(true);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, null, 'wfr-continuation-request')).toBe(false);
+  });
+
   it('does not let the source provider turn fulfill its own resolved wait debt', async () => {
     const sourceTurnId = 'turn-causal-source';
     const wait = await armLongRunWaitNow({
