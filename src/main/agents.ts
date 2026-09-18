@@ -1536,9 +1536,9 @@ function enqueue(to: Agent, message: AgentMessage): void {
   recount(to);
 }
 
-function newMessage(from: string, to: string, text: string): AgentMessage {
+function newMessage(from: string, to: string, text: string, stableId?: string): AgentMessage {
   return {
-    id: randomUUID().slice(0, 8),
+    id: stableId ?? randomUUID().slice(0, 8),
     from,
     to,
     time: Date.now(),
@@ -1589,9 +1589,18 @@ export interface StagedAgentMessages {
  * queued, including how much room each recipient has left, so a batch either lands complete
  * or changes nothing. Two messages to the same worker keep their written order.
  */
-export function stageMessages(
+interface AgentMessageRequest {
+  to: string;
+  text: string;
+  /** Internal-only stable identity for crash-safe app-owned continuations. */
+  id?: string;
+  /** Internal-only exact worker chat fence; never exposed through the agents MCP schema. */
+  expectedConversationId?: string;
+}
+
+function stageMessagesInternal(
   caller: Caller,
-  items: ReadonlyArray<{ to: string; text: string }>
+  items: ReadonlyArray<AgentMessageRequest>
 ): StagedAgentMessages {
   if (items.length === 0) throw new AgentError('No messages were given');
   if (items.length > MAX_BATCH_MESSAGES) {
@@ -1618,9 +1627,49 @@ export function stageMessages(
   }
 }
 
+export function stageMessages(
+  caller: Caller,
+  items: ReadonlyArray<{ to: string; text: string }>
+): StagedAgentMessages {
+  return stageMessagesInternal(caller, items);
+}
+
+/**
+ * App-owned continuation for one exact worker chat.
+ *
+ * The message id is supplied by the long-run obligation and therefore survives a crash between
+ * the broker's fsync and the long-run ledger's queued receipt. This is deliberately not part of
+ * the model-facing agents schema: only the local supervisor can mint this authority.
+ *
+ * Returns null while the worker is still actively executing its previous turn; the supervisor
+ * retries after the normal worker lifecycle puts it to sleep. Sleeping workers go through the
+ * ordinary slot reservation + waking transaction.
+ */
+export function stageWorkerContinuation(
+  conversationId: string,
+  stableMessageId: string,
+  text: string
+): (StagedAgentMessages & { runId: string }) | null {
+  const info = agentInfoForOwnedConversation(conversationId);
+  if (!info || info.role !== 'worker' || !info.primeConversationId || !info.runId) return null;
+  if (info.state === 'active' || info.state === 'invited' || info.state === 'detached') return null;
+  if (!/^[0-9a-f-]{8,64}$/i.test(stableMessageId)) {
+    throw new AgentError('Invalid durable worker-continuation message id.');
+  }
+  const staged = stageMessagesInternal(
+    { conversationId: info.primeConversationId },
+    [{ to: info.id, text, id: stableMessageId, expectedConversationId: conversationId }]
+  );
+  const runId = currentRunId(info.primeConversationId);
+  if (!runId) {
+    staged.rollback();
+    throw new AgentError('Worker continuation lost its run while staging.');
+  }
+  return { ...staged, runId };
+}
 function stageMessagesActive(
   caller: Caller,
-  items: ReadonlyArray<{ to: string; text: string }>,
+  items: ReadonlyArray<AgentMessageRequest>,
   resumedDormant: boolean
 ): StagedAgentMessages {
   const run = runForConversation(caller.conversationId);
@@ -1640,7 +1689,7 @@ function stageMessagesActive(
     );
   }
 
-  const planned: Array<{ to: Agent; message: AgentMessage }> = [];
+  const planned: Array<{ to: Agent; message: AgentMessage; fresh: boolean }> = [];
   const perRecipient = new Map<string, number>();
   /** Sleeping recipients this batch is about to wake, and therefore about to take a slot for. */
   const reserved = new Set<Agent>();
@@ -1667,6 +1716,35 @@ function stageMessagesActive(
       );
     }
     assertRoute(from, to);
+    if (item.expectedConversationId && to.info.conversationId !== item.expectedConversationId) {
+      throw new AgentError(`${toId} moved to another conversation before its durable continuation could be staged.`);
+    }
+    const stableId = item.id?.trim();
+    if (stableId && !/^[0-9a-f-]{8,64}$/i.test(stableId)) {
+      throw new AgentError(`Invalid internal message id${where}.`);
+    }
+    const existing = stableId ? to.queue.find((message) => message.id === stableId) : undefined;
+    if (existing) {
+      if (existing.from !== from.info.id || existing.to !== to.info.id || existing.text !== trimmed) {
+        throw new AgentError(`MESSAGE_ID_CONFLICT: durable message ${stableId} already names different work${where}.`);
+      }
+      // The exact broker row already crossed an earlier acceptance barrier. A retry may still
+      // need to reserve/re-request the sleeping worker, but it must never enqueue a second row.
+      if (to.info.state === 'sleeping') {
+        if (!to.info.conversationId) {
+          throw new AgentError(`${toId} is asleep but this app never learned which chat it is in, so it cannot be woken${where}.`);
+        }
+        if (!reserved.has(to) && freeWorkerSlots(run?.runId) - reserved.size <= 0) {
+          throw new AgentError(
+            `NO_FREE_SLOT: ${toId} is asleep and all ${getConfig().multiAgent.maxWorkers} worker slots are busy, so it ` +
+              `cannot be woken right now${where}. Nothing was sent. Wait for a worker to report and try again.`
+          );
+        }
+        reserved.add(to);
+      }
+      planned.push({ to, message: existing, fresh: false });
+      continue;
+    }
     if (isOver(to.info.state)) {
       throw new AgentError(
         to.info.state === 'failed'
@@ -1675,11 +1753,8 @@ function stageMessagesActive(
             `${where}. Spawn a new worker for this work.`
       );
     }
-    // A revival already crossing the browser is its own in-flight transaction, exactly like a
-    // spawn or a finish, and for the same reason: this call's `waking` list is what causes the
-    // browser to be asked for anything at all. A second message would see the worker already
-    // reserved, report nothing to wake, and be durably queued behind a revival that may yet
-    // roll back to `sleeping` — leaving the prime's words in a chat nothing is going to open.
+    // A revival already crossing the browser is its own in-flight transaction. Ordinary model
+    // messages are refused; an internal stable-id retry above is the only idempotent exception.
     if (to.info.state === 'waking') {
       throw new AgentError(
         `REVIVE_IN_PROGRESS: ${toId} is being woken right now${where}. Nothing was sent; send this again once it is ` +
@@ -1692,10 +1767,6 @@ function stageMessagesActive(
           `${toId} is asleep but this app never learned which chat it is in, so it cannot be woken${where}.`
         );
       }
-      // Waking is the one send that needs capacity, because the recipient is not running. The
-      // slot is reserved here, synchronously, so two messages to two sleeping workers cannot
-      // both be told the same last slot is theirs. Refused rather than queued: a message that
-      // sits unread in a chat nobody is going to open is worse than being told to wait.
       if (!reserved.has(to) && freeWorkerSlots(run?.runId) - reserved.size <= 0) {
         throw new AgentError(
           `NO_FREE_SLOT: ${toId} is asleep and all ${getConfig().multiAgent.maxWorkers} worker slots are busy, so it ` +
@@ -1704,15 +1775,14 @@ function stageMessagesActive(
       }
       reserved.add(to);
     }
-    // Counted per recipient across the batch: three messages to one worker with two slots
-    // left has to be refused here, not half-delivered and then refused by enqueue.
     const already = perRecipient.get(to.info.id) ?? 0;
     assertRoom(to, already + 1);
     perRecipient.set(to.info.id, already + 1);
-    planned.push({ to, message: newMessage(from.info.id, to.info.id, trimmed) });
+    planned.push({ to, message: newMessage(from.info.id, to.info.id, trimmed, stableId), fresh: true });
   }
 
-  for (const { to, message } of planned) {
+  for (const { to, message, fresh } of planned) {
+    if (!fresh) continue;
     unpublishedMessages.add(message);
     enqueue(to, message);
   }
@@ -1725,12 +1795,15 @@ function stageMessagesActive(
   const recipients = [...new Set(planned.map(({ to }) => to))];
   return {
     messages,
-    waking: [...reserved].map((agent) => agent.info.id),
+    waking: [...new Set([
+      ...[...reserved].map((agent) => agent.info.id),
+      ...planned.filter(({ to, fresh }) => !fresh && to.info.state === 'waking').map(({ to }) => to.info.id)
+    ])],
     commit: () => {
       if (settled) return;
       settled = true;
       if (!run || !runProjectionStillOwned(run)) return;
-      for (const { message } of planned) unpublishedMessages.delete(message);
+      for (const { message, fresh } of planned) if (fresh) unpublishedMessages.delete(message);
       for (const recipient of recipients) recount(recipient);
       // No new durable fact: the exact queue entries were already in the snapshot that crossed
       // the acceptance barrier. This only publishes them to live inbox readers and the UI.
@@ -1740,7 +1813,8 @@ function stageMessagesActive(
       if (settled) return;
       settled = true;
       if (!run || !runProjectionStillOwned(run)) return;
-      for (const { to, message } of planned) {
+      for (const { to, message, fresh } of planned) {
+        if (!fresh) continue;
         unpublishedMessages.delete(message);
         const index = to.queue.indexOf(message);
         if (index >= 0) to.queue.splice(index, 1);
