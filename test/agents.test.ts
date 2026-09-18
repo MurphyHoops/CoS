@@ -97,6 +97,11 @@ const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurab
 const { findSessionByConversation, initSessionStore, readRecentEvents, resetSessionStoreForTests } = await import(
   '../src/main/session/store.js'
 );
+const {
+  ensureRecoveryWorkNow,
+  leaseLongRunWorkNow,
+  resetLongRunStateForTests
+} = await import('../src/main/session/long-run.js');
 const { recordChatObservations, resetRecorderForTests } = await import('../src/main/session/recorder.js');
 const { resetWorkspaces, setWorkspaceFor, workspaceForChat } = await import('../src/main/workspace.js');
 const { DEFAULT_CAPABILITIES } = await import('../src/shared/types.js');
@@ -129,6 +134,7 @@ afterAll(async () => {
 beforeEach(() => {
   resetAgentsForTests();
   resetRecorderForTests();
+  resetLongRunStateForTests();
   resetWorkspaces();
   // The real app wires the broker's immediate persistence sink during startup. MCP endpoint
   // tests exercise that production contract rather than an intentionally half-wired broker;
@@ -970,7 +976,10 @@ describe('durable worker continuation broker', () => {
     startSwarm(1);
     const worker = startWorker('worker-1');
     finishAgent(worker.caller, 'first piece complete');
-    const stableId = '11111111-2222-4333-8444-555555555555';
+    const work = await ensureRecoveryWorkNow('session-worker-continuation', 'c-worker-1', 'recovery:broker-stable-id');
+    const leased = await leaseLongRunWorkNow('session-worker-continuation', 'c-worker-1');
+    expect(leased?.work.id).toBe(work?.id);
+    const stableId = leased!.work.inputId!;
     const text = 'Resume the same durable worker task after the external wait.';
 
     const first = stageWorkerContinuation('c-worker-1', stableId, text)!;
