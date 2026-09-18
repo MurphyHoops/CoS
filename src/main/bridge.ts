@@ -8757,15 +8757,20 @@ function revivalFor(agent: string, runId: string): WorkerRevival | null {
   return pendingWorkerRevivals().find((revival) => revival.id === agent && revival.runId === runId) ?? null;
 }
 
+function revivalAuthorityMessageIds(revival: WorkerRevival): readonly string[] {
+  return revival.authorityMessageIds ?? revival.messageIds;
+}
+
 function revivalLongRunAuthorityCurrent(revival: WorkerRevival): boolean {
-  return revival.messageIds.every(
+  const authority = revivalAuthorityMessageIds(revival);
+  return authority.length > 0 && authority.every(
     (messageId) => longRunMessageAuthority(messageId, revival.conversationId) !== 'stale'
   );
 }
 
 async function cleanupRevokedLongRunRevival(revival: WorkerRevival, reason: string): Promise<void> {
   let retiredAny = false;
-  for (const messageId of revival.messageIds) {
+  for (const messageId of revivalAuthorityMessageIds(revival)) {
     if (longRunMessageAuthority(messageId, revival.conversationId) !== 'stale') continue;
     if (retireWorkerContinuationIfUnsent(revival.conversationId, messageId, reason) === 'retired') {
       retiredAny = true;
