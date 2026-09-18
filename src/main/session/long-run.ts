@@ -304,12 +304,15 @@ export function longRunWaitBlocksTools(
     (work!.reason !== 'wait_resolved' && work!.reason !== 'wait_failed') ||
     (work!.state !== 'owed' && work!.state !== 'dispatching' && work!.state !== 'queued')
   ) return false;
-  // New waits pin the exact ChatGPT workflow id. A late request from the source turn remains
-  // fenced even after the recorder has already closed that turn, while the first call from the
-  // continuation's new request id is admitted immediately. Legacy snapshots without this field
-  // retain the older activeTurnId fallback rather than silently widening authority.
-  if (work!.sourceRequestId) return !requestId || requestId === work!.sourceRequestId;
-  return !!work!.sourceTurnId && activeTurnId === work!.sourceTurnId;
+  // New waits pin both the exact ChatGPT workflow id and the durable provider turn. Either
+  // witness is sufficient to prove that the old executor still owns this call: request identity
+  // catches a late source workflow after the recorder has closed the turn, while activeTurnId
+  // catches a same-turn call that arrives under a different request id. A continuation is admitted
+  // only after both identities have moved on. Legacy snapshots without request identity retain the
+  // activeTurnId fence rather than silently widening authority.
+  const sameSourceRequest = !!work!.sourceRequestId && (!requestId || requestId === work!.sourceRequestId);
+  const sameSourceTurn = !!work!.sourceTurnId && activeTurnId === work!.sourceTurnId;
+  return work!.sourceRequestId ? sameSourceRequest || sameSourceTurn : sameSourceTurn;
 }
 
 export type LongRunMessageAuthority = 'unmanaged' | 'current' | 'stale';
