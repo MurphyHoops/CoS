@@ -396,6 +396,14 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
     if (row.finishOwner && !terminal(row) && !(await finishInputCurrent(row)))
       return { ...row, state: 'cancelled', error: 'Automatic follow-up cancelled because its active turn or setting changed.' };
     if (row.purpose === 'decision') return row;
+    // Long-run continuations carry their own execution epoch. If newer certified progress,
+    // Stop, or a rebind revoked that authority before native Send/tool delivery, retire the
+    // provably-unsent row instead of leaving a permanent ghost in the outbox.
+    if (row.longRunObligationId &&
+        (row.state === 'queued' || (row.state === 'browser' && row.sendAuthorizedAt === undefined)) &&
+        !(await longRunInputCurrent(row))) {
+      return { ...row, state: 'cancelled', error: 'Automatic continuation retired because durable execution authority advanced.' };
+    }
     if (row.state === 'queued' && row.delivery === 'tool' && row.toolTurnId) {
       const session = row.sessionId ? await getSession(row.sessionId) : null;
       const activity = session ? deliveryHooks?.activity?.(session) : null;
