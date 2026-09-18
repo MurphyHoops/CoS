@@ -5396,12 +5396,27 @@ async function persistRevivalRedeem(
     const afterBroker = revivalFor(command.spec.agent, command.spec.runId);
     if (!afterBroker || !revivalLongRunAuthorityCurrent(afterBroker)) {
       if (command.owner !== null) return 'authority-stale-after-lease';
-      if (rollbackWorkerRevivalClaim(command.spec.agent, command.spec.conversationId, command.spec.runId)) {
+      const rolledBack = rollbackWorkerRevivalClaim(
+        command.spec.agent,
+        command.spec.conversationId,
+        command.spec.runId
+      );
+      if (rolledBack) {
         try {
           await persistCriticalSwarmNow();
         } catch (err) {
           logWarn(
             `bridge: could not persist authority-revocation rollback for ${specKey(command.spec)} — ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+        if (afterBroker) {
+          // afterBroker still names the exact authority rows that were present while this browser
+          // claim was in flight. Once the claim is rolled back, no payload can have escaped, so a
+          // revoked long-run row is provably unsent and may be retired. Recomputing revivalFor()
+          // here would lose that stale UUID because planning correctly filters revoked rows.
+          await cleanupRevokedLongRunRevival(
+            afterBroker,
+            'its durable long-run authority was revoked while the browser claim fsync was pending'
           );
         }
       }
