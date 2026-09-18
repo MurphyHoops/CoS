@@ -88,7 +88,11 @@ import {
 import { requestCorrelation } from '../session/correlation.js';
 import { BLOCKED_CHAT_REFUSAL, anyChatBlocked, isChatBlocked } from '../session/blocked-chats.js';
 import { anyContinuationOpen, compactingConversation } from '../session/continuation.js';
-import { anyLongRunWaitActive, longRunWaitBlocksTools } from '../session/long-run.js';
+import {
+  anyLongRunWaitActive,
+  longRunSourceRequestFenced,
+  longRunWaitBlocksTools
+} from '../session/long-run.js';
 import { anyRecoveryFenceActive, recoveryFenceActive } from '../session/recovery-fence.js';
 import { acknowledgeBackgroundExecOutput, backgroundExecRecoveryNotices, offerBackgroundExecOutput } from '../codex/ownership.js';
 import { DEFAULT_MAX_OUTPUT_TOKENS } from '../codex/unified-exec-constants.js';
@@ -655,15 +659,17 @@ async function dispatchTracked(
   const longRunSession = name !== 'session_wait' && context.caller.sessionId && context.caller.conversationId
     ? await getSession(context.caller.sessionId).catch(() => null)
     : null;
+  const longRunRequestBoundary = longRunSourceRequestFenced(context.caller.requestId);
   const longRunBoundaryBefore =
-    !!context.caller.sessionId &&
-    !!context.caller.conversationId &&
-    longRunWaitBlocksTools(
-      context.caller.sessionId,
-      context.caller.conversationId,
-      longRunSession?.activeTurnId ?? null,
-      context.caller.requestId
-    );
+    longRunRequestBoundary ||
+    (!!context.caller.sessionId &&
+      !!context.caller.conversationId &&
+      longRunWaitBlocksTools(
+        context.caller.sessionId,
+        context.caller.conversationId,
+        longRunSession?.activeTurnId ?? null,
+        context.caller.requestId
+      ));
   // session_wait status/cancel are the only calls allowed to cross an existing wait boundary.
   // They still do not inherit ordinary broker/input side effects while that boundary is active.
   const longRunWaitArmed = name !== 'session_wait' && longRunBoundaryBefore;
@@ -867,14 +873,15 @@ async function dispatchTracked(
     ? await getSession(context.caller.sessionId).catch(() => null)
     : null;
   const longRunBoundaryAfter =
-    !!context.caller.sessionId &&
-    !!context.caller.conversationId &&
-    longRunWaitBlocksTools(
-      context.caller.sessionId,
-      context.caller.conversationId,
-      longRunSessionAfter?.activeTurnId ?? null,
-      context.caller.requestId
-    );
+    longRunSourceRequestFenced(context.caller.requestId) ||
+    (!!context.caller.sessionId &&
+      !!context.caller.conversationId &&
+      longRunWaitBlocksTools(
+        context.caller.sessionId,
+        context.caller.conversationId,
+        longRunSessionAfter?.activeTurnId ?? null,
+        context.caller.requestId
+      ));
   // This call is the best evidence there is that the previous result reached the agent's
   // conversation, so anything offered then can be retired and written to its history —
   // except what was offered on a finish result, which this call may itself be the model's
