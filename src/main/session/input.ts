@@ -876,7 +876,13 @@ export function noteInputStartupError(id: string, error: string | null): Promise
 async function eligibleStageEnd(entry: InputEntry): Promise<string | null> {
   if (!entry.sessionId) return null;
   const session = await getSession(entry.sessionId);
-  if (!session || session.origin?.kind === 'worker') return null;
+  if (!session) return null;
+  // Ordinary outbox work never authors a worker chat. A long-run continuation is different:
+  // it is app-owned execution debt for this exact durable worker session, and its own authority
+  // is rechecked here and again at claim/Send. This lets a slept worker receive the one
+  // continuation that restarts its same task without inventing a Prime->Worker broker message.
+  if (session.origin?.kind === 'worker' && !entry.longRunObligationId) return null;
+  if (entry.longRunObligationId && !(await longRunInputCurrent(entry))) return null;
   const [end] = await readRecentEvents(entry.sessionId, 1, { kinds: ['turn_start', 'turn_end'] });
   // A later native final cannot erase an actual busy rejection. Keep this
   // existing delay for the exact source turn until its native retry is due.
@@ -905,7 +911,11 @@ async function eligibleStageEnd(entry: InputEntry): Promise<string | null> {
   if (session.activeTurnId) return null;
   // A failure releases manual input immediately. Automatic follow-ups require
   // the confirmed refresh ticket above; only a real completion bypasses it.
-  if (end?.kind !== 'turn_end' || end.outcome !== 'completed' || !end.turnId || end.time < entry.createdAt) return null;
+  if (end?.kind !== 'turn_end' || end.outcome !== 'completed' || !end.turnId) return null;
+  // Normal after-turn rows are promises made before the turn ends, so an older completion is
+  // never their authority. Long-run rows are created *because* an external condition resolved
+  // after that turn already ended; their durable obligation is the missing temporal proof.
+  if (!entry.longRunObligationId && end.time < entry.createdAt) return null;
   if (!(await sessionInputPolicy(entry.sessionId)).settled) return null;
   return end.turnId;
 }
