@@ -52,16 +52,25 @@ export function registerLongRunWaitTool(reg: SurfaceRegistrar): void {
     // with session_wait status (or repeated arm calls). Cancel is the sole escape hatch because
     // it explicitly revokes the durable wait and resumes this executor.
     const held = longRunStatus(caller.sessionId);
-    const sourceWaitStillActive =
-      held.wait?.state === 'waiting' &&
-      held.work?.state === 'waiting' &&
-      !!held.work.sourceRequestId &&
-      held.work.sourceRequestId === caller.requestId;
-    if (sourceWaitStillActive && input.action !== 'cancel') {
-      return fail(
-        'WAIT_ARMED_FINISH_TURN: this provider turn already handed its external wait to CoS. ' +
-        'Do not poll status or repeat arm from this turn. Finish the turn now; use session_wait cancel only if you intend to revoke the wait.'
-      );
+    const sourceWaitWork =
+      held.work &&
+      (held.work.reason === 'wait_resolved' || held.work.reason === 'wait_failed') &&
+      held.work.sourceRequestId === caller.requestId &&
+      held.work.state !== 'cancelled'
+        ? held.work
+        : null;
+    if (sourceWaitWork) {
+      const cancellable = sourceWaitWork.state === 'waiting' ||
+        sourceWaitWork.state === 'owed' ||
+        sourceWaitWork.state === 'dispatching' ||
+        sourceWaitWork.state === 'queued';
+      if (input.action !== 'cancel' || !cancellable) {
+        return fail(
+          sourceWaitWork.state === 'fulfilled'
+            ? 'WAIT_SOURCE_RETIRED: a newer continuation already certified takeover of this durable task. This retired source turn cannot inspect, cancel, or re-arm its old wait. End this turn.'
+            : 'WAIT_ARMED_FINISH_TURN: this provider turn already handed its external wait to CoS. Do not poll status or repeat arm from this turn. Finish the turn now; use session_wait cancel only if you intend to revoke the still-pending wait.'
+        );
+      }
     }
 
     if (input.action === 'status') {
