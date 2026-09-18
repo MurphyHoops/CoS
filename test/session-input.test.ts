@@ -126,7 +126,7 @@ describe('durable user input ownership', () => {
     expect(await claimBrowserInput(row.id, 'ordinary-page', binding.conversationId, true)).toBeNull();
   });
 
-  it('delivers durable long-run continuation into the same worker chat after its prior turn settled', async () => {
+  it('keeps worker long-run continuation out of the ordinary browser outbox', async () => {
     binding.origin = 'worker';
     binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'worker-wait-source', time: 900 };
     now = 1_000;
@@ -134,21 +134,16 @@ describe('durable user input ownership', () => {
     const leased = await leaseLongRunWorkNow(sessionId, binding.conversationId);
     const row = await enqueueInput(input({
       id: leased!.work.inputId!,
-      text: 'Resume the same worker task after the local wait',
+      text: 'This row must never bypass the agent revival broker',
       mode: 'after-turn'
     }), undefined, work!.id);
 
-    expect(await pendingBrowserInputs()).toEqual([
-      expect.objectContaining({ id: row.id, conversationId: binding.conversationId })
-    ]);
-    const claim = await claimBrowserInput(row.id, 'worker-wait-page', binding.conversationId, true);
-    expect(claim).toMatchObject({ id: row.id, completedTurnId: 'worker-wait-source' });
-    expect(await authorizeBrowserInput(row.id, 'worker-wait-page', binding.conversationId)).toBe(true);
-    expect(await acknowledgeBrowserInput(row.id, 'worker-wait-page', binding.conversationId, 'worker-wait-message')).toBe(true);
     expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({
-      state: 'sent',
-      messageId: 'worker-wait-message'
+      state: 'queued',
+      longRunObligationId: work!.id
     });
+    expect(await pendingBrowserInputs()).toEqual([]);
+    expect(await claimBrowserInput(row.id, 'worker-wait-page', binding.conversationId, true)).toBeNull();
   });
 
   it('retires a provably-unsent long-run continuation after certified progress revokes its authority', async () => {
