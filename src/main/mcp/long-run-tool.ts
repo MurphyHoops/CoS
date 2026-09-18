@@ -63,6 +63,11 @@ export function registerLongRunWaitTool(reg: SurfaceRegistrar): void {
     }
 
     if (!input.kind) return fail('action=arm requires kind.');
+    if (!caller.requestId) {
+      return failIdentity(
+        'WAIT_REQUEST_ID_PENDING: this provider turn has no exact MCP request identity yet, so no external wait was armed. Retry session_wait once; no wait state changed.'
+      );
+    }
     // The source provider turn is the causality boundary for this wait. Without a durable turn id
     // the old turn's eventual final cannot be distinguished from the future continuation, so fail
     // closed and let the model retry this one idempotent admission after recorder attribution lands.
@@ -104,6 +109,7 @@ export function registerLongRunWaitTool(reg: SurfaceRegistrar): void {
       sessionId: caller.sessionId,
       conversationId: caller.conversationId,
       sourceTurnId: session.activeTurnId,
+      sourceRequestId: caller.requestId,
       kind: input.kind,
       repository: input.kind === 'github_run' ? input.repository! : null,
       runId: input.kind === 'github_run' ? input.run_id! : null,
