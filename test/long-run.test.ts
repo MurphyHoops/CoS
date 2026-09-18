@@ -164,6 +164,14 @@ describe('durable long-run authority', () => {
       'wfr-continuation'
     )).toBe(true);
     expect(longRunStatus(SESSION).work?.state).toBe('fulfilled');
+    // Fulfilment proves the new continuation took over; it does not resurrect the retired source.
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, sourceTurnId, sourceRequestId)).toBe(true);
+    expect(longRunWaitBlocksTools(
+      SESSION,
+      CHAT_A,
+      'turn-continuation',
+      'wfr-continuation'
+    )).toBe(false);
   });
 
   it('turns a resolved external wait into one stable continuation obligation', async () => {
