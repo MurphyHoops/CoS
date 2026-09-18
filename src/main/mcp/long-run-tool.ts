@@ -47,6 +47,23 @@ export function registerLongRunWaitTool(reg: SurfaceRegistrar): void {
       return fail('This conversation no longer owns the durable session. No wait state was changed.');
     }
 
+    // Once this exact provider request has armed a wait, it has surrendered ordinary execution
+    // authority. Do not let it keep the provider turn alive by replacing gh/write_stdin polling
+    // with session_wait status (or repeated arm calls). Cancel is the sole escape hatch because
+    // it explicitly revokes the durable wait and resumes this executor.
+    const held = longRunStatus(caller.sessionId);
+    const sourceWaitStillActive =
+      held.wait?.state === 'waiting' &&
+      held.work?.state === 'waiting' &&
+      !!held.work.sourceRequestId &&
+      held.work.sourceRequestId === caller.requestId;
+    if (sourceWaitStillActive && input.action !== 'cancel') {
+      return fail(
+        'WAIT_ARMED_FINISH_TURN: this provider turn already handed its external wait to CoS. ' +
+        'Do not poll status or repeat arm from this turn. Finish the turn now; use session_wait cancel only if you intend to revoke the wait.'
+      );
+    }
+
     if (input.action === 'status') {
       const status = longRunStatus(caller.sessionId);
       return {
