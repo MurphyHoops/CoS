@@ -146,6 +146,7 @@ import {
   primeConversationGone,
   primeConversation,
   requestWorkerRevivals,
+  retireWorkerContinuationIfUnsent,
   rollbackWorkerRevivalClaim,
   releaseQuiescentRun,
   retiredWorkerForConversation,
@@ -213,7 +214,12 @@ import { conversationHasMcpCallSince } from './session/store.js';
 import { sessionWorkingAt } from '../shared/session-activity.js';
 import { requestCorrelation } from './session/correlation.js';
 import { bindAgentWorkspace } from './workspace.js';
-import { cancelLongRunNow, longRunWorkFor, noteLongRunProgressNow } from './session/long-run.js';
+import {
+  cancelLongRunNow,
+  longRunMessageAuthority,
+  longRunWorkFor,
+  noteLongRunProgressNow
+} from './session/long-run.js';
 
 /** Fixed candidates so the extension can find the app without being told a port. */
 export const DEFAULT_PORTS = [8765, 8766, 8767, 8768, 8769];
@@ -5280,7 +5286,13 @@ async function persistCommandLease(
   });
 }
 
-type RevivalRedeemResult = 'ok' | 'stale' | 'taken' | 'broker-not-durable' | 'lease-not-durable';
+type RevivalRedeemResult =
+  | 'ok'
+  | 'stale'
+  | 'authority-stale-after-lease'
+  | 'taken'
+  | 'broker-not-durable'
+  | 'lease-not-durable';
 
 /**
  * Makes `/commands/redeem` the wake arbitration cut, including process crashes.
@@ -5319,7 +5331,8 @@ async function persistRevivalRedeem(
     // Re-check after waiting for a prior redeemer. An MCP call is allowed to win only before
     // the browser-owned broker claim is installed.
     const revival = revivalFor(command.spec.agent, command.spec.runId);
-    if (!revival || revival.conversationId !== command.spec.conversationId) return 'stale';
+    if (!revival || revival.conversationId !== command.spec.conversationId ||
+        !revivalLongRunAuthorityCurrent(revival)) return 'stale';
     if (!claimWorkerRevival(command.spec.agent, command.spec.conversationId, command.spec.runId)) return 'stale';
 
     let brokerDurable = false;
@@ -5347,6 +5360,22 @@ async function persistRevivalRedeem(
       return 'broker-not-durable';
     }
 
+    // Stop/progress may have revoked the long-run obligation while the broker fsync above was
+    // in flight. No browser payload has escaped yet, so roll the claim back before proceeding.
+    const afterBroker = revivalFor(command.spec.agent, command.spec.runId);
+    if (!afterBroker || !revivalLongRunAuthorityCurrent(afterBroker)) {
+      if (rollbackWorkerRevivalClaim(command.spec.agent, command.spec.conversationId, command.spec.runId)) {
+        try {
+          await persistCriticalSwarmNow();
+        } catch (err) {
+          logWarn(
+            `bridge: could not persist authority-revocation rollback for ${specKey(command.spec)} — ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+      }
+      return 'stale';
+    }
+
     if (!(await persistCommandLease(command, client, claimedAt))) {
       // Do NOT roll the broker claim back here. It is already the authoritative durable cut.
       // Keeping the worker browser-owned prevents an MCP call from taking the queued text while
@@ -5354,6 +5383,16 @@ async function persistRevivalRedeem(
       // owner remains the only one allowed to finish the wake.
       if (command.owner && command.owner !== client) return 'taken';
       return 'lease-not-durable';
+    }
+
+    // The command lease is now durable but the HTTP response has still not exposed the payload.
+    // Re-check once more to close the Stop/progress race during that second fsync. Do not roll
+    // back here: a same-owner prior redeem may already have received the text, so the lease is
+    // ambiguous custody. Keeping it inert until its existing deadline is safer than pretending
+    // that potentially delivered work can be unsent.
+    const afterLease = revivalFor(command.spec.agent, command.spec.runId);
+    if (!afterLease || !revivalLongRunAuthorityCurrent(afterLease)) {
+      return 'authority-stale-after-lease';
     }
     return 'ok';
   } finally {
