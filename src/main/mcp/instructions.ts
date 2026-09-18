@@ -123,7 +123,7 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform): string {
     'Use update_plan for tasks with several meaningful steps; skip it for simple tasks. Give each step a short user-facing headline and concrete details about the approach, constraints or checks. Send the complete plan on every update, preserving useful details. Keep at most one step in_progress.',
     'Update the plan when a step is completed or the approach changes. Mark steps completed only when their work is done. Do not repeat the full plan in chat: the app shows the headlines with expandable details above queued messages.',
     'The plan does not execute steps or mark queued instructions done. New user instructions extend the work; update the plan accordingly.',
-    'For GitHub Actions, long background processes, or deliberate timer waits that may outlive the current provider turn, call session_wait directly once (not through code mode) and finish the turn. The local CoS supervisor monitors the registered condition and queues one continuation. After session_wait arms the wait, ordinary tools in that executor are fenced until the wait resolves or session_wait cancels it; do not retry polling gh run view, write_stdin, sleep, or equivalent status commands.'
+    'For GitHub Actions, background processes, or timer waits that may outlive this provider turn, call session_wait directly once, then finish the turn. CoS monitors it and queues one continuation. After arm, this executor's ordinary tools are fenced until resolution or cancel; do not poll gh run view, write_stdin, sleep, or equivalents.'
   );
   if (agentTools) lines.push(
     '',
