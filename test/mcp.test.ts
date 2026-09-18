@@ -3180,6 +3180,96 @@ describe('durable wait admission over MCP', () => {
     expect(textOf(fresh)).toContain('note line 1');
   });
 
+  it('does not let a fulfilled wait source request revive itself through session_wait control', async () => {
+    ctx.sessionTools = true;
+    const conversationId = 'wait-fulfilled-retired-source';
+    const summary = await createSession({ title: 'fulfilled retired source', conversationId });
+    const now = Date.now();
+    const sourceRequestId = 'wfr_wait_fulfilled_source';
+    const obligationId = 'obligation-wait-fulfilled-source';
+    restoreLongRunState({
+      version: 1,
+      savedAt: now,
+      epochs: [{
+        sessionId: summary.id,
+        conversationId,
+        generation: 1,
+        updatedAt: now
+      }],
+      obligations: [{
+        id: obligationId,
+        sessionId: summary.id,
+        conversationId,
+        epochGeneration: 1,
+        reason: 'wait_resolved',
+        state: 'fulfilled',
+        sourceTurnId: 'turn-fulfilled-source',
+        sourceRequestId,
+        source: 'timer:test',
+        inputId: '00000000-0000-4000-8000-000000000001',
+        result: 'timer resolved',
+        createdAt: now - 2_000,
+        updatedAt: now,
+        issuedAt: now - 1_000
+      }],
+      waits: [{
+        id: 'wait-fulfilled-source-contract',
+        sessionId: summary.id,
+        conversationId,
+        epochGeneration: 1,
+        obligationId,
+        kind: 'timer',
+        repository: null,
+        runId: null,
+        processId: null,
+        dueAt: now - 1_500,
+        description: 'fulfilled source retirement test',
+        state: 'resolved',
+        attempts: 0,
+        nextCheckAt: now - 1_500,
+        lastError: null,
+        result: 'timer resolved',
+        createdAt: now - 2_000,
+        updatedAt: now - 1_500
+      }]
+    });
+    expect(observeRequestCorrelation({
+      requestId: sourceRequestId,
+      conversationId,
+      sessionId: summary.id,
+      messageId: 'msg-wait-fulfilled-source',
+      tool: 'session_wait',
+      observedAt: Date.now()
+    })).toBe('stored');
+
+    for (const action of ['status', 'cancel'] as const) {
+      const retired = await modern(
+        'tools/call',
+        { name: 'session_wait', arguments: { action } },
+        { 'x-request-id': `${sourceRequestId}/att1` }
+      );
+      expect(failed(retired)).toBe(true);
+      expect(textOf(retired)).toContain('WAIT_SOURCE_RETIRED');
+    }
+
+    const newRequestId = 'wfr_wait_fulfilled_new_turn';
+    expect(observeRequestCorrelation({
+      requestId: newRequestId,
+      conversationId,
+      sessionId: summary.id,
+      messageId: 'msg-wait-fulfilled-new',
+      tool: 'session_wait',
+      observedAt: Date.now()
+    })).toBe('stored');
+    const status = await modern(
+      'tools/call',
+      { name: 'session_wait', arguments: { action: 'status' } },
+      { 'x-request-id': `${newRequestId}/att1` }
+    );
+    expect(failed(status), textOf(status)).toBe(false);
+    expect(textOf(status)).toContain('continuation work is fulfilled');
+  });
+
   it('hard-fences ordinary tools while an exact durable wait is armed', async () => {
     ctx.sessionTools = true;
     const conversationId = 'wait-admission-current';
