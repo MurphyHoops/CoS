@@ -266,13 +266,18 @@ export async function armLongRunWaitNow(input: ArmLongRunWaitInput): Promise<Lon
     const beforeWork = obligations.get(input.sessionId);
     const beforeWait = waits.get(input.sessionId);
     if (beforeWait?.state === 'waiting') {
+      // A lost tool response may cause the model to repeat the exact session_wait call. The source
+      // turn and external target are the semantic identity. Timer retries intentionally ignore a
+      // freshly recomputed dueAt, otherwise one transport retry silently extends the deadline.
       const sameTarget =
         beforeWait.conversationId === input.conversationId &&
         beforeWait.kind === input.kind &&
+        beforeWork?.state === 'waiting' &&
+        beforeWait.obligationId === beforeWork.id &&
+        beforeWork.sourceTurnId === input.sourceTurnId &&
         (input.kind !== 'github_run' ||
           (beforeWait.repository === input.repository && beforeWait.runId === input.runId)) &&
-        (input.kind !== 'process' || beforeWait.processId === input.processId) &&
-        (input.kind !== 'timer' || beforeWait.dueAt === input.dueAt);
+        (input.kind !== 'process' || beforeWait.processId === input.processId);
       if (sameTarget) return cloneWait(beforeWait);
       throw new Error('long_run_wait_already_active');
     }
@@ -408,6 +413,10 @@ export async function cancelLongRunNow(
     const heldWait = waits.get(sessionId);
     if (!epoch && !heldWork && !heldWait) return true;
     if (epoch && epoch.conversationId !== conversationId) return false;
+    // Cancellation is also retry-safe: an ACK loss must not manufacture a fresh execution
+    // generation after authority was already revoked.
+    if ((heldWork?.state === 'cancelled' || !heldWork) &&
+        (heldWait?.state === 'cancelled' || !heldWait)) return true;
     const beforeEpoch = epoch ? cloneEpoch(epoch) : null;
     const beforeWork = heldWork ? cloneWork(heldWork) : null;
     const beforeWait = heldWait ? cloneWait(heldWait) : null;
