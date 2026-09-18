@@ -458,9 +458,19 @@ export async function ensureRecoveryWorkNow(
     const beforeWork = obligations.get(sessionId);
     const epoch = epochForWrite(sessionId, conversationId, false);
     const existing = obligations.get(sessionId);
-    if (existing && existing.epochGeneration === epoch.generation && existing.reason === 'recovery_resume' &&
-        existing.source === source && existing.state !== 'cancelled' && existing.state !== 'fulfilled') {
-      return cloneWork(existing);
+    if (existing && existing.epochGeneration === epoch.generation &&
+        existing.state !== 'cancelled' && existing.state !== 'fulfilled') {
+      // A resolved/failed external wait is already the concrete continuation this durable task
+      // owes. Recovery must not replace its CI/process/timer result with a generic "continue"
+      // message. Likewise, once any recovery continuation owns a stable outbox id, replacing it
+      // would create a second delivery identity after an ambiguous enqueue/send boundary.
+      if (existing.reason !== 'recovery_resume' ||
+          existing.state === 'dispatching' || existing.state === 'queued' ||
+          existing.source === source) {
+        return cloneWork(existing);
+      }
+      // An older recovery episode that never reached dispatch may be refreshed below so the new
+      // executor receives a fresh probation clock and source identity.
     }
 
     const now = Date.now();
