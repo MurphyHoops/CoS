@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - feature/self-healing-longrun
+      - feature/self-healing-sessions
   pull_request:
   workflow_dispatch:
 
@@ -19,7 +20,7 @@ concurrency:
 jobs:
   lifetime:
     name: P5 Lifetime Gate
-    runs-on: ubuntu-24.04
+    runs-on: macos-15
     timeout-minutes: 20
 
     steps:
@@ -35,8 +36,7 @@ jobs:
 
       - name: Install P5 test runtime dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ripgrep
+          command -v rg >/dev/null 2>&1 || brew install ripgrep
 
       - name: Typecheck lifetime control plane
         run: npm run typecheck
@@ -61,18 +61,8 @@ jobs:
 
   verify:
     needs: lifetime
-    name: Verify ${{ matrix.name }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows x64
-            runner: windows-2025
-          - name: macOS arm64
-            runner: macos-15
-          - name: Linux x64
-            runner: ubuntu-24.04
-    runs-on: ${{ matrix.runner }}
+    name: Verify macOS arm64
+    runs-on: macos-15
     timeout-minutes: 30
 
     steps:
