@@ -1,4 +1,5 @@
 name: CI
+# P5 long-run exact-head trigger
 
 on:
   push:
