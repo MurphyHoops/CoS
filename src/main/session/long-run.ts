@@ -499,7 +499,13 @@ export async function moveLongRunStateNow(
   return serial(async () => {
     const current = epochs.get(sessionId);
     if (!current) return true;
-    if (current.conversationId === toConversationId) return true;
+    if (current.conversationId === toConversationId) {
+      // This API is a durability barrier, not merely an in-memory move. A previous attempt may
+      // have published B in memory after its fsync failed; an idempotent retry must therefore
+      // write the current snapshot now rather than treating "already B" as proof of durability.
+      await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState());
+      return true;
+    }
     if (current.conversationId !== fromConversationId) return false;
 
     const beforeEpoch = cloneEpoch(current);
