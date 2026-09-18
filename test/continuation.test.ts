@@ -1165,11 +1165,10 @@ describe('a brief that cannot be the whole handoff', () => {
  * clears would make every unrelated new chat wait.
  */
 async function waitForResumeGateCalls(gate: { mock: { calls: unknown[][] } }, count = 2): Promise<void> {
-  // The recorder does real async store I/O before it reaches resumeOpeningChat(), while these
-  // tests deliberately fake setTimeout for the claim window. vi.waitFor() itself uses timers and
-  // is therefore platform-sensitive here; setImmediate stays real and only yields to that I/O.
+  // These tests fake Date only. Keep the scheduler real so recorder disk I/O and its 50ms
+  // settle loop make ordinary event-loop progress on every OS, then move logical time explicitly.
   for (let attempt = 0; attempt < 100 && gate.mock.calls.length < count; attempt += 1) {
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
   }
   expect(gate.mock.calls.length).toBeGreaterThanOrEqual(count);
 }
@@ -1179,18 +1178,17 @@ describe('the window in which a replacement chat is expected', () => {
     const { sessionId, token } = await readyContinuation();
     const destination = '92929292-1111-4222-8333-444444444444';
     await claimContinuationNow(token, 'slow-resume-command');
-    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    vi.useFakeTimers({ toFake: ['Date'] });
     const create = vi.spyOn(store, 'createSession');
     const gate = vi.spyOn(await import('../src/main/session/resume-gate.js'), 'resumeOpeningChat');
     const observation = sessionForConversation(destination);
     await waitForResumeGateCalls(gate);
-    await vi.advanceTimersByTimeAsync(6_000);
+    vi.setSystemTime(Date.now() + 6_000);
 
-    // The command still owns its sixty-second claim. Five seconds without its ACK
+    // The command still owns its sixty-second claim. Six seconds without its ACK
     // cannot authorize a second durable session for the destination.
     expect(resumeOpeningChat()).toBe(true);
     expect(await commitContinuation(token, destination)).toBe(true);
-    await vi.advanceTimersByTimeAsync(50);
     expect(await observation).toBe(sessionId);
     expect(create).not.toHaveBeenCalled();
     expect((await store.findSessionByConversation(destination))?.id).toBe(sessionId);
@@ -1199,13 +1197,16 @@ describe('the window in which a replacement chat is expected', () => {
   it.each(['abort', 'expiry'] as const)('releases unrelated new recording when the resume claim ends by %s', async reason => {
     const { token } = await readyContinuation();
     await claimContinuationNow(token, 'unfinished-resume-command');
-    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    vi.useFakeTimers({ toFake: ['Date'] });
     const unrelated = reason === 'abort' ? '93939393-1111-4222-8333-444444444444' : '94949494-1111-4222-8333-444444444444';
     const gate = vi.spyOn(await import('../src/main/session/resume-gate.js'), 'resumeOpeningChat');
     const observation = sessionForConversation(unrelated);
     await waitForResumeGateCalls(gate);
-    if (reason === 'abort') abortContinuation(token, 'cancelled before destination');
-    await vi.advanceTimersByTimeAsync(reason === 'expiry' ? RESUME_CLAIM_WINDOW_MS + 100 : 100);
+    if (reason === 'abort') {
+      abortContinuation(token, 'cancelled before destination');
+    } else {
+      vi.setSystemTime(Date.now() + RESUME_CLAIM_WINDOW_MS + 100);
+    }
     const sessionId = await observation;
     expect(sessionId).toBeTruthy();
     expect((await getSession(sessionId!))?.conversationId).toBe(unrelated);
