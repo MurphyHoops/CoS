@@ -35,11 +35,18 @@ jobs:
       - name: Typecheck lifetime control plane
         run: npm run typecheck
 
-      - name: Exercise P5 long-run and recovery invariants
+      - name: Soak P5 long-run state machine
+        shell: bash
+        run: |
+          set -euo pipefail
+          for pass in 1 2 3 4; do
+            echo "P5 long-run soak pass $pass/4"
+            npx vitest run test/long-run.test.ts test/long-run-runtime.test.ts
+          done
+
+      - name: Exercise P5 cross-module fault matrix
         run: >
           npx vitest run
-          test/long-run.test.ts
-          test/long-run-runtime.test.ts
           test/self-healing.test.ts
           test/session-input.test.ts
           test/agents.test.ts
