@@ -18,7 +18,7 @@ export { setBrowserWorkArea } from './browser-window-layout.js';
 import { pendingBrowserPreferenceRequest, acknowledgeBrowserPreferences } from './browser-preferences.js';
 import { sessionFinishHeld, releaseSessionFinish, getSessionFinishDraft, sessionFinishWaiting } from './session/finish.js';
 import { observeUsage } from './session/usage.js';
-import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, completeBrowserDecision, listInputs, fileSilenceInput, hasQueuedAfterTurnInput, inputBeforeGoal, pendingQueuedPickups, deferSilenceInput, revokeSilenceInputs } from './session/input.js';
+import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, completeBrowserDecision, listInputs, cancelInput, fileSilenceInput, hasQueuedAfterTurnInput, inputBeforeGoal, pendingQueuedPickups, deferSilenceInput, revokeSilenceInputs } from './session/input.js';
 /**
  * The local bridge between the Chrome extension and this app.
  *
@@ -213,7 +213,7 @@ import { conversationHasMcpCallSince } from './session/store.js';
 import { sessionWorkingAt } from '../shared/session-activity.js';
 import { requestCorrelation } from './session/correlation.js';
 import { bindAgentWorkspace } from './workspace.js';
-import { cancelLongRunNow, noteLongRunProgressNow } from './session/long-run.js';
+import { cancelLongRunNow, longRunWorkFor, noteLongRunProgressNow } from './session/long-run.js';
 
 /** Fixed candidates so the extension can find the app without being told a port. */
 export const DEFAULT_PORTS = [8765, 8766, 8767, 8768, 8769];
@@ -6842,6 +6842,10 @@ async function noteRecoveryObservations(
   if (sessionId && ended?.outcome === 'stopped') {
     await cancelSelfHealingForStopNow(sessionId, conversationId);
     await cancelLongRunNow(sessionId, conversationId, 'manual_stop');
+    const cancelledWork = longRunWorkFor(sessionId);
+    if (cancelledWork?.state === 'cancelled' && cancelledWork.inputId) {
+      await cancelInput(cancelledWork.inputId);
+    }
   }
   const successfulTerminal = activity.terminal && (!ended || ended.outcome === 'completed');
   const softProbation = recorded?.recovery?.phase === 'soft_recovery' &&
