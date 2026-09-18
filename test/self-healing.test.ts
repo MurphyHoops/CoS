@@ -55,6 +55,7 @@ const {
   setGoalSwitchNow
 } = await import('../src/main/goal.js');
 const { resetWorkspaces } = await import('../src/main/workspace.js');
+const { longRunStatus, resetLongRunStateForTests } = await import('../src/main/session/long-run.js');
 const { openContinuationNow } = await import('../src/main/session/continuation.js');
 const { recordChatObservations, resetRecorderForTests, sessionForConversation } = await import('../src/main/session/recorder.js');
 const {
@@ -110,6 +111,7 @@ beforeEach(async () => {
   resetGoalStateForTests();
   resetRecorderForTests();
   resetWorkspaces();
+  resetLongRunStateForTests();
   resetRecoveryFences();
   resetResumeGate();
   resetSessionStoreForTests();
@@ -133,6 +135,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   setSelfHealingRecoveryHooksForTests({});
+  resetLongRunStateForTests();
   resetBridgeForTests();
   resetResumeGate();
   onSwarmPersistNow(null);
@@ -392,6 +395,10 @@ describe('Emergency Resume transaction', () => {
       enabled: beforeSwitch.enabled,
       mode: beforeSwitch.mode,
       afterTurn: beforeSwitch.afterTurn
+    });
+    expect(longRunStatus(session.id)).toMatchObject({
+      epoch: { conversationId: CHAT_B },
+      work: { conversationId: CHAT_B, reason: 'recovery_resume', state: 'owed' }
     });
     expect(recoveryFenceActive(CHAT_A)).toBe(false);
   });
