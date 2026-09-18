@@ -1221,23 +1221,27 @@ async function publishCommittedProjectionDurably(
 ): Promise<boolean> {
   // Session metadata is already authoritative at every call site below. A long-run wait can
   // outlive the continuation WAL retention window, so its execution epoch cannot rely on the
-  // old writeDurableSoon projection being replayed after another crash. Cross this fsync
-  // boundary before the continuation is allowed to publish "committed".
+  // old writeDurableSoon projection being replayed after another crash.
+  let durable = false;
   try {
-    if (!(await moveLongRunStateNow(entry.sessionId, entry.from, toConversationId))) {
+    durable = await moveLongRunStateNow(entry.sessionId, entry.from, toConversationId);
+    if (!durable) {
       logWarn(`continuation ${entry.token.slice(0, 8)} could not move durable long-run authority to ${toConversationId}`);
-      return false;
     }
   } catch (error) {
     logWarn(
       `continuation ${entry.token.slice(0, 8)} long-run projection will retry — ${error instanceof Error ? error.message : String(error)}`
     );
-    return false;
   }
-  publishCommittedProjection(entry, toConversationId, swarm);
-  return true;
-}
 
+  // The canonical session attachment already says B. Rebuildable live projections must follow
+  // that fact even if the extra long-run fsync barrier failed, otherwise Prime/workspace/Goal
+  // authority would stay split across A and B for the rest of this process. The continuation
+  // WAL stays committing until the durability barrier succeeds, so restart/retry repairs the
+  // remaining disk projection without rolling the authoritative A→B move backwards.
+  publishCommittedProjection(entry, toConversationId, swarm);
+  return durable;
+}
 function publishCommittedProjection(
   entry: Continuation,
   toConversationId: string,
@@ -1718,10 +1722,15 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
             );
           }
         }
-        publishCommittedProjection(entry, entry.to, 'recovery');
-        entry.state = 'committed';
-        entry.error = null;
-        logInfo(`continuation ${entry.token.slice(0, 8)} recovered after durable commit`);
+        const longRunDurable = await publishCommittedProjectionDurably(entry, entry.to, 'recovery');
+        if (longRunDurable) {
+          entry.state = 'committed';
+          entry.error = null;
+          logInfo(`continuation ${entry.token.slice(0, 8)} recovered after durable commit`);
+        } else {
+          entry.error = 'Recovered session ownership, but long-run execution authority still needs its durable A→B projection.';
+          logWarn(`continuation ${entry.token.slice(0, 8)} kept its WAL retryable because long-run authority is not durable yet`);
+        }
       } else if (entry.state === 'committing' && session && session.conversationId === entry.from) {
         if (waitingExpired) {
           // The WAL proves the durable session move never landed. Restart must not turn an
