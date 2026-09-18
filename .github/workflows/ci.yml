@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, feature/self-healing-longrun]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
