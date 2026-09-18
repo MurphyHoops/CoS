@@ -234,6 +234,56 @@ describe('durable long-run authority', () => {
     expect(replay?.ticket).toEqual(leased?.ticket);
   });
 
+  it('does not let recovery debt overwrite a resolved external-wait result', async () => {
+    const wait = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-resolved-before-recovery',
+      kind: 'github_run',
+      repository: 'MurphyHoops/UEOT',
+      runId: 35352566122
+    });
+    const ticket = captureExecutionTicket(SESSION, CHAT_A)!;
+    expect(await resolveLongRunWaitNow(
+      SESSION,
+      wait.id,
+      ticket,
+      'GitHub Actions run completed with conclusion success'
+    )).toBe(true);
+    const before = longRunStatus(SESSION).work;
+    expect(before).toMatchObject({
+      state: 'owed',
+      reason: 'wait_resolved',
+      result: 'GitHub Actions run completed with conclusion success'
+    });
+
+    const kept = await ensureRecoveryWorkNow(
+      SESSION,
+      CHAT_A,
+      'recovery:new-episode:2'
+    );
+    expect(kept?.id).toBe(before?.id);
+    expect(longRunStatus(SESSION).work).toMatchObject({
+      id: before?.id,
+      state: 'owed',
+      reason: 'wait_resolved',
+      result: 'GitHub Actions run completed with conclusion success'
+    });
+  });
+
+  it('keeps a stable dispatched recovery input id across a newer recovery episode', async () => {
+    const first = await ensureRecoveryWorkNow(SESSION, CHAT_A, 'recovery:episode:1');
+    const leased = await leaseLongRunWorkNow(SESSION, CHAT_A);
+    expect(leased?.work.id).toBe(first?.id);
+    const inputId = leased?.work.inputId;
+    expect(inputId).toBeTruthy();
+
+    const kept = await ensureRecoveryWorkNow(SESSION, CHAT_A, 'recovery:episode:2');
+    expect(kept?.id).toBe(first?.id);
+    expect(kept?.inputId).toBe(inputId);
+    expect(kept?.state).toBe('dispatching');
+  });
+
   it('does not let recovery continuation debt overwrite an active wait', async () => {
     await armLongRunWaitNow({
       sessionId: SESSION,
