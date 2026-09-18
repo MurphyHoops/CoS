@@ -31,6 +31,7 @@ import {
   thawPrimeTransfer
 } from '../agents.js';
 import { goalObjectiveFor, goalSwitchFor } from '../goal.js';
+import { ensureRecoveryWorkNow } from './long-run.js';
 import { logInfo, logWarn } from '../logger.js';
 import { bindAgentWorkspace } from '../workspace.js';
 import { publishRecoveryRebindProjectionDurably } from './rebind.js';
@@ -701,6 +702,17 @@ async function markRecoveryRecovered(
   conversationId: string,
   recovery: SelfHealingRecoveryState
 ): Promise<boolean> {
+  // Goal/Loop is durable autonomy authority. Before the recovery fence is retired, record that the
+  // same task still owes forward progress in B. The Emergency Resume bootstrap gets a grace
+  // window; if it never makes a new local MCP call, the local long-run supervisor files one stable
+  // continuation instead of letting the recovered conversation become an idle endpoint.
+  if (goalSwitchFor(conversationId).enabled) {
+    await ensureRecoveryWorkNow(
+      sessionId,
+      conversationId,
+      `recovery:${recovery.failureEpisodeId}:${recovery.recoveryGeneration}`
+    );
+  }
   const next: SelfHealingRecoveryState = {
     ...recovery,
     phase: 'recovered',
