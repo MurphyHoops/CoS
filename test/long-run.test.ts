@@ -84,10 +84,12 @@ describe('durable long-run authority', () => {
 
   it('does not let the source provider turn fulfill its own resolved wait debt', async () => {
     const sourceTurnId = 'turn-causal-source';
+    const sourceRequestId = 'wfr-causal-source';
     const wait = await armLongRunWaitNow({
       sessionId: SESSION,
       conversationId: CHAT_A,
       sourceTurnId,
+      sourceRequestId,
       kind: 'timer',
       dueAt: Date.now() + 1_000
     });
@@ -98,8 +100,12 @@ describe('durable long-run authority', () => {
     // distinct continuation turn becomes durable, otherwise an immediately-resolved CI/timer
     // can hand authority back to the same polling turn we deliberately cut.
     expect(anyLongRunWaitActive()).toBe(true);
-    expect(longRunWaitBlocksTools(SESSION, CHAT_A, sourceTurnId)).toBe(true);
-    expect(longRunWaitBlocksTools(SESSION, CHAT_A, 'turn-continuation')).toBe(false);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, sourceRequestId, sourceTurnId)).toBe(true);
+    // Either durable identity still naming the source keeps it fenced.
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, 'wfr-continuation', sourceTurnId)).toBe(true);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, sourceRequestId, 'turn-continuation')).toBe(true);
+    // Only a distinct workflow executing in a distinct provider turn is the continuation.
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, 'wfr-continuation', 'turn-continuation')).toBe(false);
 
     const leased = await leaseLongRunWorkNow(SESSION, CHAT_A);
     expect(leased?.work.inputId).toEqual(expect.any(String));
@@ -109,8 +115,10 @@ describe('durable long-run authority', () => {
       leased!.ticket,
       leased!.work.inputId!
     )).toBe(true);
-    expect(longRunWaitBlocksTools(SESSION, CHAT_A, sourceTurnId)).toBe(true);
-    expect(longRunWaitBlocksTools(SESSION, CHAT_A, 'turn-continuation')).toBe(false);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, sourceRequestId, sourceTurnId)).toBe(true);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, 'wfr-continuation', sourceTurnId)).toBe(true);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, sourceRequestId, 'turn-continuation')).toBe(true);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A, 'wfr-continuation', 'turn-continuation')).toBe(false);
 
     expect(await noteLongRunProgressNow(
       SESSION,
