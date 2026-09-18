@@ -349,7 +349,10 @@ export async function deferLongRunWaitNow(
     const before = cloneWait(wait);
     const next = {
       ...wait,
-      attempts: wait.attempts + 1,
+      // attempts is the consecutive monitor-failure budget. A successful observation that merely
+      // says "still pending" resets that budget; otherwise a long healthy CI run would make one
+      // later transient gh/process error look like the sixth failure.
+      attempts: error ? wait.attempts + 1 : 0,
       nextCheckAt: Math.max(Date.now(), nextCheckAt),
       lastError: clip(error, 500),
       updatedAt: Date.now()
