@@ -29,6 +29,7 @@ import {
 
 const LONG_RUN_POLL_MS = 5_000;
 const RECOVERY_CONTINUATION_GRACE_MS = 90_000;
+const WAIT_PENDING_MS = 30_000;
 const WAIT_RETRY_BASE_MS = 5_000;
 const WAIT_RETRY_MAX_MS = 60_000;
 const WAIT_FAILURE_LIMIT = 6;
@@ -121,7 +122,7 @@ async function inspectWait(wait: LongRunWaitContract, ticket: ExecutionTicket, n
 
   if (!executionTicketCurrent(ticket)) return;
   if (verdict.kind === 'pending') {
-    await deferLongRunWaitNow(wait.sessionId, wait.id, ticket, now + retryDelay(wait.attempts), null);
+    await deferLongRunWaitNow(wait.sessionId, wait.id, ticket, now + WAIT_PENDING_MS, null);
     return;
   }
   if (verdict.kind === 'resolved') {
