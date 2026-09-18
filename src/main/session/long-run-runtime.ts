@@ -2,12 +2,18 @@
  * Local long-run supervisor.
  *
  * The model may register a durable external wait and finish its turn.  This process owns the
- * polling afterwards, then publishes one stable continuation through the existing input outbox.
- * No provider turn has to remain open merely to poll CI or a long-running local process.
+ * polling afterwards, then publishes one stable continuation through the existing input outbox
+ * or, for a worker, through the existing durable agent-revival broker. No provider turn has to
+ * remain open merely to poll CI or a long-running local process.
  */
 
 import { runCommand } from '../exec.js';
-import { agentInfoForOwnedConversation } from '../agents.js';
+import {
+  agentInfoForOwnedConversation,
+  persistCriticalSwarmNow,
+  requestWorkerRevivals,
+  stageWorkerContinuation
+} from '../agents.js';
 import { goalSwitchFor } from '../goal.js';
 import { logInfo, logWarn } from '../logger.js';
 import { backgroundExecObligations, execOwner } from '../codex/ownership.js';
@@ -188,11 +194,72 @@ async function dispatchWork(work: WorkObligation, now: number): Promise<void> {
   const leased = await leaseLongRunWorkNow(work.sessionId, work.conversationId);
   if (!leased?.work.inputId || !executionTicketCurrent(leased.ticket)) return;
   const inputId = leased.work.inputId;
+  const text = continuationText(leased.work);
+  const agent = agentInfoForOwnedConversation(work.conversationId);
+
+  if (agent?.role === 'worker') {
+    // Worker chats have their own durable wake transaction and configured slot limit. Never
+    // bypass that broker by dropping an ordinary after-turn browser input into a sleeping worker.
+    // The long-run input UUID is reused as the broker message id, closing the crash window where
+    // the swarm fsync succeeds but this work ledger has not yet recorded queued.
+    let staged: ReturnType<typeof stageWorkerContinuation>;
+    try {
+      staged = stageWorkerContinuation(work.conversationId, inputId, text);
+    } catch (error) {
+      // NO_FREE_SLOT, an in-flight finish/transfer, or another broker arbitration condition is
+      // transient. Keep the same dispatching obligation and stable id for a later local pass.
+      logWarn(
+        `long-run: worker continuation for ${work.sessionId} will retry — ${error instanceof Error ? error.message : String(error)}`
+      );
+      return;
+    }
+    // An active/detached worker is still executing the turn that registered the wait, or has not
+    // yet crossed its ordinary sleep lifecycle. Certified progress can satisfy the debt meanwhile;
+    // otherwise a later poll reaches the same worker after it becomes sleeping.
+    if (!staged) return;
+
+    let accepted = false;
+    try {
+      if (!(await persistCriticalSwarmNow())) {
+        throw new Error('the worker broker has no immediate durable persistence sink');
+      }
+      staged.commit();
+      accepted = true;
+    } catch (error) {
+      if (!accepted) staged.rollback();
+      logWarn(
+        `long-run: worker continuation durability for ${work.sessionId} will retry — ${error instanceof Error ? error.message : String(error)}`
+      );
+      return;
+    }
+
+    // A rebind/cancel that won while the swarm fsync was in flight invalidates the old executor.
+    // The broker row is already durable under the stable UUID; do not wake the old chat. A later
+    // pass under the new epoch finds that same row and safely resumes from there.
+    if (!executionTicketCurrent(leased.ticket)) return;
+    const current = await getSession(work.sessionId);
+    if (!current?.conversationId || current.conversationId !== work.conversationId) return;
+    const currentRecovery = current.recovery;
+    if (currentRecovery && currentRecovery.phase !== 'healthy' && currentRecovery.phase !== 'recovered') return;
+
+    if (await markLongRunWorkQueuedNow(work.sessionId, leased.work.id, leased.ticket, inputId)) {
+      // Browser publication happens only after both durable authorities agree: the worker inbox
+      // is fsynced and this execution epoch has recorded the stable continuation as queued.
+      if (staged.waking.length > 0) requestWorkerRevivals(staged.waking, staged.runId);
+      logInfo(`long-run: queued ${leased.work.reason} worker continuation for session ${work.sessionId}`);
+    }
+    return;
+  }
+
+  // A session known to be a worker whose broker lineage is temporarily unavailable must fail
+  // closed. Treating it as an ordinary chat would bypass worker-slot and revival authority.
+  if (session.origin?.kind === 'worker') return;
+
   try {
     await enqueueInput({
       id: inputId,
       sessionId: work.sessionId,
-      text: continuationText(leased.work),
+      text,
       authoredSource: 'none',
       mode: 'after-turn',
       afterTurn: true,
