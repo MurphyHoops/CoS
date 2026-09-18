@@ -1,5 +1,6 @@
 import { toolDeclaration } from './tool-declarations.js';
 import { registerPlanTool } from './plan-tool.js';
+import { registerLongRunWaitTool } from './long-run-tool.js';
 import { goalWorkerChat } from '../bridge.js';
 import { announceSessionFinish, sessionFinishDeadline } from '../session/finish.js';
 import { getConfig } from '../config.js';
@@ -990,6 +991,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
 
   if (reg.sessionToolsExposed) {
     registerPlanTool(reg);
+    registerLongRunWaitTool(reg);
   }
   if (reg.ctx.exposedFinishTool ?? getConfig().ui.finishTool === true) {
     reg.register('session_finish', toolDeclaration('session_finish', () => ({
