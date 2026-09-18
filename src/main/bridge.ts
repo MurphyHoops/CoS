@@ -213,6 +213,7 @@ import { conversationHasMcpCallSince } from './session/store.js';
 import { sessionWorkingAt } from '../shared/session-activity.js';
 import { requestCorrelation } from './session/correlation.js';
 import { bindAgentWorkspace } from './workspace.js';
+import { cancelLongRunNow, noteLongRunProgressNow } from './session/long-run.js';
 
 /** Fixed candidates so the extension can find the app without being told a port. */
 export const DEFAULT_PORTS = [8765, 8766, 8767, 8768, 8769];
@@ -6840,6 +6841,7 @@ async function noteRecoveryObservations(
   const ended = observations.findLast(item => item.kind === 'turn_end');
   if (sessionId && ended?.outcome === 'stopped') {
     await cancelSelfHealingForStopNow(sessionId, conversationId);
+    await cancelLongRunNow(sessionId, conversationId, 'manual_stop');
   }
   const successfulTerminal = activity.terminal && (!ended || ended.outcome === 'completed');
   const softProbation = recorded?.recovery?.phase === 'soft_recovery' &&
@@ -6855,6 +6857,15 @@ async function noteRecoveryObservations(
       sessionId,
       conversationId,
       Math.max(1, activity.at ?? ended?.time ?? Date.now())
+    );
+  }
+  if (sessionId && successfulTerminal) {
+    await noteLongRunProgressNow(
+      sessionId,
+      conversationId,
+      Math.max(1, ended?.time ?? activity.at ?? Date.now()),
+      ended?.turnId ?? null,
+      'terminal'
     );
   }
   const thinkingFailed = ended?.outcome === 'failed' && ended.reason === 'thinking_failed' &&
@@ -7853,6 +7864,8 @@ function noteCallAttribution(
     // when Chrome, the tab or a reload destroyed the page's local turn projection.
     const sourceTurnId = filedSession?.activeTurnId ?? previous?.turnId ??
       goalPendingReplyFor(conversationId)?.silenceSourceTurnId ?? filedSession?.finishTurn?.turnId ?? null;
+    void noteLongRunProgressNow(sessionId, conversationId, startedAt, sourceTurnId, 'mcp')
+      .catch(error => logWarn(`long-run: could not persist certified MCP progress: ${String(error)}`));
     void revokeSilenceInputs(sessionId).catch(error => logWarn(`input: could not withdraw silence pickup: ${String(error)}`));
     void revokeSilenceLoop(conversationId).catch(error => logWarn(`goal: could not withdraw silence pickup: ${String(error)}`));
     grantActivity(conversationId, sessionId, continuingMcp ? Date.now() : pro ? Math.min(Date.now(), startedAt) : Date.now(), CHAT_SILENCE_MS,
