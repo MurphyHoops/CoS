@@ -171,7 +171,11 @@ async function dispatchWork(work: WorkObligation, now: number): Promise<void> {
   const session = await getSession(work.sessionId);
   if (!session?.conversationId || session.conversationId !== work.conversationId) return;
   const recovery = session.recovery;
-  if (recovery && !['healthy', 'recovered', 'recovery_failed'].includes(recovery.phase)) return;
+  // recovery_failed can still mean an ambiguous native Send with admission fences restored on
+  // restart. It is not authority to start another provider message. Only a healthy/recovered
+  // executor may receive autonomous long-run work; the recovery subsystem owns every failed
+  // transaction until it is explicitly reconciled or superseded.
+  if (recovery && recovery.phase !== 'healthy' && recovery.phase !== 'recovered') return;
 
   if (work.reason === 'recovery_resume') {
     if (!goalSwitchFor(work.conversationId).enabled && !agentInfoForOwnedConversation(work.conversationId)) return;
