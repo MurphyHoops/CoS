@@ -780,12 +780,16 @@ export async function noteLongRunProgressNow(
     // short "recovered" answer that exposed the original liveness bug and must not erase debt.
     if (work.reason === 'recovery_resume' && evidence !== 'mcp') return false;
     if (work.reason === 'wait_resolved' || work.reason === 'wait_failed') {
-      // The continuation must cross the same causal boundary that gates tool admission. A rejected
-      // late MCP request from the old workflow is still recorded for history, but it is evidence
-      // about the source executor—not proof that the queued continuation ran.
-      if (work.sourceTurnId && (!turnId || turnId === work.sourceTurnId)) return false;
-      if (evidence === 'mcp' && work.sourceRequestId &&
-          (!requestId || requestId === work.sourceRequestId)) return false;
+      // MCP progress follows the same exact workflow boundary as admission. For new waits, a
+      // different proven request id certifies the replacement provider turn even if the browser's
+      // activeTurnId projection still names the source briefly. Legacy waits without request
+      // identity retain the conservative source-turn check. Terminal-only evidence has no request
+      // id, so it must still prove a different durable turn.
+      if (evidence === 'mcp' && work.sourceRequestId) {
+        if (!requestId || requestId === work.sourceRequestId) return false;
+      } else if (work.sourceTurnId && (!turnId || turnId === work.sourceTurnId)) {
+        return false;
+      }
     }
 
     const before = cloneWork(work);
