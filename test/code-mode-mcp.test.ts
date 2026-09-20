@@ -20,6 +20,7 @@ import { unifiedExecManager } from '../src/main/codex/manager.js';
 import { noteExecOwner, forgetExecOwner } from '../src/main/codex/ownership.js';
 import * as ownership from '../src/main/codex/ownership.js';
 import type { ExecCommandToolOutput } from '../src/main/codex/unified-exec.js';
+import { longRunStatus, resetLongRunStateForTests } from '../src/main/session/long-run.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
 let directory: string, endpoint: McpEndpoint, ctx: ToolContext;
@@ -182,7 +183,7 @@ beforeAll(async () => {
   endpoint = await startMcpServer(() => ctx);
 });
 afterEach(async () => {
-  vi.restoreAllMocks(); ctx.caps = defaultConfig().capabilities; ctx.roots = [{ name: 'workspace', path: directory }]; resetBlockedChatsForTests();
+  vi.restoreAllMocks(); ctx.caps = defaultConfig().capabilities; ctx.roots = [{ name: 'workspace', path: directory }]; resetBlockedChatsForTests(); resetLongRunStateForTests();
   const config = getConfig();
   await saveConfig({ ...config, multiAgent: { ...config.multiAgent, allowUnattributedCalls: true } });
 });
@@ -345,11 +346,44 @@ it('rejects missing proof, foreign tools, invalid child arguments and nested lif
   expect(text(await call(who.requestId, 'text(await tools.read({paths:1}))'))).toContain('INVALID_ARGUMENTS');
   for (const code of [
     'text(await tools.session_finish({summary:"done"}))',
-    'text(await tools.session_wait({action:"arm",kind:"timer",seconds:60}))',
     'text(await tools.agents({action:"finish",summary:"done"}))'
   ]) {
     expect(text(await call(who.requestId, code))).toContain('DIRECT_CALL_REQUIRED');
   }
+});
+
+it('arms session_wait through code mode when direct host exposure is unavailable and cuts later tools', async () => {
+  const who = await identity();
+  const turnId = randomUUID();
+  await appendEvent(who.session.id, { kind: 'turn_start', source: 'extension', turnId, time: Date.now() });
+
+  const response = await call(
+    who.requestId,
+    'text("discard"); await tools.session_wait({action:"arm",kind:"timer",seconds:60,description:"host surface fallback"}); await tools.read({paths:["/workspace/alpha.txt"]}); text("MUST_NOT_RUN");'
+  );
+
+  expect(response.result.isError, text(response)).not.toBe(true);
+  expect(text(response)).toContain('Durable timer wait armed');
+  expect(text(response)).not.toContain('discard');
+  expect(text(response)).not.toContain('MUST_NOT_RUN');
+  expect(text(response)).not.toContain('PRIVATE_ALPHA');
+  expect(longRunStatus(who.session.id).wait).toMatchObject({
+    kind: 'timer',
+    state: 'waiting',
+    conversationId: who.conversationId
+  });
+  expect(longRunStatus(who.session.id).work).toMatchObject({
+    state: 'waiting',
+    sourceRequestId: who.requestId
+  });
+
+  const blocked = await rpc('tools/call', { name: 'read', arguments: { paths: ['/workspace/alpha.txt'] } }, who.requestId);
+  expect(blocked.result.isError).toBe(true);
+  expect(text(blocked)).toContain('WAIT_ARMED_FINISH_TURN');
+
+  const cancelled = await rpc('tools/call', { name: 'session_wait', arguments: { action: 'cancel' } }, who.requestId);
+  expect(cancelled.result.isError, text(cancelled)).not.toBe(true);
+  expect(text(cancelled)).toContain('cancelled');
 });
 
 it('allows unattributed file edits through code mode while preserving permissions and chat-owned operations', async () => {

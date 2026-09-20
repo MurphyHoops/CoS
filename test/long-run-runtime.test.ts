@@ -52,6 +52,18 @@ const {
   pollLongRunRuntime,
   resetLongRunRuntimeForTests
 } = await import('../src/main/session/long-run-runtime.js');
+const { registerLongRunWaitProvider } = await import('../src/main/session/wait-providers.js');
+
+const customInspect = vi.fn(async (_wait: unknown, _now: number) => ({
+  kind: 'resolved' as const,
+  result: 'Custom provider job completed successfully',
+  failed: false
+}));
+registerLongRunWaitProvider({
+  kind: 'fixture_job',
+  describe: (_wait, detail) => `Fixture job: ${detail}`,
+  inspect: (wait, now) => customInspect(wait, now)
+});
 
 const SESSION = 'session-runtime';
 const CHAT = 'conversation-runtime';
@@ -149,6 +161,42 @@ describe('local long-run supervisor', () => {
     expect(longRunStatus(SESSION).work).toMatchObject({ state: 'queued', reason: 'wait_resolved' });
     expect(mocks.enqueueInput).toHaveBeenCalledTimes(1);
     expect(mocks.enqueueInput.mock.calls[0]?.[0]?.text).toContain('completed with conclusion success');
+  });
+
+  it('dispatches a project-specific wait through the generic provider registry', async () => {
+    const wait = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT,
+      sourceTurnId: 'turn-custom-provider',
+      kind: 'fixture_job',
+      providerKey: 'fixture:job:42',
+      providerData: { job: 42, project: 'generic-project' },
+      description: 'generic adapter wait'
+    });
+
+    await pollLongRunRuntime(wait.nextCheckAt + 1);
+
+    expect(customInspect).toHaveBeenCalledTimes(1);
+    expect(customInspect).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'fixture_job',
+        providerKey: 'fixture:job:42',
+        providerData: { job: 42, project: 'generic-project' }
+      }),
+      wait.nextCheckAt + 1
+    );
+    expect(longRunStatus(SESSION).wait).toMatchObject({
+      kind: 'fixture_job',
+      providerKey: 'fixture:job:42',
+      state: 'resolved'
+    });
+    expect(longRunStatus(SESSION).work).toMatchObject({
+      state: 'queued',
+      reason: 'wait_resolved',
+      source: 'fixture:job:42'
+    });
+    expect(mocks.enqueueInput).toHaveBeenCalledTimes(1);
+    expect(mocks.enqueueInput.mock.calls[0]?.[0]?.text).toContain('Custom provider job completed successfully');
   });
 
   it('continues a recovered worker through the durable revival broker even when Goal is off', async () => {

@@ -6,7 +6,8 @@ import {
   longRunStatus
 } from '../session/long-run.js';
 import { getSession } from '../session/store.js';
-import { currentCaller, runningToolCalls } from './call-context.js';
+import { longRunWaitProvider } from '../session/wait-providers.js';
+import { currentCall, currentCaller, runningToolCalls } from './call-context.js';
 import { fail, failIdentity, guard, ok, type SurfaceRegistrar } from './kernel.js';
 import { toolDeclaration } from './tool-declarations.js';
 
@@ -24,11 +25,16 @@ export function registerLongRunWaitTool(reg: SurfaceRegistrar): void {
     title: 'Wait outside this turn',
     description:
       'Hand a long external wait to the local CoS supervisor, then finish this turn instead of polling. ' +
-      'Use action=arm for GitHub Actions runs, a background exec session, or a timer. CoS durably monitors it and queues one continuation when it resolves. ' +
-      'Arming is a hard provider-turn boundary: ordinary tools from this executor are refused until resolution or cancel. Use status to inspect the durable wait/work obligation and cancel to revoke it.',
+      'Built-in providers support GitHub Actions runs, background exec sessions, and timers; registered adapters may add project-specific external conditions without changing the scheduler core. ' +
+      'CoS durably monitors the wait and queues exactly one continuation when it resolves. Arming is a hard provider-turn boundary: ordinary tools from this executor are refused until resolution or cancel. Prefer a direct call when the host exposes this tool; code mode may use action=arm as a terminal yield fallback.',
     inputSchema: z.object({
       action: z.enum(['arm', 'status', 'cancel']),
-      kind: z.enum(['github_run', 'process', 'timer']).optional(),
+      kind: z.string().regex(/^[a-z][a-z0-9_.-]{1,63}$/).optional()
+        .describe('Wait-provider kind. Built-ins: github_run, process, timer; adapters may register more.'),
+      provider_target: z.string().min(1).max(500).optional()
+        .describe('Custom adapters: stable semantic target identifier used for idempotent retries.'),
+      provider_data: z.record(z.string().max(100), z.unknown()).optional()
+        .describe('Custom adapters: bounded JSON payload interpreted only by the registered provider.'),
       repository: z.string().max(201).optional().describe('github_run: owner/repo.'),
       run_id: z.number().int().positive().optional().describe('github_run: GitHub Actions run id.'),
       process_session_id: z.number().int().positive().optional().describe('process: session_id returned by this durable session’s exec_command.'),
@@ -107,7 +113,12 @@ export function registerLongRunWaitTool(reg: SurfaceRegistrar): void {
     // executor is still capable of mutating local state; the current session_wait itself accounts
     // for one running call. Background exec sessions are not counted here because their launching
     // MCP call has already returned and the process wait explicitly names their durable session id.
-    if (runningToolCalls(caller.conversationId) > 1) {
+    const call = currentCall();
+    // Direct invocation contributes one running call. Code-mode terminal yield contributes the
+    // outer exec plus this exact child; runCodeMode separately proves there is no sibling child
+    // before admitting action=arm and freezes new child admissions until the result is known.
+    const allowedCalls = call?.parentToolName === 'exec' ? 2 : 1;
+    if (runningToolCalls(caller.conversationId) > allowedCalls) {
       return fail(
         'WAIT_INFLIGHT_TOOLS: another local tool from this conversation is still running, so no wait was armed. ' +
         'Let that call settle, reconcile its result, then retry session_wait once.'
@@ -127,8 +138,15 @@ export function registerLongRunWaitTool(reg: SurfaceRegistrar): void {
           !state.exitedUnread.some((row) => row.processId === input.process_session_id)) {
         return fail('That process session is no longer retained by this durable session.');
       }
-    } else if (!input.seconds) {
-      return fail('timer requires seconds.');
+    } else if (input.kind === 'timer') {
+      if (!input.seconds) return fail('timer requires seconds.');
+    } else {
+      if (!longRunWaitProvider(input.kind)) {
+        return fail(`No long-run wait provider is registered for kind "${input.kind}".`);
+      }
+      if (!input.provider_target) {
+        return fail('Custom wait providers require provider_target for idempotent retries.');
+      }
     }
 
     const wait = await armLongRunWaitNow({
@@ -137,6 +155,8 @@ export function registerLongRunWaitTool(reg: SurfaceRegistrar): void {
       sourceTurnId: session.activeTurnId,
       sourceRequestId: caller.requestId,
       kind: input.kind,
+      providerKey: input.provider_target ?? null,
+      providerData: input.provider_data ?? null,
       repository: input.kind === 'github_run' ? input.repository! : null,
       runId: input.kind === 'github_run' ? input.run_id! : null,
       processId: input.kind === 'process' ? input.process_session_id! : null,

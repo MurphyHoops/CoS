@@ -64,6 +64,10 @@ export interface CallCaller {
 }
 
 export interface CallContext {
+  /** Tool name for this exact dispatch. Nested calls inherit the parent's caller, not its name. */
+  toolName?: string;
+  /** Immediate parent tool for nested dispatches (currently code-mode exec). */
+  parentToolName?: string | null;
   /** Result publication belongs to the transport, not to the generation-wide request ID. */
   publication?: OutputPublication;
   /** Wall-clock start of this MCP request, shared by identity-sensitive handlers. */

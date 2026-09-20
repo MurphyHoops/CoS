@@ -21,7 +21,7 @@ changed lines before applying an older patch. Document the work and its actual v
 the code currently does it. Known implementation gaps are collected in §21 instead of being
 mixed into the happy path as features.
 
-Source alignment: **2026-09-16**, including the local stability candidate. App/extension **2.1.13**,
+Source alignment: **2026-09-20**, including the generic long-run runtime candidate. App/extension **2.1.13**,
 bridge protocol **14** in the checked declarations (`package.json`, `src/main/version.ts`,
 `extension/manifest.json`). This does not prove release, installation or live Chrome behavior.
 
@@ -77,6 +77,7 @@ losing the project, history, workers or queued instructions when a chat grows to
 | Generated workflow / checkpoints | User instructions owned by the outbox; delivered at real finish/completion boundaries. |
 | `update_plan` | The agent's displayed progress plan. It does not execute or consume queue entries. |
 | `session_finish` | Astra's explicit near-finish hold/notice boundary; does not mean the whole task is already verified. |
+| Long-run wait | Durable external condition owned by the local supervisor; successful arm ends source-turn mutation authority and later queues one continuation. |
 | Prime / worker | One owning conversation and its reusable subordinate chats. Several prime families may run independently. |
 | Decision helper / planner | A role-specific chat that produces a continuation decision or workflow; it must not execute the reference task. |
 | Code-mode `exec` | Bounded JavaScript composition of one MCP surface's tools. `exec_command` runs an OS process. |
@@ -225,6 +226,7 @@ Paths in this section are repository-relative. Most mechanisms have `main`, `sha
 | Input | `src/main/session/{input,start-input,input-history,input-attachments,input-images,prompt}.ts`, `src/shared/{input,user-prompt}.ts`: outbox, native files, prompt frame and receipts. |
 | Finish/planning | `src/main/session/finish.ts`, `task-request.ts`, `goal.ts`, `src/shared/{finish,task-progress}.ts`: held turn, decision/plan invocation and cancellation. |
 | Continuation | `src/main/session/{continuation,resume-gate,handoff,handoff-prompt}.ts`: A→B transaction, send ambiguity and exact brief. |
+| Durable long-run | `src/main/session/{long-run,long-run-runtime,wait-providers}.ts`, `mcp/long-run-tool.ts`, `mcp/code-mode-{tool,runtime}.ts`: execution epochs, work debt, external waits, provider adapters, progress certificates and terminal-yield fencing. |
 | Automation | `src/main/goal.ts`, `src/shared/{goal,goal-templates}.ts`: objectives, switches, obligations, provider/helper decisions. |
 | Agents | `src/main/agents.ts`, `src/renderer/{agent-panel,agent-communication}.ts`: independent prime families, staged mutations and addressed messages. |
 | Browser orchestration | `src/main/bridge.ts`, `browser.ts`, `browser-startup.ts`, `browser-wake.ts`, `browser-window-layout.ts`, `browser-preferences.ts`; `src/shared/browser-preferences.ts`. |
@@ -253,6 +255,7 @@ Paths in this section are repository-relative. Most mechanisms have `main`, `sha
 | Direct browser tool calls | `browser-control.ts` process epoch/pending claims; extension `storage.session.cosBrowserControl` | One claim per command; browser incarnation plus local-session tab lease. MV3 retains custody/receipt, never replays input. App restart invalidates outstanding claims. |
 | Workers and inboxes | `agents.ts` / swarm snapshot and retired-worker fences | Stage → critical durable snapshot → publish/open/report. |
 | Compaction | `continuation.ts` / continuation WAL + session metadata | Disk ownership decides restart outcome; transport phase alone does not. |
+| Long-run execution debt | `long-run.ts` / `state/long-run.json` | ExecutionEpoch is mutation authority; WorkObligation and WaitContract survive carrier loss/restart. Providers only observe conditions; durable transitions grant authority. |
 | Goal control | `goal.ts` / `goal-objectives`, `goal-switches`, `goal-replies` | Objective, mode and reply debt are separate concepts; draft memory is disposable. See §21 for remaining atomicity gaps. |
 | Stop/block/finish | Stop command; `blocked-chats.ts` durable set; finish facts in recorded progress/session projection | Each names exact chat/turn; no false terminal event. |
 | Browser repair | `bridge.ts` process-memory episodes | Re-earn from live evidence; never restore an old reload token as action authority. |
@@ -1641,6 +1644,33 @@ relevant durable ids. Linked project instructions and current executor settings 
 Goal context can use a committed handoff as a provenance anchor; aborted/stale/legacy text is
 not one. A source reply obligation must be superseded when its work has moved, rather than
 mistaken for B's completed turn (§21 records the remaining ledger gap).
+
+### Durable long-run waits and replaceable executors
+
+`session/long-run.ts` owns execution epochs, work obligations and wait contracts; the local
+`long-run-runtime.ts` supervisor consumes those durable facts. A provider turn that would only
+poll GitHub Actions, a retained local process, a timer or another registered external condition
+must hand the wait to this supervisor and finish. `wait-providers.ts` is an adapter registry:
+providers observe conditions and return pending/resolved/error verdicts, but they never grant
+mutation authority or encode a project's build/test/review lifecycle. Project policy stays in
+project instructions; Core stays reusable across repositories and languages.
+
+A successful `session_wait action=arm` fsyncs the wait/work debt before retiring ordinary source-
+turn tool authority. Direct `session_wait` is preferred. If a ChatGPT host exposes only Core
+code-mode `exec`, `tools.session_wait(...)` is the supported compatibility path: a successful arm
+is a terminal yield, so QuickJS stops, earlier explicit emissions are discarded, no later nested
+call is admitted, and the outer result contains only the durable wait receipt. Arm must never run
+beside a sibling mutation or in `Promise.all`; refusal leaves the script uncut so the caller can
+reconcile and retry the one idempotent admission.
+
+`ExecutionEpoch` is the single mutation generation. `WorkObligation` is continuation debt.
+`WaitContract` names the external condition with a stable semantic target, and
+`ProgressCertificate` proves the replacement executor actually advanced the durable task. The
+source request remains fenced after wait resolution; only a distinct certified continuation can
+fulfil the debt. Stop/cancel advances authority, Compact & Resume moves current debt to B, and
+restart restores the same ledger. Built-in wait providers are `github_run`, `process` and
+`timer`; custom adapters use a stable `provider_target` plus bounded JSON `provider_data` and
+fail closed when no provider is registered.
 
 Legacy shadow repair requires exact old continuation proof. It may repair missing projections;
 it must not guess a new rebind, delete history or become the path for new continuations.

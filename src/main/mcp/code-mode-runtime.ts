@@ -14,7 +14,11 @@ export const CODE_MODE_LIMITS = Object.freeze({
 export const codeModeSchema = z.object({ code: z.string().min(1).max(CODE_MODE_LIMITS.codeChars)
   .describe('Raw JavaScript source with top-level await. Emit results with text(...) or image(...).') }).strict();
 export type CodeModeTool = { name: string; description: string };
-export type CodeModeOptions = { windowsDesktop?: boolean };
+export type CodeModeOptions = {
+  windowsDesktop?: boolean;
+  /** Whether this surface actually exposes session_wait to nested code-mode calls. */
+  sessionWaitAvailable?: boolean;
+};
 const requireRuntime = createRequire(typeof __filename === 'string' ? __filename : import.meta.url);
 let activeRuns = 0;
 
@@ -57,6 +61,8 @@ export async function runCodeMode(
   const emissions: Array<{ kind: 'text' | 'image'; json: string }> = [];
   let worker: Worker | undefined, ended = false, calls = 0, resultBytes = 0, emittedBytes = 0;
   let textBytes = 0, images = 0, textTruncated = false;
+  let terminalYield: ToolResult | null = null;
+  let terminalArmInFlight = false;
   const allowed = new Set(tools.map(tool => tool.name));
   try {
     const status = await new Promise<string | null>(resolve => {
@@ -108,20 +114,57 @@ export async function runCodeMode(
         let request: { name: string; args?: unknown };
         try { request = JSON.parse(message.json); } catch { finish('BRIDGE_ERROR'); return; }
         if (!allowed.has(request.name)) { finish('UNKNOWN_TOOL'); return; }
+        const terminalArm = request.name === 'session_wait' &&
+          !!request.args && typeof request.args === 'object' &&
+          (request.args as { action?: unknown }).action === 'arm';
+        // session_wait arm is a control-flow boundary, not an ordinary child result. Admit it only
+        // when no sibling child is already capable of mutating, then freeze all later child
+        // admissions until arm succeeds or fails. This makes Promise.all([...]) fail closed.
+        if (terminalArm) {
+          if (pending.size > 0 || terminalArmInFlight) {
+            worker!.postMessage({ type: 'result', id, json: JSON.stringify(errorResult(
+              'WAIT_INFLIGHT_TOOLS: session_wait arm must be the only nested call in flight.'
+            )) });
+            return;
+          }
+          terminalArmInFlight = true;
+        } else if (terminalArmInFlight) {
+          worker!.postMessage({ type: 'result', id, json: JSON.stringify(errorResult(
+            'WAIT_TURN_CUT_PENDING: session_wait arm is establishing a terminal yield; no later nested call was dispatched.'
+          )) });
+          return;
+        }
         // Admission is synchronous. No late worker message may start another action after finish.
         calls++;
         const work = Promise.resolve().then(() => invoke(request.name, request.args)).then(result => {
           if (ended) return;
+          if (terminalArm) {
+            terminalArmInFlight = false;
+            if (!result.isError) {
+              terminalYield = result;
+              finish('TERMINAL_YIELD');
+              return;
+            }
+          }
           const json = JSON.stringify(result);
           const bytes = Buffer.byteLength(json);
           if (bytes > limits.resultBytes || (resultBytes += bytes) > limits.totalResultBytes) { finish('RESULT_LIMIT'); return; }
           worker!.postMessage({ type: 'result', id, json });
-        }, () => { if (!ended) worker!.postMessage({ type: 'result', id, json: JSON.stringify(errorResult('TOOL_ERROR')) }); })
-          .catch(() => finish('RESULT_INVALID'));
+        }, () => {
+          if (terminalArm) terminalArmInFlight = false;
+          if (!ended) worker!.postMessage({ type: 'result', id, json: JSON.stringify(errorResult('TOOL_ERROR')) });
+        }).catch(() => finish('RESULT_INVALID'));
         pending.add(work);
         void work.then(() => pending.delete(work));
       });
     });
+    if (terminalYield) {
+      // The child already durably armed the wait. Never resume QuickJS or expose earlier script
+      // emissions that could encourage this retired provider turn to keep working. Await only the
+      // admitted child bookkeeping, then return the wait receipt as the outer exec result.
+      if (pending.size) await Promise.allSettled([...pending]);
+      return terminalYield;
+    }
     const content: ToolContent[] = [];
     for (const emission of emissions) {
       try {

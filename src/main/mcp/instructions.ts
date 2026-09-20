@@ -14,7 +14,7 @@ import { LAUNCHES_WINDOWS_POWERSHELL_5 } from '../codex/tool-specs.js';
 import { CODING_INSTRUCTIONS } from './coding-instructions.js';
 import { listSkills, skillCatalogInstructions } from '../skills.js';
 import { withManagedSkills } from '../skill-access.js';
-import { canAddCodeMode, CODE_MODE_INSTRUCTIONS } from './code-mode-tool.js';
+import { canAddCodeMode, CODE_MODE_INSTRUCTIONS, codeModeInstructions } from './code-mode-tool.js';
 import { pluginManager } from '../plugins/manager.js';
 import { effectiveCapabilities, getConfig, MAX_MCP_INSTRUCTIONS_CHARS } from '../config.js';
 import { isGitRepository } from '../toolchain.js';
@@ -123,7 +123,7 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform): string {
     'Use update_plan for tasks with several meaningful steps; skip it for simple tasks. Give each step a short user-facing headline and concrete details about the approach, constraints or checks. Send the complete plan on every update, preserving useful details. Keep at most one step in_progress.',
     'Update the plan when a step is completed or the approach changes. Mark steps completed only when their work is done. Do not repeat the full plan in chat: the app shows the headlines with expandable details above queued messages.',
     'The plan does not execute steps or mark queued instructions done. New user instructions extend the work; update the plan accordingly.',
-    'For GitHub Actions, background processes, or timer waits that may outlive this provider turn, call session_wait directly once, then finish the turn. CoS monitors it and queues one continuation. After arm, this executor’s ordinary tools are fenced until resolution or cancel; do not poll gh run view, write_stdin, sleep, or equivalents.'
+    'For long external waits, prefer direct session_wait; if the host hides it, call tools.session_wait once inside exec. Successful action=arm is a terminal yield: remaining JavaScript stops, ordinary tools are fenced, and CoS monitors locally then queues one continuation. Never arm in Promise.all or beside a mutation; never poll with sleep, gh run view/watch, write_stdin, or equivalents.'
   );
   if (agentTools) lines.push(
     '',
@@ -142,7 +142,7 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform): string {
     '',
     `Native screen, window, mouse, keyboard and clipboard tools live in the separate "${surfaceDefinition('desktop').connectorName}" connector. If the task needs them and they are unavailable, tell the user which connector is needed.`
   );
-  lines.push('', CODE_MODE_INSTRUCTIONS, ...userInstructions());
+  lines.push('', codeModeInstructions(sessionTools), ...userInstructions());
   return lines.join('\n');
 }
 

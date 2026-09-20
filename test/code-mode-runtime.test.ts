@@ -182,3 +182,79 @@ it('puts invalid-output diagnostics before the validated emissions without chang
   expect(output.content[0]).toMatchObject({ type: 'text', text: expect.stringContaining('CODE_MODE_OUTPUT_INVALID') });
   expect(output.content.slice(1)).toEqual([{ type: 'text', text: 'first' }, { type: 'text', text: 'second' }]);
 });
+
+it('treats a successful nested session_wait arm as a terminal yield and cuts later JavaScript', async () => {
+  const waitReceipt: ToolResult = {
+    content: [{ type: 'text', text: 'Durable timer wait armed. Finish this turn now.' }],
+    structuredContent: { wait_id: 'wait-fixture', kind: 'timer', state: 'waiting' }
+  };
+  const invoke = vi.fn(async (name: string) => name === 'session_wait' ? waitReceipt : result('MUTATION_RAN'));
+  const waitTools = [
+    { name: 'session_wait', description: 'Durable wait control.' },
+    { name: 'lookup', description: 'Mutation fixture.' }
+  ];
+
+  const output = await runCodeMode(
+    'text("discard me"); await tools.session_wait({action:"arm",kind:"timer",seconds:60}); await tools.lookup({mutate:true}); text("must not run");',
+    waitTools,
+    invoke,
+    limits
+  );
+
+  expect(output).toEqual(waitReceipt);
+  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(invoke).toHaveBeenCalledWith('session_wait', { action: 'arm', kind: 'timer', seconds: 60 });
+  expect(rendered(output)).not.toContain('discard me');
+  expect(rendered(output)).not.toContain('MUTATION_RAN');
+});
+
+it('freezes later nested admissions while terminal session_wait arm is in flight', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const waitReceipt: ToolResult = { content: [{ type: 'text', text: 'WAIT_ARMED' }] };
+  const invoke = vi.fn(async (name: string) => {
+    if (name === 'session_wait') {
+      await gate;
+      return waitReceipt;
+    }
+    return result('MUTATION_RAN');
+  });
+  const waitTools = [
+    { name: 'session_wait', description: 'Durable wait control.' },
+    { name: 'lookup', description: 'Mutation fixture.' }
+  ];
+
+  const running = runCodeMode(
+    'await Promise.all([tools.session_wait({action:"arm",kind:"timer",seconds:60}),tools.lookup({mutate:true})]); text("must not run");',
+    waitTools,
+    invoke,
+    limits
+  );
+  await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
+  release();
+  const output = await running;
+
+  expect(output).toEqual(waitReceipt);
+  expect(invoke).toHaveBeenCalledWith('session_wait', { action: 'arm', kind: 'timer', seconds: 60 });
+  expect(invoke).not.toHaveBeenCalledWith('lookup', expect.anything());
+});
+
+it('does not cut code mode when nested session_wait arm is refused', async () => {
+  const refused: ToolResult = { content: [{ type: 'text', text: 'WAIT_INFLIGHT_TOOLS' }], isError: true };
+  const invoke = vi.fn(async (name: string) => name === 'session_wait' ? refused : result('LOOKUP_OK'));
+  const waitTools = [
+    { name: 'session_wait', description: 'Durable wait control.' },
+    { name: 'lookup', description: 'Lookup fixture.' }
+  ];
+
+  const output = await runCodeMode(
+    'const w=await tools.session_wait({action:"arm",kind:"timer",seconds:60}); const r=await tools.lookup({}); text([w.isError,r.content[0].text]);',
+    waitTools,
+    invoke,
+    limits
+  );
+
+  expect(output.isError).not.toBe(true);
+  expect(output.content).toEqual([{ type: 'text', text: '[true,"LOOKUP_OK"]' }]);
+  expect(invoke).toHaveBeenCalledTimes(2);
+});

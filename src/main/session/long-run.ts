@@ -40,6 +40,16 @@ export interface ExecutionTicket {
   generation: number;
 }
 
+/** Certified evidence that the durable task, not merely its browser transport, advanced. */
+export interface ProgressCertificate {
+  sessionId: string;
+  conversationId: string;
+  observedAt: number;
+  turnId: string | null;
+  evidence: 'mcp' | 'terminal';
+  requestId?: string | null;
+}
+
 export interface WorkObligation {
   id: string;
   sessionId: string;
@@ -58,7 +68,9 @@ export interface WorkObligation {
   issuedAt: number | null;
 }
 
-export type LongRunWaitKind = 'github_run' | 'process' | 'timer';
+export type BuiltinLongRunWaitKind = 'github_run' | 'process' | 'timer';
+/** Adapter id. Built-ins are above; projects/plugins may register additional stable kinds. */
+export type LongRunWaitKind = BuiltinLongRunWaitKind | (string & {});
 export type LongRunWaitState = 'waiting' | 'resolved' | 'failed' | 'cancelled';
 
 export interface LongRunWaitContract {
@@ -68,6 +80,10 @@ export interface LongRunWaitContract {
   epochGeneration: number;
   obligationId: string;
   kind: LongRunWaitKind;
+  /** Stable semantic identity for retry/idempotency; adapters define its contents. */
+  providerKey?: string | null;
+  /** Bounded JSON payload owned by the wait adapter, never interpreted by the scheduler core. */
+  providerData?: Record<string, unknown> | null;
   repository: string | null;
   runId: number | null;
   processId: number | null;
@@ -96,6 +112,8 @@ export interface ArmLongRunWaitInput {
   sourceTurnId: string;
   sourceRequestId?: string | null;
   kind: LongRunWaitKind;
+  providerKey?: string | null;
+  providerData?: Record<string, unknown> | null;
   repository?: string | null;
   runId?: number | null;
   processId?: number | null;
@@ -124,6 +142,17 @@ function validConversationId(value: unknown): value is string {
 
 function validGeneration(value: unknown): value is number {
   return Number.isSafeInteger(value) && Number(value) > 0;
+}
+
+function validWaitKind(value: unknown): value is LongRunWaitKind {
+  return typeof value === 'string' && /^[a-z][a-z0-9_.-]{1,63}$/.test(value);
+}
+
+function validProviderData(value: unknown): value is Record<string, unknown> | null | undefined {
+  if (value === null || value === undefined) return true;
+  if (typeof value !== 'object' || Array.isArray(value)) return false;
+  try { return Buffer.byteLength(JSON.stringify(value), 'utf8') <= 16_384; }
+  catch { return false; }
 }
 
 function clip(value: string | null | undefined, max = 500): string | null {
@@ -187,7 +216,10 @@ export function restoreLongRunState(snapshot: LongRunSnapshot | null): void {
   for (const raw of Array.isArray(snapshot.waits) ? snapshot.waits : []) {
     if (!raw || !validSessionId(raw.sessionId) || !validConversationId(raw.conversationId) ||
         !validGeneration(raw.epochGeneration) || typeof raw.id !== 'string' || !raw.id ||
-        !['github_run', 'process', 'timer'].includes(raw.kind) ||
+        !validWaitKind(raw.kind) ||
+        (raw.providerKey !== undefined && raw.providerKey !== null &&
+          (typeof raw.providerKey !== 'string' || raw.providerKey.length === 0 || raw.providerKey.length > 500)) ||
+        !validProviderData(raw.providerData) ||
         !['waiting', 'resolved', 'failed', 'cancelled'].includes(raw.state) ||
         typeof raw.obligationId !== 'string' || !raw.obligationId ||
         !Number.isSafeInteger(raw.createdAt) || raw.createdAt <= 0 ||
@@ -372,6 +404,13 @@ export async function armLongRunWaitNow(input: ArmLongRunWaitInput): Promise<Lon
         (typeof input.sourceRequestId !== 'string' || input.sourceRequestId.length === 0 || input.sourceRequestId.length > 200)) {
       throw new Error('long_run_source_request_invalid');
     }
+    if (!validWaitKind(input.kind) || !validProviderData(input.providerData)) {
+      throw new Error('long_run_provider_invalid');
+    }
+    if (input.providerKey !== undefined && input.providerKey !== null &&
+        (typeof input.providerKey !== 'string' || input.providerKey.length === 0 || input.providerKey.length > 500)) {
+      throw new Error('long_run_provider_key_invalid');
+    }
     if (input.kind === 'github_run') {
       if (!input.repository || !/^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(input.repository) ||
           typeof input.runId !== 'number' || !Number.isSafeInteger(input.runId) || input.runId <= 0) {
@@ -385,7 +424,16 @@ export async function armLongRunWaitNow(input: ArmLongRunWaitInput): Promise<Lon
       if (typeof input.dueAt !== 'number' || !Number.isSafeInteger(input.dueAt) || input.dueAt <= Date.now()) {
         throw new Error('long_run_timer_wait_invalid');
       }
+    } else if (!input.providerKey) {
+      // Custom wait adapters must provide a stable semantic key so ACK loss/retries cannot create
+      // multiple waits for the same external condition.
+      throw new Error('long_run_custom_wait_key_required');
     }
+
+    const providerKey = input.providerKey ??
+      (input.kind === 'github_run' ? `github:${input.repository}:${input.runId}`
+        : input.kind === 'process' ? `process:${input.processId}`
+          : `timer:${input.dueAt}`);
 
     const beforeEpoch = epochs.get(input.sessionId);
     const beforeWork = obligations.get(input.sessionId);
@@ -394,16 +442,23 @@ export async function armLongRunWaitNow(input: ArmLongRunWaitInput): Promise<Lon
       // A lost tool response may cause the model to repeat the exact session_wait call. The source
       // turn and external target are the semantic identity. Timer retries intentionally ignore a
       // freshly recomputed dueAt, otherwise one transport retry silently extends the deadline.
+      const heldProviderKey = beforeWait.providerKey ??
+        (beforeWait.kind === 'github_run' ? `github:${beforeWait.repository}:${beforeWait.runId}`
+          : beforeWait.kind === 'process' ? `process:${beforeWait.processId}`
+            : beforeWait.kind === 'timer' ? `timer:${beforeWait.dueAt}`
+              : null);
+      const sameProviderTarget = input.kind === 'timer'
+        // Timer retries recompute "now + seconds"; the already-durable original deadline wins.
+        ? true
+        : heldProviderKey === providerKey;
       const sameTarget =
         beforeWait.conversationId === input.conversationId &&
         beforeWait.kind === input.kind &&
+        sameProviderTarget &&
         beforeWork?.state === 'waiting' &&
         beforeWait.obligationId === beforeWork.id &&
         beforeWork.sourceTurnId === input.sourceTurnId &&
-        (input.sourceRequestId == null || beforeWork.sourceRequestId === input.sourceRequestId) &&
-        (input.kind !== 'github_run' ||
-          (beforeWait.repository === input.repository && beforeWait.runId === input.runId)) &&
-        (input.kind !== 'process' || beforeWait.processId === input.processId);
+        (input.sourceRequestId == null || beforeWork.sourceRequestId === input.sourceRequestId);
       if (sameTarget) return cloneWait(beforeWait);
       throw new Error('long_run_wait_already_active');
     }
@@ -418,9 +473,7 @@ export async function armLongRunWaitNow(input: ArmLongRunWaitInput): Promise<Lon
       state: 'waiting',
       sourceTurnId: input.sourceTurnId,
       sourceRequestId: input.sourceRequestId ?? null,
-      source: input.kind === 'github_run' ? `github:${input.repository}:${input.runId}`
-        : input.kind === 'process' ? `process:${input.processId}`
-          : `timer:${input.dueAt}`,
+      source: providerKey,
       inputId: null,
       result: null,
       createdAt: now,
@@ -434,6 +487,8 @@ export async function armLongRunWaitNow(input: ArmLongRunWaitInput): Promise<Lon
       epochGeneration: epoch.generation,
       obligationId: obligation.id,
       kind: input.kind,
+      providerKey,
+      providerData: input.providerData ? { ...input.providerData } : null,
       repository: input.kind === 'github_run' ? input.repository! : null,
       runId: input.kind === 'github_run' ? input.runId! : null,
       processId: input.kind === 'process' ? input.processId! : null,
@@ -761,14 +816,15 @@ export async function markLongRunWorkQueuedNow(
   });
 }
 
-export async function noteLongRunProgressNow(
-  sessionId: string,
-  conversationId: string,
-  progressAt: number,
-  turnId: string | null,
-  evidence: 'mcp' | 'terminal',
-  requestId: string | null = null
-): Promise<boolean> {
+export async function certifyLongRunProgressNow(certificate: ProgressCertificate): Promise<boolean> {
+  const {
+    sessionId,
+    conversationId,
+    observedAt: progressAt,
+    turnId,
+    evidence,
+    requestId = null
+  } = certificate;
   return serial(async () => {
     const epoch = epochs.get(sessionId);
     const work = obligations.get(sessionId);
@@ -797,6 +853,25 @@ export async function noteLongRunProgressNow(
     try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
     catch (err) { obligations.set(sessionId, before); persistSoon(); throw err; }
     return true;
+  });
+}
+
+/** Backward-compatible adapter for existing browser/MCP progress call sites. */
+export function noteLongRunProgressNow(
+  sessionId: string,
+  conversationId: string,
+  progressAt: number,
+  turnId: string | null,
+  evidence: 'mcp' | 'terminal',
+  requestId: string | null = null
+): Promise<boolean> {
+  return certifyLongRunProgressNow({
+    sessionId,
+    conversationId,
+    observedAt: progressAt,
+    turnId,
+    evidence,
+    requestId
   });
 }
 
