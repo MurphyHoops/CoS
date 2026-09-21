@@ -884,6 +884,29 @@ describe('desktop input delivery and helper ownership', () => {
     ]);
   });
 
+  it('marks a Long-Run browser continuation automatic at the native Send boundary', async () => {
+    const obligation = '11111111-2222-4333-8444-555555555555';
+    live = await harness(`https://chatgpt.com/c/${chatA}`, {
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack
+        ? { ok: true }
+        : { input: claimed({ longRunObligationId: obligation }) } })
+    });
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+      userTurn(live!.document, 'long-run-continuation', text, { sent: false });
+      live!.document.querySelector('#prompt-textarea')!.textContent = '';
+      live!.hook.observe();
+    });
+
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA })).toEqual({ ok: true });
+    await settle();
+    live.hook.observe();
+    await live.hook.flush();
+
+    const row = emitted(live.sent, 'user_message')
+      .find(entry => entry.event.messageId === 'm-long-run-continuation');
+    expect(row?.event).toMatchObject({ kind: 'user_message', automatic: true });
+  });
+
   it('carries the exact pending opening into first-call correlation and retires only its accepted claim', async () => {
     const firstRequest = 'wfr_opening_before_ack', secondRequest = 'wfr_after_opening_bind';
     live = await harness(`https://chatgpt.com/?cos-input=${inputId}`, {

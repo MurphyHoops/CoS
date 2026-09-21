@@ -291,6 +291,8 @@ export type SessionEvent =
       inputDelivery?: 'offered' | 'confirmed';
       /** Original app-authored text, excluding transport-only control instructions. */
       authoredText?: string;
+      /** Proven app-generated user-role transport/guidance, never a new human requirement. */
+      automatic?: true;
       /** Native badge on this exact user message. Missing means unobserved; null means absent. */
       reaction?: string | null;
       attachments?: import('./input.js').InputAttachment[];
@@ -428,7 +430,7 @@ export type SessionEventKind = SessionEvent['kind'];
  * `extension/content.js`, which cannot import; the renderer uses this one to fold a
  * compaction's three rows into one.
  */
-export const CONTINUATION_MARKER = /^\s*\[\[CLF-(HANDOFF|RESUME):([A-Za-z0-9_-]{16,64})\]\](?:\s|$)/;
+export const CONTINUATION_MARKER = /^\s*\[\[CLF-(HANDOFF|RESUME)(?:\\)?:([A-Za-z0-9_-]{16,64})\]\](?:\s|$)/;
 
 /**
  * An event before the store assigns its sequence number.
@@ -519,6 +521,12 @@ export interface SessionSummary {
   selectedModel?: { conversationId: string; model: string; observedAt: number; reasoningEffort?: ReasoningEffort };
   /** Explicit local project; durable across frontend conversation replacement. */
   projectId?: string;
+  /**
+   * Durable user authority fence for autonomous execution. While set, Goal/Loop, Long-Run
+   * continuations and Self-Healing may observe state but must not start new autonomous work.
+   * Manual user actions remain available. Null/undefined means automation is not paused.
+   */
+  autonomyPausedAt?: number | null;
   id: string;
   title: string;
   /**

@@ -27,6 +27,7 @@ export async function recordDeliveredInput(entry: Readonly<InputEntry>, anchorCo
     // Browser delivery uses its exact native key, so a later page echo updates this row.
     // Tool delivery has no native user row and keeps the stable input id as its key.
     messageId, inputId: entry.id, inputDelivery: offered ? 'offered' as const : 'confirmed' as const, authoredText: entry.text,
+    ...(entry.finishOwner || entry.longRunObligationId ? { automatic: true as const } : {}),
     ...(messageId.startsWith('input:') && entry.toolTurnId ? { turnId: entry.toolTurnId } : {}),
     ...(entry.attachments?.length && entry.transportIntent !== 'tool' ? { attachments: entry.attachments } : {}),
     // Injection does not change the running model. Only the native send path verifies

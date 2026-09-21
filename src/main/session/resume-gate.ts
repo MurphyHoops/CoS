@@ -29,7 +29,8 @@
  * window is not free: while it is open, a genuinely unrelated new conversation waits before
  * getting a session of its own.
  */
-export const RESUME_CLAIM_WINDOW_MS = 60_000;
+// Must never be shorter than the browser command's 90-second fresh-chat delivery deadline.
+export const RESUME_CLAIM_WINDOW_MS = 90_000;
 
 const claims = new Map<string, number>();
 

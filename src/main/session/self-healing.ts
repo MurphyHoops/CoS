@@ -45,7 +45,8 @@ import {
   readLatestUserMessage,
   readRecentEvents,
   releaseSessionReplacementTransfer,
-  setSessionRecoveryState
+  setSessionRecoveryState,
+  sessionAutonomyPaused
 } from './store.js';
 
 const PROVEN_READ_ONLY_TOOLS = new Set(['read', 'find', 'view_image', 'observe']);
@@ -132,7 +133,8 @@ export async function beginSelfHealingEpisode(
   lastProgressAt: number | null = null
 ): Promise<SelfHealingRecoveryState | null> {
   const session = await getSession(sessionId);
-  if (!session || session.conversationId !== conversationId || session.lastTurnOutcome === 'stopped') return null;
+  if (!session || session.conversationId !== conversationId || session.lastTurnOutcome === 'stopped' ||
+      sessionAutonomyPaused(session)) return null;
   // Compact & Resume and Emergency Resume share one provider-replacement owner. Once a
   // continuation owns it, Self-Healing must not create a competing reload/replacement episode.
   if (session.replacementTransfer?.kind === 'continuation') return null;

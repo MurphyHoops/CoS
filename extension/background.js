@@ -482,13 +482,15 @@ function routeOf(entry) {
     conversationId: entry && typeof entry.conversationId === 'string' ? entry.conversationId : null,
     provisional: entry && typeof entry.provisional === 'string' ? entry.provisional : null,
     agent: entry && typeof entry.agent === 'string' ? entry.agent : null,
-    agentCommandId: entry && typeof entry.agentCommandId === 'string' ? entry.agentCommandId : null
+    agentCommandId: entry && typeof entry.agentCommandId === 'string' ? entry.agentCommandId : null,
+    openingCommandId: entry && typeof entry.openingCommandId === 'string' ? entry.openingCommandId : null,
+    openingCommandClient: entry && typeof entry.openingCommandClient === 'string' ? entry.openingCommandClient : null
   };
 }
 
 function routeKey(entry) {
   const route = routeOf(entry);
-  return JSON.stringify([route.conversationId, route.provisional, route.agent, route.agentCommandId]);
+  return JSON.stringify([route.conversationId, route.provisional, route.agent, route.agentCommandId, route.openingCommandId, route.openingCommandClient]);
 }
 
 function gapEntry(source, kind, text) {
@@ -613,6 +615,8 @@ function enqueue(entries) {
       provisional: typeof entry.provisional === 'string' ? entry.provisional : null,
       agent: typeof entry.agent === 'string' ? entry.agent : null,
       agentCommandId: typeof entry.agentCommandId === 'string' ? entry.agentCommandId : null,
+      openingCommandId: typeof entry.openingCommandId === 'string' ? entry.openingCommandId : null,
+      openingCommandClient: typeof entry.openingCommandClient === 'string' ? entry.openingCommandClient : null,
       event: entry.event
     });
   }
@@ -699,6 +703,9 @@ function nextJournalBatch(preferredConversationId = null, excluded = []) {
       : null;
   let agent;
   let agentCommandId;
+  let openingCommandId;
+  let openingCommandClient;
+  let selectedRoute = null;
   const mine = [];
   for (const entry of journal) {
     if (!conversationId) {
@@ -706,27 +713,35 @@ function nextJournalBatch(preferredConversationId = null, excluded = []) {
       conversationId = entry.conversationId;
     }
     if (entry.conversationId !== conversationId || mine.length >= BATCH) continue;
+    const entryRoute = routeKey(entry);
+    if (selectedRoute === null) selectedRoute = entryRoute;
+    if (entryRoute !== selectedRoute) continue;
     mine.push(entry);
-    // Recovery provenance must come from the same journal entry. Older entries can have an
-    // agent label but no command id; keep delivering them, but never upgrade that label into
-    // worker-binding authority by combining it with another row's command id.
+    // Recovery/opening provenance must come from the exact same journal route. Never combine
+    // a friendly label, command id or page client from different observations into authority.
     if (!agent && entry.agent && entry.agentCommandId) {
       agent = entry.agent;
       agentCommandId = entry.agentCommandId;
     }
+    if (!openingCommandId && entry.openingCommandId && entry.openingCommandClient) {
+      openingCommandId = entry.openingCommandId;
+      openingCommandClient = entry.openingCommandClient;
+    }
     if (mine.length >= BATCH) break;
   }
-  return conversationId ? { conversationId, mine, agent, agentCommandId } : null;
+  return conversationId ? { conversationId, mine, agent, agentCommandId, openingCommandId, openingCommandClient } : null;
 }
 
 async function deliverJournalBatch(batch) {
-  const { conversationId, mine, agent, agentCommandId } = batch;
+  const { conversationId, mine, agent, agentCommandId, openingCommandId, openingCommandClient } = batch;
   const result = await call('/events', {
     method: 'POST',
     body: JSON.stringify({
       conversationId,
       agent,
       agentCommandId,
+      openingCommandId,
+      openingCommandClient,
       events: mine.map((entry) => entry.event)
     })
   });
@@ -736,7 +751,7 @@ async function deliverJournalBatch(batch) {
     const half = mine.slice(0, Math.floor(mine.length / 2));
     const retry = await call('/events', {
       method: 'POST',
-      body: JSON.stringify({ conversationId, agent, agentCommandId, events: half.map((entry) => entry.event) })
+      body: JSON.stringify({ conversationId, agent, agentCommandId, openingCommandId, openingCommandClient, events: half.map((entry) => entry.event) })
     });
     noteDelivery(retry, half.length, conversationId);
     if (!retry.ok) return false;
@@ -3232,10 +3247,14 @@ const HANDLERS = {
     // Goal drafts are conversation-scoped in the app but browser writes are tab-scoped. Tell
     // the app which tab is polling so two tabs showing the same chat cannot both receive and
     // submit one ready Goal draft.
+    const openingCommandId = typeof message.openingCommandId === 'string' ? message.openingCommandId : '';
+    const openingCommandClient = typeof message.openingCommandClient === 'string' ? message.openingCommandClient : '';
     const query =
       `?conversationId=${encodeURIComponent(message.conversationId)}` +
       `&since=${Number(message.since) || 0}` +
-      `&goalClient=${encodeURIComponent(String(source.tab))}`;
+      `&goalClient=${encodeURIComponent(String(source.tab))}` +
+      (openingCommandId ? `&openingCommandId=${encodeURIComponent(openingCommandId)}` : '') +
+      (openingCommandClient ? `&openingCommandClient=${encodeURIComponent(openingCommandClient)}` : '');
     const result = await call(`/activity${query}`);
     if (ownsDocument(source) && result.ok && result.data && await acceptBrowserRevival(result.data.revival)) {
       await recoverDeferredRevivals();

@@ -57,3 +57,40 @@ The current ChatGPT tool snapshot still does not expose a direct `session_wait` 
 - branch/PR CI and review
 
 Evidence levels remain separate: installed-live MCP acceptance proves the canary transport/runtime path; it does not by itself prove a future ChatGPT connector snapshot will surface the same tool presentation.
+
+## 2026-09-21 stability follow-up
+
+A later shared-tree pass closed additional lifecycle gaps discovered while using the runtime for
+long UEOT verification runs:
+
+- Added a durable per-session autonomy pause so Stop/Off prevents Long-Run dispatch,
+  Self-Healing admission and queued continuation delivery until the user explicitly re-enables
+  automation.
+- Marked CoS-authored continuation/user-role rows as `automatic`, preserving that provenance
+  through recording and Goal input history so machine continuations cannot become new human
+  requirements after reload or migration.
+- Carried exact fresh-chat opening command provenance into buffered browser observations and
+  reconciled it before recorder restore, preventing a replacement chat from becoming a shadow
+  session before its A→B transaction commits.
+- Accepted ChatGPT's Markdown transport escaping for continuation/recovery markers without
+  weakening canonical prompt identity, and aligned the resume claim window with the browser
+  command lifetime.
+- Tightened desktop-input send authority: an app-owned native user row receives local generation
+  authority only after its exact durable ACK. After ACK the accepted row is re-observed so its
+  generation can settle normally.
+- Tightened stuck-composer recovery by re-proving the latest user question as well as the exact
+  assistant terminal, so a new user request arriving during the probe cannot authorize recovery
+  of the previous turn.
+
+Validation after these fixes:
+
+- `git diff --check`: PASS.
+- Focused Long-Run / code-mode / Goal / bridge / content / Self-Healing / continuation / session
+  matrix: 9 files passed, 1,489 tests passed, 3 skipped.
+- Full `npm run verify`: privacy/history, notices/native sources, typecheck and Electron
+  resolution passed; 181 ordinary test files passed and 13 skipped (4,665 tests passed,
+  129 skipped), followed by 2/2 isolated MCP shutdown tests.
+- The prior committed `bf394cc` baseline was checked independently: its original
+  `content-script` suite passed 618/618. Three regressions introduced by the follow-up patch were
+  therefore treated as real regressions, fixed at their ownership boundaries, and the current
+  suite now passes 619/619.

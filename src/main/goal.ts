@@ -1747,7 +1747,7 @@ async function run(draft: GoalDraft): Promise<void> {
   // A chat carrying a specific goal is the one case where that anchor is neither needed nor
   // evidence of a recovery failure: the user stated the request themselves, before the
   // conversation existed, and writing its opening message is the whole job. See setGoalObjective.
-  if (!draft.objective && (messages.length === 0 || !messages.some((message) => message.role === 'user'))) {
+  if (!draft.objective && !messages.some((message) => message.role === 'user' && message.origin !== 'automatic')) {
     return settle(draft, 'failed', 'no_conversation');
   }
 
@@ -2312,7 +2312,8 @@ const legacyCommittedResumeCache = new Map<string, string>();
 
 async function firstUserMessage(sessionId: string, automaticIds: ReadonlySet<string>): Promise<ChatMessage | null> {
   const references = await readEvents(sessionId, { kinds: ['user_message'], limit: MAX_CONTEXT_MESSAGES });
-  const event = references.find(event => event.kind === 'user_message' && (!event.inputId || !automaticIds.has(event.inputId)));
+  const event = references.find(event => event.kind === 'user_message' &&
+    event.automatic !== true && (!event.inputId || !automaticIds.has(event.inputId)));
   if (!event || event.kind !== 'user_message') return null;
   const content = clip(event.authoredText ?? userPromptText(event.message.text) ?? event.message.text, MAX_USER_MESSAGE_CHARS);
   if (!content) return null;
@@ -2396,7 +2397,8 @@ export async function conversationMessages(sessionId: string, deliveredInput: re
       if (event.inputId && excludedInputIds.has(event.inputId)) continue;
       // The helper judges the user's work, not the executor's transport guidance.
       const content = clip(event.authoredText ?? userPromptText(event.message.text) ?? event.message.text, MAX_USER_MESSAGE_CHARS);
-      if (content) next = event.inputId && automaticIds.has(event.inputId)
+      const automatic = event.automatic === true || (event.inputId ? automaticIds.has(event.inputId) : false);
+      if (content) next = automatic
         ? { role: 'user', origin: 'automatic', content: '[Automatic continuation; not a new human requirement]\n' + content }
         : { role: 'user', content };
     } else if ((event.kind === 'assistant_message' && (event.final || event.messageId)) || (event.kind === 'progress' && event.source === 'extension')) {

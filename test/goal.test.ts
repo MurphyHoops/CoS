@@ -233,6 +233,80 @@ describe('what leaves this machine', () => {
     ]);
   });
 
+
+  it('keeps CoS-generated user-role continuations as automatic history, never new human requirements', async () => {
+    const session = await createSession({ title: 'automatic provenance', conversationId: 'c-goal-automatic-provenance' });
+    await appendEvent(session.id, {
+      time: 100,
+      source: 'extension',
+      kind: 'user_message',
+      messageId: 'human-request',
+      message: { text: 'Finish the migration, verify it, then stop', chars: 42, truncated: false }
+    });
+    await appendEvent(session.id, {
+      time: 200,
+      source: 'extension',
+      kind: 'assistant_message',
+      messageId: 'assistant-progress',
+      final: true,
+      message: { text: 'One checkpoint completed.', chars: 25, truncated: false }
+    });
+    await appendEvent(session.id, {
+      time: 300,
+      source: 'extension',
+      kind: 'user_message',
+      messageId: 'goal-generated-continue',
+      automatic: true,
+      message: { text: 'Continue the same durable task from the first still-needed action.', chars: 62, truncated: false }
+    });
+    await appendEvent(session.id, {
+      time: 400,
+      source: 'extension',
+      kind: 'user_message',
+      messageId: 'long-run-generated-continue',
+      automatic: true,
+      message: { text: '[[CLF-WAIT-RESOLVED:fixture]] Continue the same durable task.', chars: 61, truncated: false }
+    });
+
+    const messages = await goal.conversationMessages(session.id);
+    expect(messages[0]).toEqual({ role: 'user', content: 'Finish the migration, verify it, then stop' });
+    expect(messages.filter(message => message.origin === 'automatic')).toEqual([
+      {
+        role: 'user',
+        origin: 'automatic',
+        content: '[Automatic continuation; not a new human requirement]\nContinue the same durable task from the first still-needed action.'
+      },
+      {
+        role: 'user',
+        origin: 'automatic',
+        content: '[Automatic continuation; not a new human requirement]\n[[CLF-WAIT-RESOLVED:fixture]] Continue the same durable task.'
+      }
+    ]);
+  });
+
+  it('does not invent a Goal from an automatic continuation when no human request exists', async () => {
+    const session = await createSession({ title: 'automatic only', conversationId: 'c-goal-automatic-only' });
+    await appendEvent(session.id, {
+      time: 100,
+      source: 'extension',
+      kind: 'user_message',
+      messageId: 'automatic-only',
+      automatic: true,
+      message: { text: 'Continue the same durable task.', chars: 31, truncated: false }
+    });
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return decision('continue', 'keep going');
+    }) as never;
+
+    goal.startGoalDraft({ sessionId: session.id, conversationId: 'c-goal-automatic-only', turnId: 'g-auto-only' });
+    const view = await settled('c-goal-automatic-only');
+    expect(view.stage).toBe('failed');
+    expect(view.error).toBe('no_conversation');
+    expect(calls).toBe(0);
+  });
+
   /**
    * The privacy boundary. The goal model decides whether the user's request has been met,
    * and the conversation is the only evidence it needs for that — every tool call,

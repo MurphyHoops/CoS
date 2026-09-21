@@ -297,6 +297,7 @@ function emptySummary(id: string, title: string, conversationId: string | null):
   return {
     id,
     title,
+    autonomyPausedAt: null,
     conversationId,
     chatIds: conversationId ? [conversationId] : [],
     startedAt: now,
@@ -1176,6 +1177,7 @@ export function upsertMessageEvent(
           : previous?.kind === 'user_message' && event.kind === 'user_message'
             ? { ...event, inputId: event.inputId ?? previous.inputId,
                 authoredText: event.authoredText ?? previous.authoredText,
+                automatic: event.automatic === true || previous.automatic === true ? true : undefined,
                 reaction: event.reaction === undefined ? previous.reaction : event.reaction,
                 // App-owned originals/previews retain their outbox identity when the
                 // provider later observes different native attachment ids for that send.
@@ -2032,6 +2034,10 @@ function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
             ? publicSummary.lastFinishReportAt
             : null,
         agents: Array.isArray(publicSummary.agents) ? publicSummary.agents : [],
+        autonomyPausedAt:
+          typeof publicSummary.autonomyPausedAt === 'number' && Number.isFinite(publicSummary.autonomyPausedAt) && publicSummary.autonomyPausedAt > 0
+            ? publicSummary.autonomyPausedAt
+            : null,
         origin: publicSummary.origin ?? null,
         chatIds: Array.isArray(publicSummary.chatIds)
           ? publicSummary.chatIds
@@ -2939,6 +2945,24 @@ export async function commitSelfHealingRebind(
     return null;
   }
   return recovery;
+}
+
+/** Durable master pause for autonomous execution. Manual user actions remain allowed. */
+export async function setSessionAutonomyPaused(id: string, paused: boolean): Promise<SessionSummary> {
+  const entry = await ensureOpen(id);
+  return enqueueSessionOperation(entry, 'autonomy pause', async () => {
+    const nextValue = paused ? (entry.summary.autonomyPausedAt ?? Date.now()) : null;
+    if ((entry.summary.autonomyPausedAt ?? null) === nextValue) return entry.summary;
+    const staged: SessionSummary = { ...entry.summary, autonomyPausedAt: nextValue, updatedAt: Date.now() };
+    await writeSummary(staged, entry.historySeq);
+    entry.summary = staged;
+    publishAttachmentSummary(staged);
+    return staged;
+  });
+}
+
+export function sessionAutonomyPaused(summary: SessionSummary | null | undefined): boolean {
+  return typeof summary?.autonomyPausedAt === 'number' && summary.autonomyPausedAt > 0;
 }
 
 /** Bind once before publishing project work; a task never silently changes folders. */

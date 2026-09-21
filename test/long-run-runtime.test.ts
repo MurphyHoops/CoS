@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   execOwner: vi.fn(),
   enqueueInput: vi.fn(),
   getSession: vi.fn(),
+  sessionAutonomyPaused: vi.fn(),
   logInfo: vi.fn(),
   logWarn: vi.fn()
 }));
@@ -35,7 +36,10 @@ vi.mock('../src/main/codex/ownership.js', () => ({
   execOwner: mocks.execOwner
 }));
 vi.mock('../src/main/session/input.js', () => ({ enqueueInput: mocks.enqueueInput }));
-vi.mock('../src/main/session/store.js', () => ({ getSession: mocks.getSession }));
+vi.mock('../src/main/session/store.js', () => ({
+  getSession: mocks.getSession,
+  sessionAutonomyPaused: mocks.sessionAutonomyPaused
+}));
 vi.mock('../src/main/logger.js', () => ({ logInfo: mocks.logInfo, logWarn: mocks.logWarn }));
 
 const { initDurableStore, resetDurableForTests } = await import('../src/main/durable.js');
@@ -87,6 +91,9 @@ beforeEach(async () => {
   mocks.backgroundExecObligations.mockReturnValue({ running: [], exitedUnread: [] });
   mocks.execOwner.mockReturnValue(null);
   mocks.enqueueInput.mockResolvedValue({ state: 'queued' });
+  mocks.sessionAutonomyPaused.mockImplementation((session: { autonomyPausedAt?: number | null } | null | undefined) =>
+    typeof session?.autonomyPausedAt === 'number' && session.autonomyPausedAt > 0
+  );
   mocks.getSession.mockResolvedValue({
     id: SESSION,
     conversationId: CHAT,
@@ -342,6 +349,24 @@ describe('local long-run supervisor', () => {
       id: work!.id,
       state: 'dispatching'
     });
+  });
+
+  it('keeps resolved autonomous work dormant while the durable session is user-paused', async () => {
+    mocks.goalSwitchFor.mockReturnValue({ enabled: true, mode: 'goal', own: true, afterTurn: false });
+    mocks.getSession.mockResolvedValue({
+      id: SESSION,
+      conversationId: CHAT,
+      autonomyPausedAt: Date.now(),
+      recovery: null,
+      origin: { kind: 'desktop' }
+    });
+    const work = await ensureRecoveryWorkNow(SESSION, CHAT, 'recovery:episode:paused');
+
+    await pollLongRunRuntime(work!.createdAt + 90_001);
+
+    expect(mocks.enqueueInput).not.toHaveBeenCalled();
+    expect(mocks.stageWorkerContinuation).not.toHaveBeenCalled();
+    expect(longRunStatus(SESSION).work).toMatchObject({ id: work!.id, state: 'owed' });
   });
 
   it('does not dispatch autonomous work while recovery_failed may still hold ambiguous-send fences', async () => {

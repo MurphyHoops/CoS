@@ -114,7 +114,9 @@ import {
   turnHasMcpCall,
   readActivityEvents,
   readHydratedActivityCall,
-  sessionDurableModifiedAt
+  sessionDurableModifiedAt,
+  setSessionAutonomyPaused,
+  sessionAutonomyPaused
 } from './session/store.js';
 import { inFlightMcpRequests, runningToolCalls, runningToolProgress, settlingToolCalls } from './mcp/call-context.js';
 import { nativeHandoffPrompt } from './session/handoff-prompt.js';
@@ -932,6 +934,7 @@ function parseObservations(input: unknown): ChatObservation[] {
     };
     if (item['authoredTime'] === true) observation.authoredTime = true;
     if (item['authoredNow'] === true && kind === 'user_message') observation.authoredNow = true;
+    if (item['automatic'] === true && kind === 'user_message') observation.automatic = true;
     if (item['activeNow'] === true && kind === 'assistant_message') observation.activeNow = true;
     if (kind === 'model_selection') {
       if (typeof item['model'] !== 'string' || !/^[a-zA-Z0-9 ._-]{1,80}$/.test(item['model'])) continue;
@@ -1318,6 +1321,8 @@ export type SessionControlsView = {
   plan: import('../shared/agent-plan.js').AgentPlan | null;
   conversationId: string;
   automation: 'off' | 'goal' | 'loop';
+  /** Durable master user fence; stronger than the Goal/Loop switch. */
+  autonomyPaused: boolean;
   loopAfterTurn?: boolean;
   proLoopDelivery?: boolean;
   objective: string;
@@ -1368,20 +1373,22 @@ export async function sessionControlsFor(sessionId: string): Promise<SessionCont
   const selfHealingStatus = getConfig().multiAgent.selfHealingSessions || session.recovery
     ? recoveryStatusLabel(session.recovery)
     : null;
+  const autonomyPaused = sessionAutonomyPaused(session);
   return { sessionId, plan, conversationId: id, activeTurnId, finishHeld,
     recovery,
+    autonomyPaused,
     selfHealingStatus,
     queueAtFinish: !blocked && inputPolicy.queueAtFinish, canInject: !blocked && inputPolicy.canInject,
     canSendDirectly: !blocked && !!inputPolicy.directTurn,
     finishGoalDraft: getSessionFinishDraft(sessionId, activeTurnId),
     finishWaiting,
-    goalDraft: draft ? { stage: draft.stage, model: draft.model, text: draft.text.slice(-8000), error: draft.error } : null,
-    goalWait: !blocked && !draft && goalActiveFor(id) ? await goalWaitFor(id, sessionId) : null,
+    goalDraft: !autonomyPaused && draft ? { stage: draft.stage, model: draft.model, text: draft.text.slice(-8000), error: draft.error } : null,
+    goalWait: !autonomyPaused && !blocked && !draft && goalActiveFor(id) ? await goalWaitFor(id, sessionId) : null,
     stopPending: commands.some(c => c.spec.type === 'stop' && c.spec.sessionId === sessionId && c.spec.turnId === activeTurnId),
     objective: goalObjectiveFor(id),
     loopAfterTurn: control.afterTurn,
     proLoopDelivery: session.selectedModel?.conversationId === id && isProModel(session.selectedModel.model, session.selectedModel.reasoningEffort),
-    automation: goalArmedFor(id) && !blocked ? control.enabled ? control.mode : 'goal' : 'off',
+    automation: autonomyPaused ? 'off' : goalArmedFor(id) && !blocked ? control.enabled ? control.mode : 'goal' : 'off',
     blocked, job: resumeJobFor(sessionId) };
 }
 /** One absolute budget includes opening an absent tab and native hydration. */
@@ -1575,8 +1582,19 @@ export async function setSessionAutomation(sessionId: string, automation: Sessio
   const id = await controlledConversation(sessionId);
   if (automation !== 'off' && goalBlockReason(id)) throw new Error(goalWorkerChat(id) ? 'worker_goal_disabled' : 'chat_blocked');
   const mode = automation === 'off' ? goalSwitchFor(id).mode : automation;
-  // The existing reply setter retires drafts and durably closes the pickup for Off.
+  // Pause is fail-closed: raise the durable master fence before retiring Goal. Resume is the
+  // inverse ordering: restore Goal first, then remove the master fence, so a failed switch write
+  // can never let Long-Run/Self-Healing run while the UI still says automation is off.
+  if (automation === 'off') {
+    await setSessionAutonomyPaused(sessionId, true);
+    if (await controlledConversation(sessionId) !== id) throw new Error('conversation_changed');
+  }
+  // The existing reply setter retires drafts and durably closes the Goal pickup for Off.
   const held = await setGoalSwitchNow(id, mode, automation !== 'off', afterTurn);
+  if (automation !== 'off') {
+    await setSessionAutonomyPaused(sessionId, false);
+    if (await controlledConversation(sessionId) !== id) throw new Error('conversation_changed');
+  }
   if (!loopAfterTurnFor(id) && goalPendingReplyFor(id)?.silencePro) await revokeSilenceLoop(id);
   const keyPresent = held.enabled && await goalKeyPresent(mode);
   if (await controlledConversation(sessionId) !== id) throw new Error('conversation_changed');
@@ -1585,6 +1603,7 @@ export async function setSessionAutomation(sessionId: string, automation: Sessio
     && getConfig().sessions.record && keyPresent);
   forgetGoalWatch(id);
   changed();
+  if (automation !== 'off') scheduleDeliver();
   return sessionControlsFor(sessionId);
 }
 /** One ticket publication boundary shared by browser and app controls. */
@@ -2072,6 +2091,23 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     const id = conversationId(body['conversationId']);
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    const openingCommandId = typeof body['openingCommandId'] === 'string' ? body['openingCommandId'].slice(0, 128) : '';
+    const openingCommandClient = typeof body['openingCommandClient'] === 'string' ? body['openingCommandClient'].slice(0, 100) : '';
+    if (openingCommandId || openingCommandClient) {
+      if (!openingCommandId || !openingCommandClient) {
+        return json(res, 400, { error: 'bad_opening_command_provenance' }, origin);
+      }
+      // Commit the exact replacement before recorder/session restoration gets any chance to
+      // create a shadow session for this fresh chat. This is the /events twin of /activity's
+      // provenance fence; whichever route arrives first wins the same idempotent transaction.
+      const opening = await reconcileOpeningCommand(openingCommandId, openingCommandClient, id);
+      if (opening.status === 'retryable') {
+        return json(res, 503, { error: opening.error, retryable: true }, origin);
+      }
+      if (opening.status === 'terminal') {
+        return json(res, 409, { error: opening.error, disposition: 'terminal' }, origin);
+      }
+    }
     // Normal worker binding happens on the exact command ACK. `/events` is the lost-ACK
     // recovery path, but the friendly id (`worker-1`) is reused by every later swarm and is
     // therefore not enough authority on its own. A command-opened document also carries the
@@ -2295,7 +2331,21 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const id = conversationId(url.searchParams.get('conversationId'));
     const since = Number(url.searchParams.get('since') ?? 0);
     const goalClient = (url.searchParams.get('goalClient') ?? '').slice(0, 100);
+    const openingCommandId = (url.searchParams.get('openingCommandId') ?? '').slice(0, 128);
+    const openingCommandClient = (url.searchParams.get('openingCommandClient') ?? '').slice(0, 100);
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    if (openingCommandId || openingCommandClient) {
+      if (!openingCommandId || !openingCommandClient) {
+        return json(res, 400, { error: 'bad_opening_command_provenance' }, origin);
+      }
+      const opening = await reconcileOpeningCommand(openingCommandId, openingCommandClient, id);
+      if (opening.status === 'retryable') {
+        return json(res, 503, { error: opening.error, retryable: true }, origin);
+      }
+      if (opening.status === 'terminal') {
+        return json(res, 409, { error: opening.error, disposition: 'terminal' }, origin);
+      }
+    }
     const retiredWorker = retiredWorkerForConversation(id);
     const superseded = await conversationWasSuperseded(id);
     /**
@@ -2443,7 +2493,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       }
     } else if (summary?.conversationId === id && summary.recovery?.replacementConversationId === id &&
         (summary.recovery.phase === 'reconciling' || summary.recovery.phase === 'recovered') && openingUserMessage?.messageId) {
-      const marker = new RegExp(`^\\s*\\[\\[CLF-EMERGENCY-RESUME:${summary.recovery.failureEpisodeId.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\]\\]`);
+      const marker = new RegExp(`^\\s*\\[\\[CLF-EMERGENCY-RESUME(?:\\\\)?:${summary.recovery.failureEpisodeId.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\]\\]`);
       if (!openingUserMessage.message.truncated && marker.test(openingUserMessage.message.text)) {
         bootstrapMessageId = openingUserMessage.messageId;
       }
@@ -3179,6 +3229,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return json(res, 409, { error: 'recovery_command_not_current', disposition: 'terminal' }, origin);
     }
     if (action === 'dispatch') {
+      if (sessionAutonomyPaused(await getSession(recoverySpec.sessionId))) {
+        // Fail before native Send. content.js will invoke the existing release path, which
+        // safely returns this exact command to queued custody instead of cancelling the task.
+        return json(res, 409, { error: 'automation_paused', disposition: 'retain', paused: true }, origin);
+      }
       const dispatched = await writeCommandTransition(command, async () => {
         if (!commands.includes(command) || command.owner !== client || command.claimedAt === null) return false;
         return dispatchEmergencyResumeDestinationSend(
@@ -8457,6 +8512,11 @@ async function deliverOne(): Promise<void> {
     retire(command, 'its self-healing episode is no longer current');
     return;
   }
+  if (command.spec.type === 'recovery' && sessionAutonomyPaused(await getSession(command.spec.sessionId))) {
+    // User pause parks autonomous recovery before any browser is opened. The durable recovery
+    // episode/command remains queued and can be resumed explicitly without replaying a mutation.
+    return;
+  }
   if (!openInBrowser) {
     // Nothing can open a browser in this process, and nothing will come and ask. Ending it
     // here is what keeps the failure honest: the continuation stays in the chat it is in and
@@ -9077,6 +9137,124 @@ function nextDeliverable(): Command | null {
  * minutes later.
  */
 type AckStatus = 'sent' | 'failed';
+
+
+type OpeningCommandReconcile =
+  | { status: 'none' }
+  | { status: 'committed'; sessionId: string }
+  | { status: 'retryable'; error: string }
+  | { status: 'terminal'; error: string };
+
+/**
+ * Commits a fresh replacement from the exact command provenance carried by its page.
+ *
+ * This path exists before recorder/session restoration. It therefore closes the A→B ownership
+ * race without a wall-clock guess: a page can only name the random command it redeemed, and the
+ * durable continuation/recovery WAL still performs the authoritative CAS.
+ */
+async function reconcileOpeningCommand(
+  commandId: string,
+  client: string,
+  toConversationId: string
+): Promise<OpeningCommandReconcile> {
+  if (!commandId || !client) return { status: 'none' };
+  const prior = receiptFor(commandId);
+  if (prior) {
+    if (prior.outcome === 'committed' && prior.conversationId === toConversationId && prior.client === client) {
+      const session = await findSessionByConversation(toConversationId, { requireUnique: true }).catch(() => null);
+      return session ? { status: 'committed', sessionId: session.id } : { status: 'none' };
+    }
+    return { status: 'terminal', error: 'opening_command_receipt_conflict' };
+  }
+  const command = commands.find((entry) => entry.id === commandId) ?? null;
+  if (!command || command.claimedAt === null) return { status: 'none' };
+
+  if (command.spec.type === 'resume') {
+    if (command.owner !== client) return { status: 'terminal', error: 'opening_command_owner_changed' };
+    const continuation = continuationByToken(command.spec.token);
+    if (!continuation || continuation.sessionId !== command.spec.sessionId ||
+        !continuationClaimedBy(command.spec.token, command.id)) {
+      return { status: 'terminal', error: 'opening_resume_not_current' };
+    }
+    if (continuation.destinationSend.state !== 'dispatched-unresolved' &&
+        continuation.destinationSend.state !== 'sent') {
+      return { status: 'retryable', error: 'opening_resume_send_not_dispatched' };
+    }
+    const result = await commitContinuationResult(command.spec.token, toConversationId);
+    if (result.status === 'retryable') return { status: 'retryable', error: 'opening_resume_commit_retryable' };
+    if (result.status === 'rejected') return { status: 'terminal', error: 'opening_resume_commit_rejected' };
+    if (result.status === 'committed') armResumedChat(command.spec.sessionId, result.conversationId);
+    const receipt: CommandReceipt = {
+      id: command.id,
+      client,
+      conversationId: result.conversationId,
+      outcome: 'committed',
+      committed: true,
+      error: null,
+      completedAt: Date.now()
+    };
+    if (!(await finalizeCommand(command, receipt))) {
+      return { status: 'retryable', error: 'opening_resume_receipt_not_durable' };
+    }
+    return { status: 'committed', sessionId: command.spec.sessionId };
+  }
+
+  if (command.spec.type === 'recovery') {
+    const session = await getSession(command.spec.sessionId);
+    const recovery = session?.recovery;
+    if (!recovery ||
+        recovery.failureEpisodeId !== command.spec.episodeId ||
+        recovery.recoveryGeneration !== command.spec.generation ||
+        recovery.destinationSend.commandId !== command.id) {
+      return { status: 'terminal', error: 'opening_recovery_not_current' };
+    }
+    if (recovery.destinationSend.state === 'attempted-unresolved') {
+      const dispatched = await dispatchEmergencyResumeDestinationSend(
+        command.spec.sessionId,
+        command.spec.episodeId,
+        command.spec.generation,
+        command.id
+      );
+      if (!dispatched) return { status: 'retryable', error: 'opening_recovery_dispatch_not_durable' };
+    }
+    const bound = await bindEmergencyResumeDestination(
+      command.spec.sessionId,
+      command.spec.episodeId,
+      command.spec.generation,
+      command.id,
+      toConversationId,
+      null
+    );
+    if (!bound) return { status: 'terminal', error: 'opening_recovery_destination_conflict' };
+    const result = await commitEmergencyResume(command.spec.sessionId, command.spec.episodeId, toConversationId);
+    if (result.status === 'retryable') return { status: 'retryable', error: 'opening_recovery_commit_retryable' };
+    if (result.status === 'rejected') return { status: 'terminal', error: 'opening_recovery_commit_rejected' };
+    await noteChatOrigin(toConversationId, {
+      kind: 'recovery',
+      fromSessionId: command.spec.sessionId,
+      agentId: command.spec.agent,
+      task: ''
+    }).catch((err: Error) => logWarn(`could not record recovered chat origin: ${err.message}`));
+    endResumeClaim(command.spec.episodeId);
+    retireRecoveredSource(command.spec.fromConversationId);
+    armResumedChat(command.spec.sessionId, result.conversationId);
+    const receipt: CommandReceipt = {
+      id: command.id,
+      client,
+      conversationId: result.conversationId,
+      outcome: 'committed',
+      committed: true,
+      error: null,
+      completedAt: Date.now()
+    };
+    if (!(await finalizeCommand(command, receipt))) {
+      return { status: 'retryable', error: 'opening_recovery_receipt_not_durable' };
+    }
+    return { status: 'committed', sessionId: command.spec.sessionId };
+  }
+
+  return { status: 'none' };
+}
 
 /** What a queued command says the chat it opened is for. Null once the command is gone. */
 async function commandOrigin(id: string): Promise<SessionOrigin | null> {

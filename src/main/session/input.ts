@@ -155,6 +155,8 @@ export async function sessionInputPolicy(sessionId: string, observedActivity?: I
 async function longRunInputCurrent(entry: InputEntry): Promise<boolean> {
   if (!entry.longRunObligationId) return true;
   if (!entry.sessionId) return false;
+  const session = await getSession(entry.sessionId);
+  if (typeof session?.autonomyPausedAt === 'number' && session.autonomyPausedAt > 0) return false;
   const work = longRunWorkFor(entry.sessionId);
   return !!work &&
     work.id === entry.longRunObligationId &&

@@ -242,6 +242,10 @@
   // app will only accept lost-ACK recovery when this full random id still names the leased worker
   // command that opened this document. It comes only from the extension's redeemed command.
   let agentCommandId = null;
+  // Exact fresh-chat command provenance, independent of worker identity. A Resume/Recovery
+  // page uses this after native Send succeeds so every buffered observation can prove which
+  // durable replacement transaction opened the conversation before the recorder sees it.
+  let openingCommandId = null;
 
   const queue = [];
   const queueSizes = new WeakMap();
@@ -706,7 +710,24 @@
   const USER_SEND_RECEIPT_MS = 30_000;
   let userSendReceipt = null;
   const pageViewChecks = new Set(); // Existing readiness waits also observe accepted MAIN-world snapshots.
-  const sendText = (value) => String(value || '').replace(/\s+/g, '');
+  // ChatGPT's canonical provider/Fiber user source can Markdown-escape punctuation that the
+  // composer submitted literally (for example \\: in a continuation marker, or \\# / \\* in
+  // a handoff brief). Treat only that presentation escape as transport-equivalent; generation
+  // always keeps the canonical unescaped text.
+  const markdownTransportText = (value) => {
+    const input = String(value || '');
+    let output = '';
+    for (let index = 0; index < input.length; index += 1) {
+      const code = input.charCodeAt(index);
+      const next = index + 1 < input.length ? input.charCodeAt(index + 1) : -1;
+      const punctuation = (next >= 33 && next <= 47) || (next >= 58 && next <= 64) ||
+        (next >= 91 && next <= 96) || (next >= 123 && next <= 126);
+      if (code === 92 && punctuation) { output += input[index + 1]; index += 1; }
+      else output += input[index];
+    }
+    return output;
+  };
+  const sendText = (value) => markdownTransportText(value).replace(/\s+/g, '');
   /** Receipt, transcript and presentation share the same exact native user source. */
   function userMessageSource(message) {
     if (!message || message.role !== 'user' || !message.id || !message.node?.isConnected ||
@@ -734,6 +755,24 @@
     const source = userMessageSource(message);
     return source !== null && sendText(source.text) === sendText(expected);
   }
+  /** Read-only provenance probe for canonical Fiber user rows.
+   * Fiber may observe the exact native user object before the DOM path that consumes the send
+   * receipt and opens the local generation. Never consume custody here; only carry the
+   * automatic bit onto that earlier transcript observation.
+   */
+  function automaticSubmittedUser(messageId, rawText) {
+    const receipt = userSendReceipt;
+    if (!receipt?.automatic || typeof rawText !== 'string') return false;
+    if (!desktopInputBusy && Date.now() - receipt.at > USER_SEND_RECEIPT_MS) return false;
+    const route = CLF_DOM.conversationId();
+    const accepted = receipt.accepted;
+    const acceptedIdentity = accepted?.messageId === messageId &&
+      accepted.conversationId === route && accepted.epoch === epoch;
+    const sameConversation = !receipt.conversationId || receipt.conversationId === route;
+    const newIdentity = !receipt.previousMessageId || receipt.previousMessageId !== messageId;
+    return Boolean(sameConversation && newIdentity &&
+      (acceptedIdentity || (receipt.text && sendText(rawText) === receipt.text)));
+  }
   // A first fresh route may await authored evidence. A second route (including an
   // observed return to New Chat) revokes this send; text proof is not its lifetime.
   function submittedSendLifetime(target, startedEpoch = epoch) {
@@ -755,12 +794,22 @@
       return !revoked;
     };
   }
-  function sendSubmittedText(stillCurrent, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null, onAttempt = null) {
-    return CLF_DOM.send({ stillCurrent, clearAcceptedDraft, beforeSend, onAttempt, acceptUserReceipt, matchesUser: matchesSubmittedUser,
+  let automaticSendBoundary = 0;
+  function sendSubmittedText(stillCurrent, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null, onAttempt = null, automatic = false) {
+    if (!automatic) return CLF_DOM.send({ stillCurrent, clearAcceptedDraft, beforeSend, onAttempt, acceptUserReceipt, matchesUser: matchesSubmittedUser,
       observeEvidence: check => { pageViewChecks.add(check); return () => pageViewChecks.delete(check); } });
+    automaticSendBoundary += 1;
+    try {
+      return Promise.resolve(CLF_DOM.send({ stillCurrent, clearAcceptedDraft, beforeSend, onAttempt, acceptUserReceipt, matchesUser: matchesSubmittedUser,
+        observeEvidence: check => { pageViewChecks.add(check); return () => pageViewChecks.delete(check); } }))
+        .finally(() => { automaticSendBoundary = Math.max(0, automaticSendBoundary - 1); });
+    } catch (error) {
+      automaticSendBoundary = Math.max(0, automaticSendBoundary - 1);
+      throw error;
+    }
   }
   const GOAL_MARKER_INSTRUCTION = '\n\nFor this Goal session only: at the end of each final reply, write exactly one separate last line: [[COS_GOAL:COMPLETE]] if the entire requested task is finished, or [[COS_GOAL:CONTINUE]] if requested work remains. Do not claim completion for partial work. If user input is required, explain it and omit both markers.';
-  function rememberUserSend() {
+  function rememberUserSend(automatic = false) {
     // Only the explicitly selected offline Goal backend changes the user prompt.
     const composer = CLF_DOM.composer();
     if (goalConfig?.backend === 'templates' && (goalConfig?.enabled === true || (!goalConfig?.own && !!goalConfig?.objective)) && goalConfig?.mode !== 'loop' && !desktopDecision) {
@@ -784,17 +833,23 @@
       conversationId: CLF_DOM.conversationId(),
       previousMessageId,
       baseline: { sections, marks: sections.slice(-3).map(node => ({ node, mark: sectionMark(node) })) },
+      automatic: automatic === true,
+      // A desktop-input claim has a second durable authority boundary after native Send:
+      // the app must ACK the exact message under the still-current outbox owner. A rejected
+      // claim may have physically reached ChatGPT, but it must not mint local execution
+      // authority merely because later Fiber text is transport-equivalent.
+      requiresAcceptance: desktopInputBusy === true,
       at: Date.now()
     };
   }
   document.addEventListener('click', (event) => {
     const button = CLF_DOM.sendButton?.();
-    if (button && event.target && button.contains(event.target)) rememberUserSend();
+    if (button && event.target && button.contains(event.target)) rememberUserSend(automaticSendBoundary > 0);
   }, true);
   document.addEventListener('submit', (event) => {
     const composer = CLF_DOM.composer();
     if (composer && event.target && typeof event.target.contains === 'function' && event.target.contains(composer)) {
-      rememberUserSend();
+      rememberUserSend(automaticSendBoundary > 0);
     }
   }, true);
   document.addEventListener('keydown', (event) => {
@@ -806,7 +861,7 @@
       event.key === 'Enter' &&
       !event.shiftKey &&
       !event.isComposing
-    ) rememberUserSend();
+    ) rememberUserSend(automaticSendBoundary > 0);
   }, true);
 
   /**
@@ -1154,6 +1209,8 @@
       conversationId,
       agent,
       agentCommandId,
+      openingCommandId,
+      openingCommandClient: openingCommandId ? RUN_ID : null,
       event: { time: Date.now(), ...bounded }
     };
     // Streaming canonical messages replace their older unsent snapshot. Keeping every
@@ -1186,7 +1243,7 @@
       const index = queue.findIndex((entry) => !queueGapKeys.has(entry));
       if (index < 0) break;
       const dropped = removeQueueEntry(index);
-      const key = `${dropped.conversationId || ''}\u0000${dropped.agent || ''}\u0000${dropped.agentCommandId || ''}`;
+      const key = `${dropped.conversationId || ''}\u0000${dropped.agent || ''}\u0000${dropped.agentCommandId || ''}\u0000${dropped.openingCommandId || ''}`;
       let held = queueGaps.get(key);
       if (!held) {
         held = {
@@ -1194,6 +1251,7 @@
             conversationId: dropped.conversationId,
             agent: dropped.agent,
             agentCommandId: dropped.agentCommandId,
+            openingCommandId: dropped.openingCommandId,
             event: {
               time: dropped.event.time,
               kind: 'chat_error',
@@ -2003,9 +2061,9 @@
           const attachmentsMatch = receipt.text || (receipt.attachmentNames?.length &&
             JSON.stringify(receipt.attachmentNames) === JSON.stringify((userMessageSource(message)?.attachments || []).map(file => file.name).sort()));
           if (sameConversation && newIdentity && attachmentsMatch &&
-              (acceptedIdentity || matchesSubmittedUser(message, receipt.text))) {
+              (acceptedIdentity || (!receipt.requiresAcceptance && matchesSubmittedUser(message, receipt.text)))) {
             userSendReceipt = null;
-            return { messageId: message.id, baseline: receipt.baseline };
+            return { messageId: message.id, baseline: receipt.baseline, automatic: receipt.automatic === true };
           }
         }
       }
@@ -2042,7 +2100,13 @@
         // row contributes only the boundary here.
         const justAuthored = authoredNow(message);
         if (seenMessages.has(key) && (reaction === undefined || (seenMessages.get(key) ?? null) === reaction)) {
-          if (justAuthored) newUserMessage = justAuthored;
+          if (justAuthored) {
+            newUserMessage = justAuthored;
+            if (justAuthored.automatic) emit({
+              kind: 'user_message', text, messageId: message.id, turnId: message.turnId || undefined,
+              authoredNow: true, automatic: true
+            });
+          }
           continue;
         }
         // Presentation is not enough to commit a continuation, but it is enough to stop this
@@ -2067,6 +2131,7 @@
         }
         markSeen(key, reaction);
         if (justAuthored) newUserMessage = justAuthored;
+        const automatic = justAuthored?.automatic === true || automaticSubmittedUser(message.id, text);
         emit({
           kind: 'user_message',
           text,
@@ -2074,7 +2139,8 @@
           ...(source.attachments?.length ? { attachments: source.attachments } : {}),
           messageId: message.id,
           turnId: message.turnId || undefined,
-          ...(justAuthored ? { authoredNow: true } : {})
+          ...(justAuthored ? { authoredNow: true } : {}),
+          ...(automatic ? { automatic: true } : {})
         });
       } else if (message.role === 'assistant') {
         // Assistant identity/content comes exclusively from the MAIN-world Fiber scan now.
@@ -2197,6 +2263,7 @@
         // the worker". A tab that has left the worker's chat is nobody's worker.
         agent = null;
         agentCommandId = null;
+        openingCommandId = null;
         resetConversation();
         // New Chat can be reached from an older chat in the same document. Retire that
         // old recording normally, transferring only this dispatched opening to its first
@@ -4120,7 +4187,8 @@
             messageId: message.messageId,
             text: message.rawText,
             ...(message.attachments?.length ? { attachments: message.attachments } : {}),
-            ...(message.createTime ? { time: message.createTime, authoredTime: true } : {})
+            ...(message.createTime ? { time: message.createTime, authoredTime: true } : {}),
+            ...(automaticSubmittedUser(message.messageId, message.rawText) ? { automatic: true } : {})
           });
           continue;
         }
@@ -6003,7 +6071,12 @@
     const forEpoch = epoch;
     const current = () => alive && conversationId === forId && epoch === forEpoch;
     try {
-      const reply = await ask({ type: 'activity', conversationId, since });
+      const reply = await ask({
+        type: 'activity',
+        conversationId,
+        since,
+        ...(openingCommandId ? { openingCommandId, openingCommandClient: RUN_ID } : {})
+      });
       if (!reply || reply.ok !== true || !reply.data) {
         // Keep waiting only for failures that can genuinely mean "the local app/worker is
         // not reachable yet". A structured application refusal is an answer to the identity
@@ -6180,6 +6253,11 @@
       }
       if (recoveryJournalPending && bootstrap === 'recovery' && observed.session) {
         releaseRecoveryJournal();
+      }
+      if (observed.session && (bootstrap === 'resume' || bootstrap === 'recovery' || bootstrap === 'worker')) {
+        // The app has durably attached this fresh conversation. The exact opening provenance has
+        // served its only purpose and must not be replayed forever on ordinary activity polls.
+        openingCommandId = null;
       }
       bootstrapAgent = typeof data.bootstrapAgent === 'string' && data.bootstrapAgent ? data.bootstrapAgent : null;
       if (job && job.busy) pressedAt = 0;
@@ -7305,12 +7383,12 @@
     // Programmatic sends do not reliably bubble the synthetic button click through the
     // document listener in every ChatGPT renderer. Mint the same receipt explicitly at the
     // irreversible boundary so the first user row can open its local generation.
-    rememberUserSend();
+    rememberUserSend(true);
     const openingSend = { text: opening, current: submittedSendLifetime(null, openingEpoch), accepted: false };
     const sendingTarget = () => pendingObjectiveSend === openingSend && openingSend.current() &&
       pendingObjective === goal && goalConfig?.enabled === true && pendingObjectiveMode === (mode === 'loop' ? 'loop' : 'goal');
     pendingObjectiveSend = openingSend;
-    const sent = await sendSubmittedText(sendingTarget);
+    const sent = await sendSubmittedText(sendingTarget, true, null, null, null, true);
     if (!sendingTarget()) return;
     if (!sent) {
       pendingObjectiveSend = null;
@@ -8607,8 +8685,8 @@
         return;
       }
       attemptCrossed = true;
-      rememberUserSend();
-      if (!(await sendSubmittedText(current))) {
+      rememberUserSend(true);
+      if (!(await sendSubmittedText(current, true, null, null, null, true))) {
         CLF_DOM.clearPromptExact(prompt);
         nativeBusy = false;
         nativePhase = 'waiting';
@@ -8643,8 +8721,8 @@
     }
   }
 
-  const CONTINUATION_MARKER = /^\s*\[\[CLF-(HANDOFF|RESUME):([A-Za-z0-9_-]{16,64})\]\](?:\s|$)/;
-  const EMERGENCY_RESUME_MARKER = /^\s*\[\[CLF-EMERGENCY-RESUME:([0-9a-f-]{8,64})\]\](?:\s|$)/i;
+  const CONTINUATION_MARKER = /^\s*\[\[CLF-(HANDOFF|RESUME)(?:\\)?:([A-Za-z0-9_-]{16,64})\]\](?:\s|$)/;
+  const EMERGENCY_RESUME_MARKER = /^\s*\[\[CLF-EMERGENCY-RESUME(?:\\)?:([0-9a-f-]{8,64})\]\](?:\s|$)/i;
   const continuationReconciliations = new Map();
   /**
    * Proof key → how the app answered the marker: `committed` is ownership proof for the
@@ -9493,10 +9571,10 @@
             !(allowed.enabled === true || (allowed.own !== true && allowed.objective)) || allowed.hasKey !== true ||
             allowed.blocked || allowed.queuePending || authorization.data.job?.busy || authorization.data.pendingTools > 0 ||
             goalSourceGenerating() || CLF_DOM.generating() || nativeBusy || job?.busy) return false;
-        rememberUserSend();
+        rememberUserSend(true);
         sendAttempted = true;
         return true;
-      });
+      }, null, null, true);
       if (!onDocument() || !sendAttempted) return;
       const ownsDraft = goalDraft?.token === draft.token;
       if (ownsDraft) goalDraft = null;
@@ -10247,6 +10325,10 @@
         return void (await fail('the resume bootstrap had no valid continuation marker'));
       }
       continuationJournalPending = true;
+      // Hold every observation until this exact opening command can be attached to it. The app
+      // can then commit A→B before recorder session creation instead of relying on a wall-clock
+      // shadow-session grace window.
+      commandJournalGate = true;
       const permit = await ask({ type: 'compact', token: resumeMarker[2], commandId: boot.id, client: RUN_ID, destinationAttempt: true });
       if (await rejectChangedBootstrap()) return;
       if (!permit || permit.ok !== true || !permit.data || permit.data.allowed !== true) {
@@ -10276,7 +10358,7 @@
       recoveryJournalPending = true;
       commandJournalGate = true;
     }
-    rememberUserSend();
+    rememberUserSend(true);
     let recoverySendAttempted = false;
     const authorizeRecoveryDispatch = boot.type === 'recovery'
       ? async (sendCurrent) => {
@@ -10289,7 +10371,8 @@
       false,
       authorizeRecoveryDispatch,
       null,
-      boot.type === 'recovery' ? () => { recoverySendAttempted = true; } : null
+      boot.type === 'recovery' ? () => { recoverySendAttempted = true; } : null,
+      true
     ))) {
       // Once send() was invoked, a missing/cleared draft cannot prove that no click
       // happened. Only the exact pre-click check above may release the dispatch.
@@ -10311,6 +10394,18 @@
         return;
       }
       return void (await fail('ChatGPT did not accept the bootstrap send'));
+    }
+    if (typeof boot.id === 'string' && ['worker', 'resume', 'recovery'].includes(boot.type)) {
+      openingCommandId = boot.id;
+      // Observations made while the fresh route had no /c/<id> were intentionally held by
+      // commandJournalGate. Stamp them now that native Send is proven, before any flush can make
+      // recorder ownership decisions.
+      for (const entry of queue) {
+        if (entry.conversationId || entry.openingCommandId) continue;
+        entry.openingCommandId = openingCommandId;
+        entry.openingCommandClient = RUN_ID;
+        accountQueueEntry(entry);
+      }
     }
     agent = boot.agent || null;
     agentCommandId = agent && typeof boot.id === 'string' ? boot.id : null;
@@ -10689,9 +10784,12 @@
       // Keep the input queued until this same document exposes its composer again.
       const composer = await waitPageView(() => (message.directTurn || !CLF_DOM.generating()) && CLF_DOM.composerVisible() && CLF_DOM.composer(),
         () => onTarget() && (message.directTurn || silencePickup || !generating) && pendingTools === 0, 15000);
-      if (!composer && onTarget() && CLF_DOM.generating() && await confirmedProviderTerminal() && onTarget() && CLF_DOM.generating()) {
-        // Only after readiness expires, re-prove the exact terminal: a Retry or
-        // new user turn must never become authority to reload the page.
+      const sameSourceUser = () =>
+        CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id === sourceUser;
+      if (!composer && onTarget() && sameSourceUser() && CLF_DOM.generating() &&
+          await confirmedProviderTerminal() && onTarget() && sameSourceUser() && CLF_DOM.generating()) {
+        // Only after readiness expires, re-prove both sides of the exact turn. A Retry or a new
+        // user question must never let the previous assistant terminal authorize page recovery.
         emit({ kind: 'chat_error', turnId, recoverable: true, text: 'ChatGPT finished its answer but its composer is still stuck on Stop. Recovering this page before delivering the queued message.' });
         await flush();
         return false; // No claim, insertion or Send: queued input survives recovery.
@@ -10755,7 +10853,11 @@
       await Promise.resolve();
       if (!onTarget() || !draft.current() || sendText(CLF_DOM.composer()?.textContent) !== sendText(input.text)) return fail('The composer changed; your draft was preserved');
       const previousUserId = CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id;
-      rememberUserSend();
+      // Internal continuation inputs still travel through ChatGPT's native composer, but they
+      // are execution history rather than a new human instruction. Stamp that provenance at
+      // the irreversible browser-send boundary too; canonical input history later reinforces
+      // the same bit, and message upsert only promotes automatic provenance, never erases it.
+      rememberUserSend(Boolean(input.finishOwner || input.longRunObligationId));
       const submittedText = sendText(CLF_DOM.composer()?.textContent);
       if (input.purpose === 'decision') {
         decision = { id: input.id, owner: input.owner, messageId: null, text: input.text, temporary, onTarget: sendingTarget, conversationId: null, epoch: forEpoch, response: '', publishing: false };
@@ -10778,7 +10880,7 @@
         // may replace it before this async operation resumes; do not rediscover it.
         receipt = { conversation, user: { id: user.id } };
         return true;
-      }))) return false;
+      }, null, Boolean(input.finishOwner || input.longRunObligationId)))) return false;
       if (!receipt || !sendingTarget()) return false;
       // Native Send listeners refresh the receipt; pin only that witnessed object.
       const witnessedSendReceipt = userSendReceipt;
@@ -10802,6 +10904,10 @@
           (witnessedSendReceipt.previousMessageId ?? null) === (previousUserId ?? null) &&
           Date.now() - witnessedSendReceipt.at <= USER_SEND_RECEIPT_MS) {
         witnessedSendReceipt.accepted = { messageId: receipt.user.id, conversationId: deliveredConversation, epoch };
+        // Acceptance is the second authority boundary for app-owned desktop input. The native
+        // row may already have been observed before ACK and deliberately refused generation
+        // authority; re-observe now so that exact accepted row can open the local generation.
+        observe();
       }
       // Stop/composer-clear may precede the exact user row. This receipt, not that early
       // native acceptance, owns retirement of the still-untouched prepared draft. A

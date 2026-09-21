@@ -51,14 +51,26 @@ export function resumeBootstrapText(summary: string, token = ''): string {
  * Whether a recorded user row is the exact Compact & Resume bootstrap for one stored handoff.
  *
  * ChatGPT's rendered text has historically changed ordinary indentation spaces into NBSP. One
- * Windows/DOM path then surfaced those bytes as the literal mojibake pair `Â ` (U+00C2 U+00A0)
- * in the recorder. That is presentation damage, not authored-content drift. Canonicalise only
- * those known space artifacts plus line endings; deliberately do not trim/collapse
- * ordinary whitespace or normalize arbitrary Unicode, because this comparison is provenance.
+ * Windows/DOM path then surfaced those bytes as the literal mojibake pair `Â ` (U+00C2 U+00A0).
+ * The canonical provider/Fiber user source can also Markdown-escape ASCII punctuation even though
+ * the composer submitted it literally. Those are presentation artifacts, not authored-content
+ * drift. Canonicalise only those known transformations; do not trim/collapse ordinary whitespace
+ * or normalize arbitrary Unicode, because this comparison is provenance.
  */
 export function resumeBootstrapMatches(recorded: string, summary: string): boolean {
-  const canonical = (value: string): string =>
-    value.replace(/\u00c2\u00a0/g, ' ').replace(/\u00a0/g, ' ').replace(/\r\n?/g, '\n');
+  const canonical = (value: string): string => {
+    const spaced = value.replace(/\u00c2\u00a0/g, ' ').replace(/\u00a0/g, ' ').replace(/\r\n?/g, '\n');
+    let output = '';
+    for (let index = 0; index < spaced.length; index += 1) {
+      const code = spaced.charCodeAt(index);
+      const next = index + 1 < spaced.length ? spaced.charCodeAt(index + 1) : -1;
+      const punctuation = (next >= 33 && next <= 47) || (next >= 58 && next <= 64) ||
+        (next >= 91 && next <= 96) || (next >= 123 && next <= 126);
+      if (code === 92 && punctuation) { output += spaced[index + 1]; index += 1; }
+      else output += spaced[index];
+    }
+    return output;
+  };
   const normalized = canonical(recorded);
   const withoutMarker = (userPromptText(normalized) ?? normalized).replace(/^\[\[CLF-RESUME:[A-Za-z0-9_-]{16,64}\]\]\n\n/, '');
   return withoutMarker === canonical(resumeBootstrapText(summary));

@@ -2599,6 +2599,95 @@ describe('delivering a bootstrap', () => {
     expect((await getSession(sessionId))?.conversationId).toBe(destination);
   });
 
+
+  it('commits an exact replacement from activity provenance before recorder restore, preserving project and Goal', async () => {
+    await pair();
+    const from = '93939393-1111-2222-3333-444444444444';
+    const destination = '94949494-1111-2222-3333-444444444444';
+    const projectId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const client = 'slow-resume-page';
+    const { sessionId, token } = await compactedSession(from, 'carry project and Goal exactly');
+
+    await sessionStoreModule.bindSessionProject(sessionId, projectId);
+    const goal = await import('../src/main/goal.js');
+    await goal.setGoalObjectiveNow(from, 'finish the durable mission');
+    await goal.setGoalSwitchNow(from, 'goal', true);
+
+    const command = queueResume(sessionId, token)!;
+    expect((await request('POST', '/commands/redeem', { body: { id: command.id, client } })).status).toBe(200);
+    expect((await request('POST', '/compact', {
+      body: { token, commandId: command.id, client, destinationAttempt: true }
+    })).body.allowed).toBe(true);
+    expect((await request('POST', '/compact', {
+      body: { token, commandId: command.id, client, destinationDispatch: true }
+    })).body.armed).toBe(true);
+
+    // No /commands/ack: this models a slow/escaped replacement whose ordinary ACK path did not
+    // report back before the page itself began polling activity. Exact command provenance must
+    // commit A→B before /activity is allowed to restore or create any session for B.
+    const feed = await request(
+      'GET',
+      `/activity?conversationId=${destination}&openingCommandId=${command.id}&openingCommandClient=${client}`
+    );
+    expect(feed.status).toBe(200);
+    expect(feed.body.sessionId).toBe(sessionId);
+    expect((await findSessionByConversation(destination, { requireUnique: true }))?.id).toBe(sessionId);
+    expect(await getSession(sessionId)).toMatchObject({
+      conversationId: destination,
+      projectId
+    });
+    expect(goal.goalSwitchFor(destination)).toMatchObject({ enabled: true, mode: 'goal' });
+    expect(goal.goalObjectiveFor(destination)).toBe('finish the durable mission');
+
+    // The browser ACK can arrive later; the activity-side commit left a durable receipt, so the
+    // late ACK is idempotent rather than opening/claiming anything again.
+    const lateAck = await request('POST', '/commands/ack', {
+      body: { id: command.id, status: 'sent', conversationId: destination, client }
+    });
+    expect(lateAck.status).toBe(200);
+    expect(lateAck.body).toMatchObject({ committed: true, conversationId: destination });
+  });
+
+  it('commits exact replacement provenance on /events before recorder can create a shadow session', async () => {
+    await pair();
+    const from = '95959595-1111-2222-3333-444444444444';
+    const destination = '96969696-1111-2222-3333-444444444444';
+    const projectId = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+    const client = 'events-first-resume-page';
+    const { sessionId, token } = await compactedSession(from, 'events must not mint a shadow');
+
+    await sessionStoreModule.bindSessionProject(sessionId, projectId);
+    const goal = await import('../src/main/goal.js');
+    await goal.setGoalObjectiveNow(from, 'preserve exact durable mission');
+    await goal.setGoalSwitchNow(from, 'goal', true);
+
+    const command = queueResume(sessionId, token)!;
+    expect((await request('POST', '/commands/redeem', { body: { id: command.id, client } })).status).toBe(200);
+    expect((await request('POST', '/compact', {
+      body: { token, commandId: command.id, client, destinationAttempt: true }
+    })).body.allowed).toBe(true);
+    expect((await request('POST', '/compact', {
+      body: { token, commandId: command.id, client, destinationDispatch: true }
+    })).body.armed).toBe(true);
+
+    const events = await request('POST', '/events', {
+      body: {
+        conversationId: destination,
+        openingCommandId: command.id,
+        openingCommandClient: client,
+        events: [{ kind: 'turn_start', time: Date.now(), turnId: 'events-first-turn' }]
+      }
+    });
+    expect(events.status).toBe(200);
+    expect((await findSessionByConversation(destination, { requireUnique: true }))?.id).toBe(sessionId);
+    expect(await getSession(sessionId)).toMatchObject({ conversationId: destination, projectId });
+    expect(goal.goalSwitchFor(destination)).toMatchObject({ enabled: true, mode: 'goal' });
+    expect(goal.goalObjectiveFor(destination)).toBe('preserve exact durable mission');
+
+    const all = await sessionStoreModule.listAllSessions();
+    expect(all.filter(row => row.conversationId === destination)).toHaveLength(1);
+  });
+
   /**
    * Document ownership is replaceable up to the click and never past it.
    *

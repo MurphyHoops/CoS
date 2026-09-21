@@ -18,7 +18,7 @@ import { goalSwitchFor } from '../goal.js';
 import { getConfig } from '../config.js';
 import { logInfo, logWarn } from '../logger.js';
 import { enqueueInput } from './input.js';
-import { getSession } from './store.js';
+import { getSession, sessionAutonomyPaused } from './store.js';
 import {
   captureExecutionTicket,
   deferLongRunWaitNow,
@@ -130,6 +130,10 @@ function continuationText(work: WorkObligation): string {
 async function dispatchWork(work: WorkObligation, now: number): Promise<void> {
   const session = await getSession(work.sessionId);
   if (!session?.conversationId || session.conversationId !== work.conversationId) return;
+  // A user pause is the master autonomous-execution fence. External waits may keep being
+  // observed and become owed, but no continuation is leased/enqueued until the same durable
+  // session is explicitly resumed.
+  if (sessionAutonomyPaused(session)) return;
   const recovery = session.recovery;
   // recovery_failed can still mean an ambiguous native Send with admission fences restored on
   // restart. It is not authority to start another provider message. Only a healthy/recovered
