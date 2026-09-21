@@ -1,5 +1,8 @@
 # Generic Long-Run Runtime — 2026-09-20
 
+
+> **Historical — pre-CoS 3.0.** This document is preserved as engineering/provenance evidence. It does **not** define current runtime behavior. Current architecture is defined by docs/architecture.md and AGENTS.md. Historical version numbers, repository links, PRs, incidents and implementation assumptions are intentionally retained as facts from that period.
+
 ## Goal
 
 Generalize the P5 durable Long-Run Runtime so it is reusable across projects and fix the host-surface failure where ChatGPT can expose Core code mode without exposing `session_wait` as a direct tool.

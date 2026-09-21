@@ -1,5 +1,8 @@
 # Manual bug hunt follow-up — 2026-08-24
 
+
+> **Historical — pre-CoS 3.0.** This document is preserved as engineering/provenance evidence. It does **not** define current runtime behavior. Current architecture is defined by docs/architecture.md and AGENTS.md. Historical version numbers, repository links, PRs, incidents and implementation assumptions are intentionally retained as facts from that period.
+
 This is the follow-up manual audit requested after the larger same-day architecture pass in
 `docs/bug-audit-2026-08-24.md`. The checkout was already heavily modified, so this pass did not
 reset, reformat, or take ownership of unrelated work. Candidate findings from parallel read-only

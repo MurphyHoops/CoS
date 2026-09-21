@@ -1,5 +1,8 @@
 # ChatGPT turn signals — what the page tells us, and how to read it
 
+
+> **CoS 3.x subsystem reference.** This document covers one component, experiment or design lineage. Interpret it under docs/architecture.md and AGENTS.md; where older terminology conflicts with the durable-mission model, the 3.x canonical documents win.
+
 Recorded 2026-08-30, against the 2.0.2 tree.
 
 Every unattended feature in this app — the Goal loop firing, a revival being sent, a compaction

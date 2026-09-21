@@ -1,5 +1,10 @@
 # Computer Use Overhaul Plan
 
+
+> **CoS 3.x subsystem reference.** This document covers one component, experiment or design lineage. Interpret it under docs/architecture.md and AGENTS.md; where older terminology conflicts with the durable-mission model, the 3.x canonical documents win.
+
+> **Non-canonical reference (design snapshot).** Keep this document for implementation context, but resolve current identity, authority, recovery and repository-policy questions from [architecture.md](architecture.md) and [AGENTS.md](../AGENTS.md).
+
 Date: 2026-08-24
 
 ## Decision in one paragraph

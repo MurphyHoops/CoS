@@ -1,5 +1,8 @@
 # Plugin notices and 2.0.8 source audit
 
+
+> **CoS 3.x provenance/compliance reference.** This document preserves third-party attribution, source or packaging obligations. It is not a product-architecture specification.
+
 Reviewed on 2026-09-08 for the full 2.0.8 source update, **Darkex by dark tibo**.
 This review covers package notices, catalog license provenance, public source scope and
 the automated validation pipeline. It does not establish clearance for every hosted-service

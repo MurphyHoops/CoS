@@ -1,5 +1,8 @@
 # Workspace integration, 12 September 2026
 
+
+> **Historical — pre-CoS 3.0.** This document is preserved as engineering/provenance evidence. It does **not** define current runtime behavior. Current architecture is defined by docs/architecture.md and AGENTS.md. Historical version numbers, repository links, PRs, incidents and implementation assumptions are intentionally retained as facts from that period.
+
 Integrated current workspace changes onto the current public main branch, retaining
 the published version metadata and the existing request-origin, send-receipt and
 README improvements. Release workflows and updater behavior are unchanged.

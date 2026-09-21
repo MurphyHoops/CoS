@@ -1,4 +1,4 @@
-# Chat On Steroids — product logic and agent map
+# CoS 3.x — durable runtime product logic and agent map
 
 Read this file before changing the app. It explains the product, feature logic, owners and
 working rules without requiring old worklogs. If the host injected only a prefix, read the
@@ -21,21 +21,25 @@ changed lines before applying an older patch. Document the work and its actual v
 the code currently does it. Known implementation gaps are collected in §21 instead of being
 mixed into the happy path as features.
 
-Source alignment: **2026-09-20**, including the generic long-run runtime candidate. App/extension **2.1.13**,
+Canonical source: **MurphyHoops/CoS**, independent runtime line, **2026-09-21**. App/extension **3.0.0**,
 bridge protocol **14** in the checked declarations (`package.json`, `src/main/version.ts`,
 `extension/manifest.json`). This does not prove release, installation or live Chrome behavior.
 
-## 1. What the whole app is meant to do
+**Repository policy.** `origin` is the standalone canonical repository and direct development line. Historical and external repositories are reference-only inputs, never branch authorities. Port a reviewed external change only when it preserves the durable-runtime invariants in this file and passes this repository's own validation.
 
-Chat On Steroids is a Windows/macOS/Linux Electron workspace around ChatGPT. The user can work
-from the desktop app while ChatGPT generates answers in its own browser conversation. The app
-sends instructions, records the conversation, supplies local tools over MCP, and coordinates
-long-running work. The companion extension connects that browser conversation to the local
-session. ChatGPT still owns model execution and its native account/model availability.
+## 1. What the whole runtime is meant to do
 
-The product should feel like one continuous workspace: choose a project, send a task, watch
-real progress, correct it while it runs, inspect what actually happened, and continue without
-losing the project, history, workers or queued instructions when a chat grows too long.
+CoS is a Windows/macOS/Linux durable local runtime for long-running AI work. The **local mission
+is the identity**; ChatGPT conversations are replaceable execution carriers. The app persists
+mission/session state, work obligations, execution authority, tool/process custody, worker state,
+external waits and recovery transactions. The companion extension supplies provider/browser
+evidence and delivery, while ChatGPT still owns model execution and native account/model
+availability.
+
+The product should feel like one continuous mission even when its execution carrier changes:
+choose a project, send a task, watch real progress, correct it while it runs, wait locally when
+external work is slow, replace a context-heavy or stalled executor when necessary, and continue
+without losing the project, history, workers, obligations or queued instructions.
 
 ### The user's normal path
 
@@ -78,7 +82,7 @@ losing the project, history, workers or queued instructions when a chat grows to
 | `update_plan` | The agent's displayed progress plan. It does not execute or consume queue entries. |
 | `session_finish` | Astra's explicit near-finish hold/notice boundary; does not mean the whole task is already verified. |
 | Long-run wait | Durable external condition owned by the local supervisor; successful arm ends source-turn mutation authority and later queues one continuation. |
-| Prime / worker | One owning conversation and its reusable subordinate chats. Several prime families may run independently. |
+| Prime / worker | Durable execution roles inside one local mission/family. Their current ChatGPT conversations are replaceable carriers, not the role identity. Several prime families may run independently. |
 | Decision helper / planner | A role-specific chat that produces a continuation decision or workflow; it must not execute the reference task. |
 | Code-mode `exec` | Bounded JavaScript composition of one MCP surface's tools. `exec_command` runs an OS process. |
 | Stop / End turn / Block | Stop requests native generation cancellation; End turn releases a finish hold; Block revokes exact-chat local tool access. |
@@ -325,14 +329,14 @@ still checks live policy. Schema visibility is never the security boundary.
 
 | Surface | Advertised operations under current eligibility |
 | --- | --- |
-| Core — `chat-on-steroids-core` | `read`, `view_image`, `find` when command execution is off, `apply_patch`, `exec_command`/`write_stdin`, `update_plan`, `agents`, `session_finish`, code-mode `exec`. |
+| Core — `chat-on-steroids-core` | `read`, `view_image`, `find` when command execution is off, `apply_patch`, `exec_command`/`write_stdin`, `update_plan`, `session_wait`, `agents`, `session_finish`, code-mode `exec`. |
 | Desktop — `chat-on-steroids-desktop` | All Chromium extension hosts: `browser_tabs`, `browser_snapshot`, `browser_screenshot`, `browser_console`, `browser_network`, `browser_navigate`, `browser_action`, `browser_evaluate`. Windows additionally exposes 13 Window2 operations, clipboard and `exec` with `sky`; macOS adds `observe`/`computer`. Surface `exec` composes browser tools too. |
 | Plugins — `chat-on-steroids-plugins` | Enabled external tools with their upstream names and schemas, plus code-mode `exec` when that composition name is available. |
 
 `read` needs read/browse/metadata as appropriate; images need read; patch checks each hunk's
 create/edit/move/delete permission; command controls both terminal tools.
 Recording controls `update_plan`; multi-agent controls `agents`;
-the finish setting controls `session_finish`. Windows publishes four observation methods under
+recording/current-session identity controls `session_wait`; the finish setting controls `session_finish`. Windows publishes four observation methods under
 screen access, nine input/launch methods under control, and clipboard methods under their own
 permissions. Multiline `type_text` additionally requires clipboard write. macOS `computer`
 registration can exist for control or clipboard access; each action rechecks its own permission.
@@ -1681,6 +1685,12 @@ it must not guess a new rebind, delete history or become the path for new contin
 independent user tasks run at once. Inside a family the topology is a star: workers report to
 their prime and cannot create worker descendants.
 
+The durable identity is the family/run plus worker assignment/role, not the provider conversation
+currently carrying that role. Healthy sleeping workers normally reuse their existing conversation;
+Self-Healing may replace an unusable Prime or worker carrier while preserving the same durable
+mission/family and fencing the old carrier. Ordinary worker reuse therefore prefers the existing
+chat, but recovery correctness must never depend on that chat being permanent.
+
 `agents.ts` is the one broker. Its run map and v6 `activeRuns` snapshot hold independent families;
 `maxWorkers` applies **per family**, not to one global active run. Display names such as
 `worker-1` are scoped by run incarnation/prime. Resolve a proven caller first, then its family;
@@ -1734,9 +1744,11 @@ Broker mutations stage and durably publish the exact run object; async rollback 
 restore another family's state. Disable parks families; Clear deliberately discards the
 broker's retained history/fences. Dormant families are bounded (16 / seven days). Retirement
 and browser close are separate: a sleeping worker becomes eligible for page reuse after two
-quiet minutes and page closure after five (§14), while remaining available for revival by its
-exact conversation id. Compact & Resume rebinds a prime within its
-family; it does not merge families or move a terminal process to another principal.
+quiet minutes and page closure after five (§14), while its durable role/history remains available
+for revival. A normal healthy revival targets the current bound conversation; a Self-Healing
+replacement changes that binding under the recovery transaction and execution-epoch fence.
+Compact & Resume rebinds a prime within its family; it does not merge families or move a terminal
+process to another principal.
 
 The app's configurable worker capacity is distinct from the coding agent's delegation policy
 in §19. Do not infer permission to launch development subagents from a product feature toggle.
@@ -2245,10 +2257,11 @@ Use at most two direct development subagents concurrently and explicitly prohibi
 delegation. Audit-only means no source/test/config/AppData writes beyond the named report.
 The prime independently verifies important claims; parallel reports are hypotheses, not votes.
 
-When integrating external PRs, preserve original authorship. Adapted or snapshot-integrated
-work must name the original PR/author and carry appropriate GitHub-linked `Co-authored-by`
-trailers; update `CONTRIBUTORS.md` and distinguish incorporated code from reports/proposals.
-Closing a PR or rewriting its implementation does not remove the contributor's credit.
+When porting or adapting external work, preserve original human authorship. Name the original
+source/author and carry appropriate GitHub-linked `Co-authored-by` trailers when their code is
+actually incorporated; update `CONTRIBUTORS.md` when durable attribution belongs there and
+distinguish incorporated code from reports/proposals. Historical repositories are references,
+not merge authorities. Rewriting an implementation does not erase credit for source material used.
 
 Record changes and actual checks in a focused worklog. Keep security reproductions/private
 session material out of public docs and fixtures; follow `SECURITY.md`. Do not package, install,

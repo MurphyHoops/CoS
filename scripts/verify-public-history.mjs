@@ -1,8 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 
-const maintainerLogin = 'totec448-spec';
-const safeMaintainerEmail = /^(?:\d+\+)?totec448-spec@users\.noreply\.github\.com$/i;
+const maintainerLogin = 'murphyhoops';
+const safeMaintainerEmail = /^(?:\d+\+)?MurphyHoops@users\.noreply\.github\.com$/i;
 
 // Keep the blocked values split so this guard does not contain the data it rejects.
 const blockedText = [
@@ -108,7 +108,7 @@ function publishedCommits() {
   const remotes = String(runGit(['remote']).stdout).split(/\r?\n/).filter(Boolean);
   const canonical = remotes.find((remote) => {
     const url = String(runGit(['remote', 'get-url', remote]).stdout).trim();
-    return /^(?:https?:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)totec448-spec\/chat-on-steroids(?:\.git)?\/?$/i.test(url);
+    return /^(?:https?:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)MurphyHoops\/CoS(?:\.git)?\/?$/i.test(url);
   });
   const publishedRef = `refs/remotes/${canonical ?? 'origin'}/main`;
   const ref = runGit(['rev-parse', '--verify', '--quiet', publishedRef], {

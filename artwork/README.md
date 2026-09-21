@@ -1,5 +1,8 @@
 # App icon artwork
 
+
+> **CoS 3.x subsystem reference.** This document covers one component, experiment or design lineage. Interpret it under docs/architecture.md and AGENTS.md; where older terminology conflicts with the durable-mission model, the 3.x canonical documents win.
+
 The production icon is generated from `app-icon-source.png` by
 `scripts/make-icon.mjs`. Run `npm run icon` to regenerate the Windows ICO, its preview,
 and the four Chrome extension PNGs.
@@ -18,8 +21,9 @@ generated with the built-in ImageGen tool as transparent, text-free, square logo
 
 Every prompt required a bold 16 px silhouette, the same black/white palette, generous
 padding, no lettering, no ChatGPT/OpenAI mark, no thin strokes, no colour, and no enclosing
-app-store mockup. Concept 5 was selected because it is the least generic, preserves the old
-folder-plus-conversation meaning, and still reads when reduced to toolbar size.
+app-store mockup. Concept 5 was selected because it is the least generic and still reads when
+reduced to toolbar size. In CoS 3.x the folder/conversation shapes are visual shorthand for local
+work plus an execution carrier; the durable mission, not a particular chat, is the product identity.
 
 The checked-in PNG is the selected model output, not a hand-assembled composite. The
 generator decodes that one source without an image dependency, tight-crops its alpha,

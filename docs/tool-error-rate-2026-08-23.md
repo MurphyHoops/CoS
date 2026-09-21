@@ -1,5 +1,8 @@
 # Tool error-rate audit — 2026-08-23
 
+
+> **Historical — pre-CoS 3.0.** This document is preserved as engineering/provenance evidence. It does **not** define current runtime behavior. Current architecture is defined by docs/architecture.md and AGENTS.md. Historical version numbers, repository links, PRs, incidents and implementation assumptions are intentionally retained as facts from that period.
+
 This is the frozen evidence and implementation record for the 2026-08-23 review of recent
 Chat On Steroids tool calls. It exists separately from `TOOL_CALL_ISSUES.md` so later cleanup of
 that working issue file cannot erase the denominator, the projection correction, or the exact

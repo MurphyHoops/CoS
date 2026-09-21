@@ -1,12 +1,8 @@
 name: CI
-# P5 long-run exact-head trigger
-
 on:
   push:
     branches:
       - main
-      - feature/self-healing-longrun
-      - feature/self-healing-sessions
   pull_request:
   workflow_dispatch:
 

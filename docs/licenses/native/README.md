@@ -1,5 +1,8 @@
 # Native image-library licenses, source and replacement
 
+
+> **CoS 3.x provenance/compliance reference.** This document preserves third-party attribution, source or packaging obligations. It is not a product-architecture specification.
+
 The sharp/libvips packages include separately licensed native libraries. Their README.md
 and versions.json files identify the components and versions for each target platform.
 This supplement preserves full license texts omitted from the published native npm packages:
@@ -19,7 +22,7 @@ Upstream build/source projects:
 
 The current dependency set uses sharp 0.35.4 / libvips 8.18.6. The release pipeline
 places `Chat-On-Steroids-Native-Sources.tar.gz` beside the matching installers at:
-https://github.com/totec448-spec/chat-on-steroids/releases
+https://github.com/MurphyHoops/CoS/releases
 Use the source archive and checksums from the same release as your installer.
 
 It contains original component archives, locked Rust dependency sources, build repositories,

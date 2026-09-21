@@ -1,5 +1,8 @@
 # Recovery, ownership and dependency snapshot
 
+
+> **Historical — pre-CoS 3.0.** This document is preserved as engineering/provenance evidence. It does **not** define current runtime behavior. Current architecture is defined by docs/architecture.md and AGENTS.md. Historical version numbers, repository links, PRs, incidents and implementation assumptions are intentionally retained as facts from that period.
+
 This snapshot applies subsequent workspace changes to public main while retaining
 previously integrated fixes and contributor credit. No version bump, release or
 updater behavior change is included.

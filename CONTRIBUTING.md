@@ -1,52 +1,83 @@
-# Contributing
+# Contributing to CoS 3.x
 
-Chat On Steroids is a Windows/macOS/Linux beta maintained by one person. Bug reports, focused fixes and concrete improvements are welcome.
+CoS 3.x is a standalone durable-runtime project. Contributions are welcome when they preserve the runtime's identity, authority and recovery invariants.
 
-## Before a pull request
+Start with:
 
-For anything non-trivial, open an issue first so the intended behavior is clear. Security problems must be reported privately through [`SECURITY.md`](SECURITY.md), not as an issue or PR.
+1. [docs/architecture.md](docs/architecture.md)
+2. [AGENTS.md](AGENTS.md)
+3. the subsystem document for the code you are changing.
 
-Keep changes narrow. Preserve existing permission, identity and recovery behavior unless the issue specifically requires changing it. Avoid unrelated formatting, generated output, local debugging material and private data. In screenshots, logs and examples, replace real usernames, local paths, chat text, IDs and credentials with obvious placeholders such as `C:\Users\you\project` or `/home/you/project`.
+## Repository model
 
-## Responsible-use expectations
+The canonical repository is **MurphyHoops/CoS**.
 
-Contributions and examples should follow the [responsible-use notice](README.md#responsible-use-and-provider-rules). Do not propose or promote bypassing provider safety decisions, usage limits or account restrictions. Describe browser automation and recording accurately; do not market CoS as a way to avoid quota. Claims about usage allowances or OpenAI approval require evidence. Keep account notices, appeals and private conversation evidence out of public issues, PRs and documentation. These expectations do not alter the MIT license or replace any provider's terms.
+Historical repositories are reference sources only. Do not merge an external upstream branch into CoS `main`. If an external project contains a useful fix, audit the behavior and port only the required change into CoS with CoS-native tests.
 
-## Development setup
+## What a good change looks like
 
-Development requires Node 22+ and is supported on Windows, macOS and Linux. Desktop/computer-use has platform-native Windows and macOS helpers behind one protocol; Core, extension, sessions, agents and tunnel behavior must stay portable. macOS helper changes require Xcode/Swift and a packaged arm64 or x64 smoke check.
+Prefer the earliest correct ownership boundary over a new fallback.
+
+A change should answer:
+
+- Which durable fact was wrong or missing?
+- Which component owns that fact?
+- What evidence proves the new behavior?
+- What stale authority or duplicate path is removed?
+- How does the behavior survive restart/executor replacement?
+
+Avoid creating a second authority for mission state, progress, recovery, worker ownership or completion.
+
+## Development
+
+Requirements: Node 22+.
 
 ```sh
 npm ci
-npm run verify     # the same gate CI runs
-npm run dev        # Electron development build
+npm run verify
+npm run dev
 ```
 
-A behavior change should include a deterministic regression test where practical. Run the nearest focused tests while working and `npm run verify` before submitting.
+Run the nearest focused tests while iterating, then run the full verification gate before committing.
 
-## Packaging
+For packaging-sensitive changes, build/smoke the platform package that can exercise the change.
 
-Release packages are platform/architecture-specific:
+## Long-run changes
 
-```sh
-npm run dist:x64
-npm run dist:arm64
-npm run dist:mac:x64
-npm run dist:mac:arm64
-npm run dist:linux:x64
-npm run dist:linux:arm64
-```
+Changes touching Goal/Loop, Compact & Resume, Self-Healing, workers, `session_wait`, process custody or continuation delivery must preserve:
 
-Release CI builds and smoke-tests every platform/architecture on a native runner. Packaging downloads/stages pinned external assets and verifies their checksums, so the first packaging run needs network access. Do not claim a cross-OS package is validated merely because electron-builder can sometimes emit it from another host.
+- durable mission identity;
+- one current execution authority;
+- stale-executor fencing;
+- no blind replay of ambiguous mutations;
+- exactly-once continuation delivery;
+- explicit user cancellation precedence;
+- restart/rebind reconciliation.
+
+## Documentation
+
+Update canonical docs when the architecture or user contract changes.
+
+Do not turn a temporary incident note into the architecture authority. Historical worklogs/audits should remain factual records and must be marked historical when they predate CoS 3.x.
 
 ## Pull requests
 
-Explain the root cause, the smallest behavior change that fixes it, and exactly how you validated it. Packaging/runtime changes should include a packaged-runtime smoke check where relevant.
+Explain:
 
-## Credit and attribution
+- root cause;
+- ownership/invariant being repaired;
+- behavior change;
+- tests run;
+- packaged/live validation when relevant.
 
-Contributors retain credit when their patches are adapted, rewritten or consolidated into release snapshots. Merge the original PR when appropriate and preserve its author. For adapted work, link the original PR, explain what was incorporated, and include the original contributor in the integration commit's `Co-authored-by` trailers using their public GitHub noreply identity. Verify the resulting commit resolves to the intended GitHub account.
+Do not include secrets, private account data, local personal paths or provider conversation content.
 
-Record incorporated work in [CONTRIBUTORS.md](CONTRIBUTORS.md). Credit bug reports, designs and review explicitly, distinguishing them from incorporated code. Closing a PR as incorporated or superseded must explain that distinction and link the integration; it must not erase attribution. AI-assisted integration does not transfer the original contributor's credit to the maintainer or the model.
+## Security
 
-Contributions are accepted under the MIT licence in [`LICENSE`](LICENSE).
+Report vulnerabilities privately through GitHub Security for `MurphyHoops/CoS`. See [SECURITY.md](SECURITY.md).
+
+## Credit
+
+CoS 3.x originated from the open-source Chat On Steroids project by @totec448-spec; see [CONTRIBUTORS.md](CONTRIBUTORS.md).
+
+New contributions remain visible in Git history and the normal GitHub contribution record. Contributions are accepted under the repository's MIT license.

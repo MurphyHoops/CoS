@@ -1,5 +1,8 @@
 # Plugin catalog artwork
 
+
+> **CoS 3.x provenance/compliance reference.** This document preserves third-party attribution, source or packaging obligations. It is not a product-architecture specification.
+
 The catalog ships original, code-drawn SVG illustrations in `src/renderer/plugin-icons/`:
 `blender.svg`, `memory.svg`, `playwright.svg`, `fetch.svg`, `heygen.svg`, `recraft.svg`,
 `unity.svg`, and `custom.svg`. The earlier `time.svg`, `thinking.svg`, `git.svg` and

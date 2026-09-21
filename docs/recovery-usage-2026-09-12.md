@@ -1,5 +1,8 @@
 # Completed-chat recovery and background Usage refresh
 
+
+> **Historical — pre-CoS 3.0.** This document is preserved as engineering/provenance evidence. It does **not** define current runtime behavior. Current architecture is defined by docs/architecture.md and AGENTS.md. Historical version numbers, repository links, PRs, incidents and implementation assumptions are intentionally retained as facts from that period.
+
 Session hydration now replays the current generation in committed lifecycle order.
 A new start replaces the active turn and only its matching end clears it. Older
 turns with missing ends remain historical records, so closing and revisiting a

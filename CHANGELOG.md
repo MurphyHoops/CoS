@@ -5,9 +5,25 @@ All notable changes to this project are documented here.
 This project is in **beta** despite its version number. Behavior may still change between
 releases.
 
+CoS 3.x is the current standalone durable-runtime line. Entries before 3.0 are preserved as
+historical release records; their repository links, terminology and implementation descriptions
+document what was true at the time and are not the current architecture contract.
+
 The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
+
+## [3.0.0] — 2026-09-21
+
+### Independent durable runtime
+
+- Established `MurphyHoops/CoS` as the standalone canonical repository and direct development line for CoS 3.x.
+- Made the durable local mission the architectural authority: ChatGPT conversations are replaceable executors rather than task identity.
+- Added generic long-run execution with durable work obligations, execution epochs, certified progress, local external-wait supervision and exactly-once continuation delivery.
+- Added bounded Self-Healing executor migration for Prime and workers, with recovery WALs, mutation-safety fences and crash/restart reconciliation.
+- Added `session_wait` with direct-call support plus code-mode terminal yield when the host hides the direct tool, so long external waits do not need to keep a provider turn open and poll.
+- Hardened Compact & Resume, Goal/Loop continuation provenance, worker revival authority and stale-executor fencing for multi-hour autonomous work.
+- Historical source provenance remains credited under the existing license and notices. External changes are reviewed and ported selectively against CoS runtime invariants rather than treated as repository authority.
 
 ## [2.1.13] — i am very sad. openai theatend to ban my account for whatever reason. anthropic support blocks me. money tight.
 

@@ -1,5 +1,8 @@
 # Building and replacing the native image libraries
 
+
+> **CoS 3.x provenance/compliance reference.** This document preserves third-party attribution, source or packaging obligations. It is not a product-architecture specification.
+
 `sources.json` maps each archive to its URL, version, applicable OS and SHA-256. Verify
 `SHA256SUMS.txt` before extracting. Keep embedded subprojects and notices. Source retains
 its original licenses. The application consumes the published sharp 0.35.4/@img binaries

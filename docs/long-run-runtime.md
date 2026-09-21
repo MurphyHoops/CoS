@@ -1,69 +1,147 @@
 # Generic Long-Run Runtime
 
-CoS treats a development mission as durable local state and ChatGPT conversations as replaceable execution carriers. The kernel is intentionally project-agnostic: Lean, TypeScript, Python, research simulations, CI pipelines and other workflows use the same authority and recovery model.
+CoS 3.x treats long-running work as a durable local state machine, not as one provider conversation that must remain alive.
 
-## Kernel primitives
+## Core principle
 
-- **ExecutionEpoch** — the single mutation authority for one durable session. Rebind, stop and recovery advance or move that authority so stale executors cannot continue writing.
-- **WorkObligation** — durable work debt that survives provider-turn completion, executor migration and application restart.
-- **WaitContract** — a durable external condition monitored by the local supervisor instead of keeping a provider turn open.
-- **ProgressCertificate** — evidence that the durable task actually advanced. Browser activity alone is not a certificate.
-- **WaitProvider** — an adapter that observes one external wait kind. The scheduler never embeds project lifecycle rules.
+> **The mission is durable; the executor is replaceable.**
 
-Project workflows decide what to build, test and ship. The Core runtime only guarantees ownership, waiting, continuation, recovery and side-effect fencing.
-## Waiting outside the provider turn
+Long-Run Runtime supplies the common control plane used by Goal/Loop, external waits, process custody, Compact & Resume, Self-Healing and worker continuation.
 
-Use `session_wait` instead of polling an external condition inside ChatGPT.
+## Durable primitives
 
-Built-in providers:
+### Mission/session
 
-- `github_run` — GitHub Actions run id plus owner/repository.
-- `process` — a retained background `exec_command` session owned by the same durable session.
-- `timer` — a local deadline.
+Owns project identity, history, obligations, current executor binding and terminal state.
 
-Additional providers register a stable kind, an inspector and a semantic `provider_target`. Optional bounded `provider_data` belongs to the adapter; the scheduler core does not interpret it. Unknown providers fail closed.
+### Work obligation
 
-A successful `action=arm` is a hard provider-turn boundary. CoS persists the WaitContract and WorkObligation before the source executor loses ordinary mutation authority.
-## Host compatibility
+Represents work CoS still owes. It records why continuation exists and prevents recovery from inventing generic "continue" prompts.
 
-Direct `session_wait` is preferred when ChatGPT exposes the tool natively. Some host surfaces expose only code mode (`exec`) even though the underlying MCP server advertises `session_wait`.
+### Execution epoch
 
-In that case code mode may call:
+Fences mutation authority. When ownership transfers to a replacement executor, stale executors cannot start new mission mutations.
 
-```js
-await tools.session_wait({
-  action: "arm",
-  kind: "github_run",
-  repository: "owner/repo",
-  run_id: 123456
-});
+### Progress evidence
+
+Progress must come from durable or correlated evidence such as:
+- accepted/completed tool calls;
+- process state;
+- Git/filesystem change;
+- CI state transition;
+- worker report;
+- verified provider turn completion.
+
+A page merely showing "working" is not enough to erase a recovery episode.
+
+### Wait contract
+
+Transfers a slow external condition from the provider turn to the local supervisor.
+
+## `session_wait`
+
+`session_wait` is the model-facing control primitive for durable external waits.
+
+Supported actions include status/arm/cancel according to the current schema.
+
+Built-in wait providers:
+
+| Kind | Target |
+| --- | --- |
+| `github_run` | One exact GitHub Actions run |
+| `process` | One background `exec_command` process owned by the same durable session |
+| `timer` | One local deadline |
+
+The provider registry is extensible, so project-specific adapters can add external conditions without changing the scheduler core.
+
+## Terminal yield
+
+Arming a wait is a control-flow boundary.
+
+After the wait is durably armed, the source provider turn must not continue mutating that obligation.
+
+CoS supports:
+- direct `session_wait` invocation when the host exposes it;
+- code-mode terminal yield when the host virtualizes the tool behind `exec`.
+
+The semantics are the same: arm → cut remaining executor work → local supervisor owns the wait.
+
+## Why provider-side polling is wrong
+
+A loop such as:
+
+```text
+gh run view
+sleep
+gh run view
+sleep
+...
 ```
 
-Successful arm is a **terminal yield**. The code-mode runtime immediately cuts remaining JavaScript, returns only the durable wait receipt, and refuses later nested admissions. Never place an arm call in `Promise.all` or beside an independent mutation. A refused arm does not cut the script.
-## Continuation
+keeps browser/provider/MCP state live for no useful reasoning work and increases the chance of stale ownership, transport loss or context churn.
 
-The local supervisor observes each due WaitContract through its registered provider. Resolution changes the associated WorkObligation to owed and queues exactly one stable continuation.
+The correct pattern is:
 
-Before acting, a resumed executor reconciles current files, Git state, processes, CI, receipts and workers. It must not repeat completed or ambiguous side effects.
+```text
+start external work
+→ obtain exact target identity
+→ arm durable wait
+→ finish provider turn
+→ local supervisor polls
+→ resolve
+→ enqueue one continuation
+```
 
-Self-Healing and Long-Run are complementary:
+## Wait resolution
 
-- Long-Run handles expected external latency by ending the provider turn.
-- Self-Healing handles an executor that should be working but becomes unresponsive.
-- Executor migration carries ExecutionEpoch, active WaitContract and WorkObligation to the replacement conversation.
+When a provider reports a terminal condition:
 
-## Project policy boundary
+1. the wait result is persisted;
+2. CoS materializes/updates the obligation;
+3. a continuation is queued exactly once;
+4. the authorized executor receives the continuation;
+5. it reconciles real state before further mutation.
 
-Do not encode a project lifecycle such as “Lean proof → PR → ledger” in the Core runtime. Keep those rules in project instructions or future project-policy adapters. The durable kernel remains unchanged across repositories and languages.
-## Invariants
+A successful wait does not imply the whole mission is complete.
 
-1. One current ExecutionEpoch owns mutation authority.
-2. Unknown or ambiguous mutations are never blindly replayed.
-3. An armed wait cannot coexist with further source-turn mutations.
-4. A WaitContract retry is idempotent by source turn plus stable semantic target.
-5. A resolved wait queues at most one continuation identity.
-6. Recovery or carrier migration cannot erase unresolved work debt.
-7. Observations provide evidence; only durable kernel transitions grant or revoke authority.
-8. Missing provider implementations fail closed instead of guessing completion.
+## Process waits
 
-Long-running tests should exercise restart, executor migration, duplicate callbacks, delayed external completion, provider errors and stale-source calls—not only isolated successful turns.
+A process wait may only name a process owned by the same durable session.
+
+If a process is no longer retained after restart/crash, CoS reports that fact and the executor must inspect the filesystem/process/project state before deciding whether any command should be re-run.
+
+## GitHub waits
+
+A GitHub wait names an exact repository and run id.
+
+The continuation must inspect the actual run result and current Git/PR state before merging, pushing or re-triggering anything.
+
+## Timers
+
+Timers are local scheduling primitives, not progress evidence. A timer expiration means only that its deadline arrived.
+
+## Recovery interaction
+
+Recovery does not replace a specific wait result with a generic continuation.
+
+If an executor dies while a wait is active, the wait remains mission-owned. A replacement executor inherits only the unresolved obligation after reconciliation.
+
+## Exactly-once continuation
+
+The runtime distinguishes:
+- wait resolution;
+- continuation creation;
+- continuation dispatch;
+- continuation acknowledgement.
+
+These are separate durable phases so a crash between them does not duplicate work.
+
+## User cancellation
+
+User cancellation/Stop can revoke the obligation or automation authority. Recovery must preserve that revocation.
+
+## Development invariant
+
+Any new long-run mechanism should integrate through these primitives instead of adding a parallel timer/watcher/retry state machine.
+
+See [architecture.md](architecture.md) and [../AGENTS.md](../AGENTS.md).

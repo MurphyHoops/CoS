@@ -1,5 +1,8 @@
 # Open PR bug-fix review — 2026-09-16
 
+
+> **Historical — pre-CoS 3.0.** This document is preserved as engineering/provenance evidence. It does **not** define current runtime behavior. Current architecture is defined by docs/architecture.md and AGENTS.md. Historical version numbers, repository links, PRs, incidents and implementation assumptions are intentionally retained as facts from that period.
+
 ## Scope and method
 
 Screened all 39 open PRs against public main `efc69f35` and the shared local tree. The user prioritized real bug fixes, required checking the code against current implementation, and authorized closing already-fixed PRs. Feature/UI proposals were screened for scope, not represented as fully audited implementations. Bug-fix candidates received implementation/contract comparison; the two accepted patches received before/after reproduction and combined verification.

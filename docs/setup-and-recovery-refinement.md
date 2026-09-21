@@ -1,5 +1,8 @@
 # Setup, profiles and recovery refinements
 
+
+> **Historical — pre-CoS 3.0.** This document is preserved as engineering/provenance evidence. It does **not** define current runtime behavior. Current architecture is defined by docs/architecture.md and AGENTS.md. Historical version numbers, repository links, PRs, incidents and implementation assumptions are intentionally retained as facts from that period.
+
 First-run Setup retains the six-step English/Chinese guide. Profile management is a compact
 row below Language in Settings: choose a profile, add a named profile with Plus, or delete
 an entry from its dropdown. The last profile remains protected. Active profile removal

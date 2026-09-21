@@ -1,19 +1,21 @@
-# Claude repository instructions
+# Repository instructions
 
-Read and follow `AGENTS.md` before changing this repository.
+Read [AGENTS.md](AGENTS.md) and [docs/architecture.md](docs/architecture.md) before changing CoS.
 
-This is a public repository. Never add Claude provenance session URLs or session trailers to
-commit messages, files, release notes, logs, or generated artifacts. Maintainer commits must use
-a GitHub noreply address; never use a personal mailbox or a private local path. Before every
-commit, push, tag, or release, run `npm run verify:privacy`. The versioned Git hooks installed by
-`npm run hooks:install` enforce the same policy for Claude-created commits.
+CoS 3.x is a standalone durable-runtime project. The durable mission/session is the identity; provider conversations are replaceable executors.
 
-Do not bypass these guards with `--no-verify`. If a privacy check blocks a change, remove the
-private value at its source and create a new clean commit instead.
+Key rules:
 
-Never push this clone's local branch history. Publish work as fresh commits built on the remote
-branch tip (`git write-tree` / `git commit-tree`, or a merge of `origin/main` done the same way),
-pointed at by a new local branch. The local history is private and stays here.
+- preserve one authoritative owner for each durable fact;
+- never replay an ambiguous mutation without reconciliation;
+- never restore authority to a superseded executor;
+- never turn a quiet provider turn into invented work;
+- use durable waits rather than provider-side polling for long external conditions;
+- explicit user Stop/cancellation outranks automation;
+- historical repositories are reference-only; do not merge them into `main`.
 
-Never add a `Co-Authored-By` trailer, a "Generated with" line, or any other Claude attribution to
-commits, pull requests, tags or release notes. The maintainer is the only author on this repository.
+This is a public repository. Never commit secrets, private account identifiers, local personal paths, provider conversation content or provenance/session URLs.
+
+Before commit/push/tag/release, run the repository privacy and verification gates. Do not bypass them with `--no-verify`.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the current contribution model.

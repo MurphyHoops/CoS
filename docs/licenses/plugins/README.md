@@ -1,5 +1,8 @@
 # Optional plugin recipe license references
 
+
+> **CoS 3.x provenance/compliance reference.** This document preserves third-party attribution, source or packaging obligations. It is not a product-architecture specification.
+
 These exact upstream texts support the reviewed catalog. They are not the complete dependency notices for an installed plugin: CoS downloads those packages only when the user installs them, and retains their dependency directories and bundled code notices. They do not change the MIT license of CoS. The original CoS SVG illustrations are MIT artwork, not upstream logos.
 
 `inventory.json` maps every local recipe to its pinned distribution, archive integrity and SHA-256 of the preserved license text. Hosted HeyGen and Recraft have no invented package/version or open-source grant: their small SERVICE-NOTICE files identify the official endpoint, setup documentation and provider terms. These references were checked on 2026-09-08.

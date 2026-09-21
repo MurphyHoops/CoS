@@ -1,48 +1,81 @@
-# Security policy
+# CoS 3.x security model
 
 ## Reporting a vulnerability
 
-**Please do not open a public issue or pull request for a security problem.** Use GitHub's private vulnerability reporting for this repository: **Security → Report a vulnerability**.
+Do not open a public issue for a security vulnerability. Use GitHub private vulnerability reporting for **MurphyHoops/CoS**.
 
-Include the smallest useful reproduction, the app version, operating-system version/architecture, and whether the Chrome extension was connected. Redact personal file contents, usernames/paths, conversation text and account/workspace identifiers. Never post live API keys, connector URLs, tunnel tokens or other credentials. Rotate anything accidentally exposed.
-
-This is a solo-maintained beta. There is no bug bounty or guaranteed response window.
-
-Security fixes target the **latest published release**. If you can reproduce an issue safely on
-the latest version, include that result in the private report.
+Include the smallest useful reproduction, CoS version, OS/architecture and the affected capability. Redact usernames, paths, conversation text, account/workspace identifiers, connector URLs, tunnel tokens and credentials. Rotate any credential that was exposed.
 
 ## Security model
 
-Chat On Steroids is a permission boundary between ChatGPT and the logged-in OS user running the app:
+CoS is a local capability boundary plus a durable orchestration runtime.
 
-- Filesystem tools validate paths against folders you explicitly approve.
-- Read-only mode disables effective file writes, commands, desktop control and clipboard writes.
-- `exec_command` is intentionally **not** confined to approved folders. It starts in an approved working directory, then runs with the normal privileges of your account.
-- Screen/control permissions also enable the companion's background browser tools on Chromium hosts. Chrome grants required debugger/tabs and HTTP(S) host permissions; there is no additional per-tab approval dialog. Read-only disables browser input, navigation, tab creation/closure and page JavaScript. Native screen, mouse/keyboard and clipboard remain desktop-wide on supported Windows/macOS hosts, independent of approved folders and macOS OS consent.
-- MCP servers bind to loopback and use secret tokenized paths. Public reachability comes only from the tunnel you configure.
-- The companion-extension bridge is a separate loopback service and exposes no filesystem, command or settings-mutation route.
-- Stored API/bridge credentials use Electron `safeStorage` (DPAPI on Windows, Keychain on macOS, a secure desktop secret store on Linux). Linux `basic_text` is refused; normal Activity logs are redacted, capped and memory-only.
-- Session recording is separate durable local history. It is on for fresh installs and can be disabled.
+The most important distinction is:
 
-## Provider rules and responsible use
+> **Recovery may restore work continuity; it may not expand authority.**
 
-Local permissions control access to your machine; they do not authorize bypassing a provider's safety decision, usage limit or account restriction. Do not route a blocked action through another tool, worker, connector or account. Follow the [responsible-use notice](README.md#responsible-use-and-provider-rules) and the applicable provider terms.
+### Capability boundaries
 
-CoS is an independent beta used at your own risk. Its browser automation and local recording are not an OpenAI approval or a guarantee of compliance or continued account access. Review the security model and limitations on this page, supervise tool use and stop workflows that receive a provider restriction or policy warning. Account enforcement questions belong with the provider's support or appeal process; keep private notices and account identifiers out of public reports.
+- File tools are restricted to folders the user approved.
+- Read-only mode removes effective file writes, commands and mutating browser/desktop actions.
+- `exec_command` runs with the privileges of the logged-in OS user. Approved roots choose its starting workspace; they are not an OS sandbox.
+- Browser/desktop capabilities can act outside one project folder when explicitly enabled and should be treated as powerful.
+- MCP services bind locally; public reachability exists only through the configured tunnel.
+- Credentials stored by CoS use Electron `safeStorage` where supported.
+
+### Durable authority boundaries
+
+A mission can outlive one provider conversation, but only the current execution epoch may mutate mission-owned state.
+
+When an executor is replaced:
+- the source executor is fenced;
+- the replacement attaches to the same mission;
+- local/Git/process/tool evidence is reconciled;
+- only unresolved obligations continue.
+
+Late results from an old executor may be recorded as evidence but cannot silently restore its authority.
+
+### Mutation ambiguity
+
+Transport failure is not evidence that a mutation failed.
+
+If a tool response is lost after dispatch, CoS must inspect receipts, process state, files, Git or the target system before retrying. Blind replay is a security and correctness bug.
+
+### Long external waits
+
+A long wait should be handed to the local supervisor. After `session_wait` arms a wait, the source turn loses the right to keep mutating that obligation. This prevents one provider turn and the local supervisor from racing the same task.
+
+### User control
+
+Explicit Stop, cancellation, permission removal and changed objectives are durable control-plane events. Recovery must not reinterpret them as failures to work around.
+
+### Provider rules
+
+Provider restrictions are not recovery targets. Do not switch accounts, chats, connectors or tools to evade safety decisions, usage limits or account restrictions.
+
+CoS is independent software and is not affiliated with or endorsed by OpenAI.
+
+## Stored data
+
+Session recording can contain detailed conversation and tool activity. It is local application data and is not automatically encrypted as a whole. Anyone with access to the OS account may be able to read it.
+
+Do not place secrets in logs or public issue reports.
 
 ## Expected limitations
 
-These are properties of the current design, not vulnerability reports by themselves:
-
-- **Release binaries are not publisher-signed; macOS builds are also unnotarized.** Apple-silicon Mach-O files may still carry ad-hoc signatures, which do not identify a publisher or establish Gatekeeper trust. Windows SmartScreen, macOS Gatekeeper or browsers can warn. Verify release SHA-256 checksums before running them.
-- **The Linux AppImage has a sandbox-availability fallback.** Its electron-builder static launcher can add `--no-sandbox` when the host disables unprivileged user namespaces. On Debian/Ubuntu, prefer the DEB on such restrictive systems if you do not want the portable AppImage to take that fallback.
-- **Fresh installs start Core permissions enabled and read-only mode off.** Windows additionally enables Desktop permissions; Linux enables extension browser screen/control, and macOS retains its off default. Existing installs keep their explicit stored choices.
-- **Application path checks are not a kernel/VM sandbox.** They substantially constrain the app's filesystem tools, but same-user filesystem races can still exist. Do not treat approved roots as isolation from a hostile local process.
-- **Command and Windows Desktop capabilities are powerful by design.** If enabled, they can act wherever your logged-in user can act, subject to normal OS privilege boundaries.
-- **Session recording is intentionally detailed and is not encrypted by `safeStorage`.** Recorded conversations/tool activity stay local to this app, but anyone with access to your OS account may be able to read the session files.
+- Release binaries may be unsigned/unnotarized as stated in the release notes.
+- On Linux, if unprivileged user namespaces are unavailable, the AppImage may use the documented `--no-sandbox` fallback. Prefer the DEB if you do not want that fallback.
+- Approved-root checks are application controls, not a VM/kernel sandbox.
+- Command and browser/desktop control capabilities are intentionally powerful.
 
 ## Scope
 
-In scope: this repository's desktop app, MCP surfaces, local browser bridge and `extension/` companion.
+In scope:
+- CoS desktop app;
+- Core/Desktop MCP surfaces;
+- durable session/mission runtime;
+- Long-Run/Self-Healing/continuation logic;
+- local browser bridge and companion extension;
+- packaged first-party helpers.
 
-Out of scope: ChatGPT/OpenAI infrastructure, Electron/Chromium upstream, `tunnel-client`, `cloudflared`, and other third-party dependencies. Report upstream vulnerabilities to the relevant project as well.
+Third-party providers, Electron/Chromium, tunnel binaries and external services should also be reported to their respective maintainers where appropriate.

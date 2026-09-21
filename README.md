@@ -1,84 +1,131 @@
-<p align="center"><img src="docs/images/readme-hero.svg?v=2" width="960" alt="Turn ChatGPT into Codex-style local coding. Chat On Steroids: Your files. Your terminal. Your ChatGPT plan." /></p>
+# CoS
 
-<p align="center">
-  <a href="https://github.com/totec448-spec/chat-on-steroids/releases/latest/download/Chat-On-Steroids-Setup-x64.exe"><img src="docs/images/download-windows.svg" width="208" height="56" alt="Download for Windows x64" /></a>&nbsp;
-  <a href="https://github.com/totec448-spec/chat-on-steroids/releases/latest/download/Chat-On-Steroids-macOS-arm64.dmg"><img src="docs/images/download-macos.svg" width="208" height="56" alt="Download for macOS Apple silicon" /></a>&nbsp;
-  <a href="https://github.com/totec448-spec/chat-on-steroids/releases/latest/download/Chat-On-Steroids-Linux-x64.deb"><img src="docs/images/download-linux.svg" width="208" height="56" alt="Download for Linux x64" /></a>
-</p>
+**Durable local runtime for long-running AI work.**
 
-<p align="center"><a href="https://github.com/totec448-spec/chat-on-steroids/releases/latest">All downloads</a></p>
+CoS keeps the mission local and durable while treating provider conversations as replaceable executors. It gives ChatGPT access to approved local files, terminals, browser/desktop capabilities and reusable workers, but the durable identity of the work lives in CoS rather than in one chat.
 
-<p align="center"><sub>Independent beta. Use at your own risk and within your provider's rules. <a href="#responsible-use-and-provider-rules">Read the usage notice</a> before connecting.</sub></p>
+> **Core rule:** the mission is durable; the executor is replaceable.
 
-<br />
+CoS 3.x is maintained directly and independently in **MurphyHoops/CoS**.
 
-<p align="center"><a href="docs/images/demo.mp4"><img src="docs/images/demo.gif" width="960" alt="Chat On Steroids in action: model selection, task plans, live tool results and reusable workers" /></a></p>
+## What CoS 3.x changes
 
-<p align="center"><a href="#get-started">Get started</a> &nbsp;·&nbsp; <a href="docs/images/demo.mp4">Watch the demo</a> &nbsp;·&nbsp; <a href="CHANGELOG.md">What’s new</a></p>
+Traditional chat automation tends to bind the task to one provider conversation. CoS 3.x separates them:
 
-<br />
+- **Mission/session** — durable objective, project, history, obligations and completion evidence.
+- **Executor** — the currently authorized Prime or worker conversation.
+- **Execution epoch** — the interval in which that executor may mutate mission-owned state.
+- **Work obligation** — durable record of unfinished work.
+- **External wait** — a condition supervised locally after the provider turn yields.
+- **Recovery transaction** — bounded replacement of an unusable executor without replaying ambiguous mutations.
 
-<h2 align="center">Code. Delegate. Keep going.</h2>
+That separation enables multi-hour work without requiring one model turn to stay open for the entire job.
 
-**Work on the real project.** Let ChatGPT read and edit files, run tests, keep terminals open and use your desktop. Follow the actual tool results as they arrive.
+## Main capabilities
 
-**Give it a team.** Split independent jobs across workers, then bring their results back. Workers keep their context, so the next task can pick up where they left off.
+### Local work
+- Read and edit approved project files.
+- Run commands and keep background processes under durable custody.
+- Inspect tool results in the local timeline.
+- Use browser/desktop capabilities when explicitly enabled.
 
-**Stay in control of long tasks.** Send a correction while work runs. Goal follows unfinished work; Loop keeps working within your brief. Compact & Resume deliberately carries the session and worker history into a fresh chat. Optional **Self-healing sessions** can do the same automatically after one bounded same-chat recovery when a Goal, Prime or worker executor becomes unusable, while keeping the durable local session as the identity.
+### Durable long-running work
+- Goal and Loop drive unfinished work through durable obligations.
+- `session_wait` hands long external waits to the local supervisor.
+- Compact & Resume replaces a context-heavy conversation without changing the mission.
+- Self-Healing can replace a stalled Prime or worker while preserving mission identity.
+- Late/stale executors are fenced from new mutations after authority moves.
 
-<p align="center"><strong>Uses your ChatGPT conversation rather than invoking Codex directly.</strong><br /><sub>ChatGPT Work and Codex share usage limits. Your account’s model availability, usage and context limits still apply. <a href="https://learn.chatgpt.com/docs/pricing">OpenAI usage details →</a></sub></p>
+### Multi-agent work
+- One Prime owns delegation intent.
+- Workers own bounded sub-obligations and can sleep, revive or be replaced.
+- Worker reports are persisted before live delivery so they survive transport/tab failures.
 
-## Responsible use and provider rules
+### Safe recovery
+- A lost tool response does not prove the side effect failed.
+- Ambiguous mutations are reconciled against local/Git/process state before retry.
+- Explicit user Stop/cancellation outranks automation.
+- Provider restrictions are terminal control events, not retry opportunities.
 
-Chat On Steroids is an independent, open-source workspace for coding and other authorized tasks with your own files and tools. It is intended to support productive work within the rules of the services you use. **It is not intended to bypass usage limits, account restrictions or safety controls.**
+## Architecture
 
-Use CoS in accordance with OpenAI's applicable [Terms of Use](https://openai.com/policies/terms-of-use/) ([Europe Terms](https://openai.com/policies/eu-terms-of-use/) for the EEA, Switzerland and UK), [Usage Policies](https://openai.com/policies/usage-policies/) and [Service Terms](https://openai.com/policies/service-terms/), plus your workspace's rules and any connected service's terms.
+Read [docs/architecture.md](docs/architecture.md) first.
 
-- **Respect limits and access decisions.** Workers, Goal/Loop, Compact & Resume, Self-healing sessions and finish checkpoints organize work; they do not grant extra quota or model access and must not be used to evade rate limits, usage caps or account restrictions. Do not switch accounts, chats, connectors or tunnels to evade a restriction.
-- **Respect safety decisions.** Do not use local tools, browser control, plugins or another worker to carry out an action that the provider blocked for safety. A local permission or an enabled MCP connector is not permission to override a provider refusal.
-- **Understand the integration.** CoS connects local tools through MCP. Its companion also observes and automates the ChatGPT browser UI and records conversation content locally. This browser integration is not a public ChatGPT automation API. MCP availability does not establish permission for every form of browser automation or recording; OpenAI's terms also restrict automated or programmatic extraction of data or output.
-- **Use at your own risk.** Review the rules for your account and intended workflow before connecting, supervise automation and review tool actions and outputs. CoS cannot guarantee policy compliance, continued service access or protection from account warnings, restrictions or suspension. If a workflow is restricted or receives a policy warning, stop that workflow and seek clarification through the provider's support or appeal process.
+Canonical 3.x documentation:
 
-This notice states the project's intended use; it does not certify compliance or change provider rules. CoS is not affiliated with, endorsed by or approved by OpenAI. The software is provided as-is under the [MIT license](LICENSE); applicable statutory rights remain unaffected. See [Security](SECURITY.md) for local permissions and risks.
+- [Architecture](docs/architecture.md)
+- [Setup and operation](docs/setup.md)
+- [Model-facing tools](docs/tool-surface.md)
+- [Long-Run Runtime](docs/long-run-runtime.md)
+- [Security model](SECURITY.md)
+- [Implementation invariants](AGENTS.md)
+- [Documentation map](docs/README.md)
 
-<br />
+Older 2.x release notes, audits and worklogs are retained as historical evidence only. They do not define current behavior.
 
 ## Get started
 
-1. **Install CoS** and approve your project folder in **Settings → Workspace**.
-2. **Connect Core** through **Settings → Setup** and add it in ChatGPT’s Developer mode. [Tunnel setup →](docs/setup.md#tunnel-setup)
-3. **Load the companion extension.** Click **Open extension folder**, then **Load unpacked** in Chrome’s extension settings. Pairing is automatic.
-4. **Choose a model, write your task and send.**
+1. Install the matching CoS app and companion extension.
+2. In **Settings → Workspace**, approve the project folders CoS may access.
+3. In **Settings → Setup**, connect the Core MCP app to ChatGPT Developer mode.
+4. Load/reload the companion extension in Chrome/Edge.
+5. Start a task from the CoS workspace.
 
-<details>
-<summary>Requirements &amp; installation notes</summary>
+For exact setup and recovery steps, see [docs/setup.md](docs/setup.md).
 
-Windows 10/11, **macOS 13 Ventura or newer**, or a current desktop Linux. Chrome 116+ or current Edge, plus a ChatGPT account/workspace with Developer mode and custom MCP apps. [Check account availability](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt).
+## Long waits
 
-- **Unsigned beta:** Windows is not publisher-signed; macOS is unsigned and unnotarized. Verify the package against the release checksums.
-- **Linux:** a Secret Service keyring is required. Prefer the DEB; when unprivileged user namespaces are disabled, the AppImage launcher can fall back to <code>--no-sandbox</code>.
-- **Permissions:** choose your approved folders and review capabilities before connecting. Fresh installs enable Core capabilities and two workers; Windows also enables Desktop permissions. Shell commands run with your normal user privileges.
-- **After updating:** reload the companion extension and refresh the CoS apps in ChatGPT when prompted.
+Do not keep a provider turn alive merely to poll CI or another slow condition.
 
-</details>
+The preferred pattern is:
 
-<details>
-<summary>More screenshots</summary>
+```text
+active executor
+  → arm durable wait
+  → provider turn ends
+  → CoS supervises locally
+  → condition resolves
+  → exactly one continuation obligation
+  → authorized executor resumes
+```
 
-![Conversation, workers and task plan](docs/images/workspace.png)
+See [docs/long-run-runtime.md](docs/long-run-runtime.md).
 
-![Model and reasoning selection](docs/images/model-picker.png)
+## Permissions and responsible use
 
-![Folder and capability settings](docs/images/settings.png)
+CoS runs local tools with the permissions you explicitly enable. Durability and recovery do not expand those permissions.
 
-</details>
+- Approved filesystem roots limit file tools.
+- Read-only mode removes effective mutation capabilities.
+- Commands run with the normal privileges of your OS account.
+- Browser/desktop control is powerful and must be enabled deliberately.
+- Do not use CoS to evade provider safety decisions, usage limits or account restrictions.
 
-<br />
+CoS is independent software and is not affiliated with or endorsed by OpenAI. Provider model availability, usage limits and policies still apply.
 
----
+See [SECURITY.md](SECURITY.md).
 
-<p align="center"><a href="docs/setup.md">Setup &amp; help</a> &nbsp;·&nbsp; <a href="docs/plugins.md">Plugins</a> &nbsp;·&nbsp; <a href="CONTRIBUTING.md">Contribute</a> &nbsp;·&nbsp; <a href="SECURITY.md">Security</a> &nbsp;·&nbsp; <a href="LICENSE">MIT license</a></p>
+## Platform notes
 
-<p align="center">Built with our <a href="CONTRIBUTORS.md">community contributors</a>. Thank you to the people behind the code, designs, bug reports and testing.</p>
+Supported targets are Windows, macOS and Linux. The current macOS release target is **macOS 13 Ventura or newer**.
 
-<p align="center"><sub>Not affiliated with or endorsed by OpenAI. ChatGPT and Codex are OpenAI trademarks.</sub></p>
+Release binaries are currently unsigned/unnotarized where documented. On Linux, when unprivileged user namespaces are disabled, the AppImage may require the documented `--no-sandbox` fallback; prefer the DEB if you do not want that fallback.
+
+## Downloads
+
+Releases: https://github.com/MurphyHoops/CoS/releases/latest
+
+After updating:
+- install the matching app build;
+- reload the companion extension;
+- refresh/reconnect the CoS custom app in ChatGPT when the tool schema changed.
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). Changes must preserve durable mission identity, execution authority, exactly-once continuation and mutation-reconciliation rules.
+
+## Acknowledgement
+
+CoS 3.x began from the open-source **Chat On Steroids** project created by [@totec448-spec](https://github.com/totec448-spec). Thank you for making that foundation available.
+
+Historical contributors and third-party components remain credited through Git history, the archived 2.x documents, [CONTRIBUTORS.md](CONTRIBUTORS.md), [LICENSE](LICENSE) and [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).

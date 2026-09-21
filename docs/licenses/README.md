@@ -1,5 +1,8 @@
 # License supplements
 
+
+> **CoS 3.x provenance/compliance reference.** This document preserves third-party attribution, source or packaging obligations. It is not a product-architecture specification.
+
 `flora-colossus` 2.0.0 declares MIT in its npm manifest but omits a license file from the
 distributed package. Its npm gitHead (`134ea667085bfd7f0a4c63420076eb97d41f1ad9`) also has
 no LICENSE at the repository root. `flora-colossus-LICENSE` preserves the explicit MIT grant

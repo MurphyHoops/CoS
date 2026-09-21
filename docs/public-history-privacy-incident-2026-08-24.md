@@ -1,5 +1,8 @@
 # Public-history privacy incident — 2026-08-24
 
+
+> **Historical — pre-CoS 3.0.** This document is preserved as engineering/provenance evidence. It does **not** define current runtime behavior. Current architecture is defined by docs/architecture.md and AGENTS.md. Historical version numbers, repository links, PRs, incidents and implementation assumptions are intentionally retained as facts from that period.
+
 ## What happened
 
 The public repository contained a personal maintainer email in Git author and committer metadata.

@@ -1,5 +1,8 @@
 # Model picker compatibility: 2.1.12
 
+
+> **Historical — pre-CoS 3.0.** This document is preserved as engineering/provenance evidence. It does **not** define current runtime behavior. Current architecture is defined by docs/architecture.md and AGENTS.md. Historical version numbers, repository links, PRs, incidents and implementation assumptions are intentionally retained as facts from that period.
+
 The reported UI displays effort-only headings under Latest, retains a version prefix
 for explicit selections and 6 Pro, and adds a retirement caption to a version row.
 

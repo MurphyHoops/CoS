@@ -1,5 +1,8 @@
 # OpenAI Codex attribution
 
+
+> **CoS 3.x provenance/compliance reference.** This document preserves third-party attribution, source or packaging obligations. It is not a product-architecture specification.
+
 `LICENSE` and `NOTICE` were copied from OpenAI Codex revision
 `1a4096e273e80da30947e57fdfa45be92858ca91` on 2026-09-09.
 
