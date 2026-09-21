@@ -54,6 +54,12 @@ A task should be attached to the intended local project before mutation.
 
 CoS records the mission/session and binds the current provider conversation as an executor. The conversation is replaceable; the mission is not.
 
+### Optional project runtime contract
+
+Projects that want machine-verifiable completion can add `.cos/project.json`. It can name direct-exec verification tasks and path/task completion predicates. The profile is optional; projects without it keep normal behavior.
+
+Use `project_runtime status` to inspect the safe declarative summary and `project_runtime check` to evaluate it. Command checks still obey current command permission. See [project-runtime.md](project-runtime.md).
+
 ## 6. Long-running work
 
 For active reasoning/tool work, use the provider turn normally.
@@ -76,7 +82,9 @@ Built-in wait kinds:
 - `process`
 - `timer`
 
-See [long-run-runtime.md](long-run-runtime.md).
+If the provider/network becomes unavailable, leave CoS running. Connectivity loss is treated as transport suspension: provider-dependent delivery/recovery clocks are parked, local durable state remains intact, and the same obligations resume after the connection authority returns to ready. Do not manually spam Retry/Continue merely because the machine was offline.
+
+See [long-run-runtime.md](long-run-runtime.md) and [transport-suspension.md](transport-suspension.md).
 
 ## 7. Compact & Resume
 

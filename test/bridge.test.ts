@@ -20,7 +20,7 @@ import { browserControl } from '../src/main/browser-control.js';
 import { foldProgress, type SessionEvent } from '../src/shared/session.js';
 import type { ContinuationSnapshot } from '../src/main/session/continuation.js';
 import type { SwarmSnapshot } from '../src/main/agents.js';
-import type { Config } from '../src/shared/types.js';
+import type { Config, ConnectionStatus } from '../src/shared/types.js';
 
 const recoveryBrowserWake = vi.hoisted(() => vi.fn(async (_url: string, _retry?: boolean, _background?: boolean,
   _authority?: { current(): boolean }) => {}));
@@ -50,6 +50,7 @@ const { initSecretsPath, resetSecretsCacheForTests, setSecret } = await import('
 const {
   bridgePort,
   bridgeStatus,
+  flushBridgeTransportRecoveryForTests,
   sessionControlsFor,
   onBridgeChange,
   compactSession,
@@ -169,6 +170,19 @@ const { resumeBootstrapText } = await import('../src/main/session/handoff.js');
 const { beginSelfHealingEpisode, setSelfHealingRecoveryHooksForTests } = await import('../src/main/session/self-healing.js');
 const { SELF_HEAL_POST_RELOAD_MS } = await import('../src/shared/recovery.js');
 const { getLog } = await import('../src/main/logger.js');
+const { publishProviderTransportStatus, resetProviderTransportForTests } = await import('../src/main/session/connectivity.js');
+
+const connectedTransport: ConnectionStatus = {
+  state: 'connected',
+  detail: '',
+  publicUrl: null,
+  localUrl: null,
+  handshakeAt: Date.now(),
+  lastRequestAt: null,
+  lastToolCallAt: null,
+  health: null,
+  surfaces: []
+};
 
 const EXTENSION_ORIGIN = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop';
 /** The chat that spawns the swarm in these tests: only a proven conversation can. */
@@ -411,6 +425,7 @@ beforeAll(async () => {
     multiAgent: { ...baseConfig.multiAgent, enabled: true, recoverAgentTabs: true }
   };
   await saveConfig(suiteConfig);
+  resetProviderTransportForTests(connectedTransport);
   const port = await startBridge();
   expect(port, 'no loopback port in 8765-8769 was free').not.toBeNull();
   base = `http://127.0.0.1:${port}`;
@@ -446,6 +461,7 @@ beforeEach(async () => {
   // just emptied — the previous test's cleanup showing up as the next test's first command.
   resetSwarm();
   resetBridgeForTests();
+  publishProviderTransportStatus(connectedTransport);
   resetLongRunStateForTests();
   opened.length = 0;
   anonymousRedeemIndex = 0;
@@ -2340,7 +2356,9 @@ describe('delivering a bootstrap', () => {
     expect(resumeRow).toBeTruthy();
     const expiredAt = Date.now() - 30 * 60_000 - 5_000;
     revival.createdAt = expiredAt;
+    revival.deadlineCreatedAt = expiredAt;
     revival.claimedAt = expiredAt;
+    revival.deadlineClaimedAt = expiredAt;
     await writeDurableNow('bridge-commands', durableCommands);
 
     resetBridgeForTests();
@@ -4092,12 +4110,14 @@ describe('delivering a bootstrap', () => {
     finishAgent({ conversationId }, 'reported, waiting for more');
     wake([{ to: 'worker-1', text: 'expire this readiness wait on restart' }]);
     await waitForRevival();
+    expect(pendingWorkerRevivals()).toHaveLength(1);
     await flushDurable();
     const durable = await readDurable<any>('bridge-commands');
     const revive = durable?.commands?.find((entry: any) => entry?.spec?.type === 'revive');
     expect(revive).toBeTruthy();
     const id = revive.id as string;
     revive.createdAt = Date.now() - REVIVAL_ACTIVITY_MS - 1;
+    revive.deadlineCreatedAt = revive.createdAt;
     expect(revive.phase).toBe('queued');
     expect(revive.owner).toBeNull();
     await writeDurableNow('bridge-commands', durable);
@@ -4276,6 +4296,7 @@ describe('delivering a bootstrap', () => {
     // fresh command's pending debounced snapshot, while the fresh command itself remains in
     // memory exactly as a settings-driven stop/start would retain it.
     staleRevive.createdAt = Date.now() - 30 * 60_000 - 5_000;
+    staleRevive.deadlineCreatedAt = staleRevive.createdAt;
     staleDisk.commands = [staleRevive];
     staleDisk.receipts = [];
     await writeDurableNow('bridge-commands', staleDisk);
@@ -11565,6 +11586,60 @@ describe('app requests to stop one exact active turn', () => {
       expect((await getSession(sessionId))?.activeTurnId).toBe('original-turn');
     } finally { vi.useRealTimers(); }
   });
+  it('keeps one durable Stop across an offline interval and resumes it after reconnect', async () => {
+    const { stopSessionTurn, STOP_COMMAND_TIMEOUT_MS } = await import('../src/main/bridge.js');
+    const conversationId = 'e6767676-aaaa-4bbb-8ccc-111111111111';
+    vi.useFakeTimers();
+    try {
+      const sessionId = await active(conversationId, 'offline-stop-turn');
+      const startedAt = Date.now();
+
+      publishProviderTransportStatus({
+        ...connectedTransport,
+        state: 'offline',
+        detail: 'No internet',
+        handshakeAt: null
+      });
+      await stopSessionTurn(sessionId, 'offline-stop-turn');
+
+      const first = (await request('GET', '/status')).body.stopTurns;
+      expect(first).toHaveLength(1);
+      const commandId = first[0].id;
+      expect(recoveryBrowserWake).not.toHaveBeenCalled();
+
+      // Offline time is transport suspension, not Stop failure budget.
+      vi.setSystemTime(startedAt + STOP_COMMAND_TIMEOUT_MS + 30_000);
+      const stillPending = (await request('GET', '/status')).body.stopTurns;
+      expect(stillPending).toHaveLength(1);
+      expect(stillPending[0].id).toBe(commandId);
+
+      publishProviderTransportStatus({
+        ...connectedTransport,
+        state: 'connected',
+        detail: '',
+        handshakeAt: Date.now()
+      });
+      await flushBridgeTransportRecoveryForTests();
+
+      expect(recoveryBrowserWake).toHaveBeenCalledTimes(1);
+      expect(recoveryBrowserWake.mock.calls[0]?.[0]).toBe(`https://chatgpt.com/c/${conversationId}`);
+      const resumed = (await request('GET', '/status')).body.stopTurns;
+      expect(resumed).toHaveLength(1);
+      expect(resumed[0].id).toBe(commandId);
+      expect(resumed[0].expiresAt).toBeGreaterThan(Date.now());
+
+      // Repeating the same user intent cannot mint another transport command.
+      await stopSessionTurn(sessionId, 'offline-stop-turn');
+      const deduped = (await request('GET', '/status')).body.stopTurns;
+      expect(deduped).toHaveLength(1);
+      expect(deduped[0].id).toBe(commandId);
+      expect(recoveryBrowserWake).toHaveBeenCalledTimes(1);
+    } finally {
+      publishProviderTransportStatus({ ...connectedTransport, handshakeAt: Date.now() });
+      vi.useRealTimers();
+    }
+  });
+
   it('does not borrow a previous turn question when the Stop target has no native question anchor', async () => {
     const { stopSessionTurn } = await import('../src/main/bridge.js');
     const conversationId = 'e7777777-aaaa-4bbb-8ccc-111111111111';

@@ -32,6 +32,7 @@ const { appendEvent, createSession, observeSessionModel, initSessionStore, reset
   '../src/main/session/store.js'
 );
 const goal = await import('../src/main/goal.js');
+const { resetProviderTransportForTests } = await import('../src/main/session/connectivity.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
 
 let dir: string;
@@ -90,6 +91,10 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
+  resetProviderTransportForTests({
+    state: 'connected', detail: '', publicUrl: null, localUrl: null,
+    handshakeAt: Date.now(), lastRequestAt: null, lastToolCallAt: null, health: null, surfaces: []
+  });
   goal.resetGoalStateForTests();
   await saveConfig({
     ...defaultConfig(),

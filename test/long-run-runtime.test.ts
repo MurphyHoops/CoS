@@ -2,10 +2,14 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { LongRunSnapshot } from '../src/main/session/long-run.js';
 
 const mocks = vi.hoisted(() => ({
   runCommand: vi.fn(),
   getConfig: vi.fn(),
+  effectiveCapabilities: vi.fn(),
+  loadSessionProjectRuntimeProfile: vi.fn(),
+  evaluateSessionProjectCompletion: vi.fn(),
   goalSwitchFor: vi.fn(),
   agentInfoForOwnedConversation: vi.fn(),
   persistCriticalSwarmNow: vi.fn(),
@@ -18,11 +22,19 @@ const mocks = vi.hoisted(() => ({
   getSession: vi.fn(),
   sessionAutonomyPaused: vi.fn(),
   logInfo: vi.fn(),
-  logWarn: vi.fn()
+  logWarn: vi.fn(),
+  transportReady: true
 }));
 
 vi.mock('../src/main/exec.js', () => ({ runCommand: mocks.runCommand }));
-vi.mock('../src/main/config.js', () => ({ getConfig: mocks.getConfig }));
+vi.mock('../src/main/config.js', () => ({
+  getConfig: mocks.getConfig,
+  effectiveCapabilities: mocks.effectiveCapabilities
+}));
+vi.mock('../src/main/project-runtime.js', () => ({
+  loadSessionProjectRuntimeProfile: mocks.loadSessionProjectRuntimeProfile,
+  evaluateSessionProjectCompletion: mocks.evaluateSessionProjectCompletion
+}));
 vi.mock('../src/main/goal.js', () => ({ goalSwitchFor: mocks.goalSwitchFor }));
 vi.mock('../src/main/agents.js', () => ({
   agentInfoForOwnedConversation: mocks.agentInfoForOwnedConversation,
@@ -41,13 +53,24 @@ vi.mock('../src/main/session/store.js', () => ({
   sessionAutonomyPaused: mocks.sessionAutonomyPaused
 }));
 vi.mock('../src/main/logger.js', () => ({ logInfo: mocks.logInfo, logWarn: mocks.logWarn }));
+vi.mock('../src/main/session/connectivity.js', () => ({
+  providerTransportReady: () => mocks.transportReady
+}));
 
-const { initDurableStore, resetDurableForTests } = await import('../src/main/durable.js');
+const { initDurableStore, readDurable, resetDurableForTests } = await import('../src/main/durable.js');
 const {
+  LONG_RUN_STATE,
   armLongRunWaitNow,
+  captureExecutionTicket,
+  claimProjectCompletionCheckNow,
   ensureRecoveryWorkNow,
   leaseLongRunWorkNow,
   longRunStatus,
+  moveLongRunStateNow,
+  pauseLongRunTransportNow,
+  resolveLongRunWaitNow,
+  restoreLongRunState,
+  resumeLongRunTransportNow,
   markLongRunWorkQueuedNow,
   noteLongRunProgressNow,
   resetLongRunStateForTests
@@ -81,7 +104,18 @@ beforeEach(async () => {
   directory = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-long-run-runtime-'));
   initDurableStore(directory);
 
+  mocks.transportReady = true;
   mocks.getConfig.mockReturnValue({ multiAgent: { enabled: true } });
+  mocks.effectiveCapabilities.mockReturnValue({ command: true, read: true, metadata: true });
+  mocks.loadSessionProjectRuntimeProfile.mockResolvedValue(null);
+  mocks.evaluateSessionProjectCompletion.mockResolvedValue({
+    state: 'unconfigured',
+    projectId: null,
+    projectName: null,
+    profilePath: null,
+    mode: null,
+    checks: []
+  });
   mocks.goalSwitchFor.mockReturnValue({ enabled: false, mode: 'goal', own: true, afterTurn: false });
   mocks.agentInfoForOwnedConversation.mockReturnValue(null);
   mocks.persistCriticalSwarmNow.mockResolvedValue(true);
@@ -138,6 +172,204 @@ describe('local long-run supervisor', () => {
     expect(mocks.enqueueInput).toHaveBeenCalledTimes(1);
   });
 
+  it('stops an owed continuation when an opted-in machine completion rule is satisfied', async () => {
+    mocks.loadSessionProjectRuntimeProfile.mockResolvedValue({
+      projectId: 'project-1',
+      projectName: 'Generic project',
+      projectReal: '/project',
+      profilePath: '/project/.cos/project.json',
+      profile: {
+        version: 1,
+        tasks: {},
+        completion: {
+          mode: 'all',
+          autoStop: true,
+          checks: [{ kind: 'path_exists', path: 'done.marker' }]
+        }
+      }
+    });
+    mocks.evaluateSessionProjectCompletion.mockResolvedValue({
+      state: 'satisfied',
+      projectId: 'project-1',
+      projectName: 'Generic project',
+      profilePath: '/project/.cos/project.json',
+      mode: 'all',
+      checks: [{ check: { kind: 'path_exists', path: 'done.marker' }, state: 'satisfied', detail: 'path exists' }]
+    });
+
+    const dueAt = Date.now() + 1_000;
+    await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT,
+      sourceTurnId: 'turn-complete',
+      kind: 'timer',
+      dueAt
+    });
+
+    await pollLongRunRuntime(dueAt + 1);
+
+    expect(longRunStatus(SESSION).work).toMatchObject({ state: 'fulfilled', reason: 'wait_resolved' });
+    expect(mocks.evaluateSessionProjectCompletion).toHaveBeenCalledTimes(1);
+    expect(mocks.enqueueInput).not.toHaveBeenCalled();
+
+    await pollLongRunRuntime(dueAt + 10_000);
+    expect(mocks.evaluateSessionProjectCompletion).toHaveBeenCalledTimes(1);
+    expect(mocks.enqueueInput).not.toHaveBeenCalled();
+  });
+
+  it.each(['unsatisfied', 'blocked'] as const)(
+    'continues durable work when an opted-in completion rule is %s',
+    async state => {
+      mocks.loadSessionProjectRuntimeProfile.mockResolvedValue({
+        projectId: 'project-1',
+        projectName: 'Generic project',
+        projectReal: '/project',
+        profilePath: '/project/.cos/project.json',
+        profile: {
+          version: 1,
+          tasks: {},
+          completion: {
+            mode: 'all',
+            autoStop: true,
+            checks: [{ kind: 'path_exists', path: 'done.marker' }]
+          }
+        }
+      });
+      mocks.evaluateSessionProjectCompletion.mockResolvedValue({
+        state,
+        projectId: 'project-1',
+        projectName: 'Generic project',
+        profilePath: '/project/.cos/project.json',
+        mode: 'all',
+        checks: []
+      });
+
+      const dueAt = Date.now() + 1_000;
+      await armLongRunWaitNow({
+        sessionId: SESSION,
+        conversationId: CHAT,
+        sourceTurnId: `turn-${state}`,
+        kind: 'timer',
+        dueAt
+      });
+
+      await pollLongRunRuntime(dueAt + 1);
+
+      expect(mocks.evaluateSessionProjectCompletion).toHaveBeenCalledTimes(1);
+      expect(mocks.enqueueInput).toHaveBeenCalledTimes(1);
+      expect(longRunStatus(SESSION).work).toMatchObject({ state: 'queued' });
+    }
+  );
+
+  it('does not evaluate completion automatically unless the project explicitly opts in', async () => {
+    mocks.loadSessionProjectRuntimeProfile.mockResolvedValue({
+      projectId: 'project-1',
+      projectName: 'Generic project',
+      projectReal: '/project',
+      profilePath: '/project/.cos/project.json',
+      profile: {
+        version: 1,
+        tasks: {},
+        completion: {
+          mode: 'all',
+          autoStop: false,
+          checks: [{ kind: 'path_exists', path: 'done.marker' }]
+        }
+      }
+    });
+    const dueAt = Date.now() + 1_000;
+    await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT,
+      sourceTurnId: 'turn-no-auto-stop',
+      kind: 'timer',
+      dueAt
+    });
+
+    await pollLongRunRuntime(dueAt + 1);
+
+    expect(mocks.evaluateSessionProjectCompletion).not.toHaveBeenCalled();
+    expect(mocks.enqueueInput).toHaveBeenCalledTimes(1);
+    expect(longRunStatus(SESSION).work).toMatchObject({ state: 'queued' });
+  });
+
+  it('persists a completion claim across crash restore and executor rebind without replaying the verifier', async () => {
+    const reboundConversation = 'conversation-runtime-rebound';
+    const dueAt = Date.now() + 60_000;
+    const wait = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT,
+      sourceTurnId: 'turn-claim-crash',
+      kind: 'timer',
+      dueAt
+    });
+    const ticket = captureExecutionTicket(SESSION, CHAT);
+    expect(ticket).not.toBeNull();
+    expect(await resolveLongRunWaitNow(SESSION, wait.id, ticket!, 'timer resolved')).toBe(true);
+    const owed = longRunStatus(SESSION).work!;
+    expect(owed.state).toBe('owed');
+
+    expect(await claimProjectCompletionCheckNow(SESSION, owed.id, ticket!)).toBe(true);
+    const claimedAt = longRunStatus(SESSION).work?.completionCheckClaimedAt;
+    expect(claimedAt).toEqual(expect.any(Number));
+
+    // The claim is part of the fsynced WAL, not a process-memory retry cache.
+    const persisted = await readDurable<LongRunSnapshot>(LONG_RUN_STATE);
+    expect(persisted?.obligations[0]?.completionCheckClaimedAt).toBe(claimedAt);
+
+    // Rebinding authority must not reopen an ambiguous command-backed evaluation.
+    expect(await moveLongRunStateNow(SESSION, CHAT, reboundConversation)).toBe(true);
+    const reboundTicket = captureExecutionTicket(SESSION, reboundConversation);
+    expect(reboundTicket).not.toBeNull();
+    expect(await claimProjectCompletionCheckNow(SESSION, owed.id, reboundTicket!)).toBe(false);
+    expect(longRunStatus(SESSION).work?.completionCheckClaimedAt).toBe(claimedAt);
+
+    const reboundSnapshot = await readDurable<LongRunSnapshot>(LONG_RUN_STATE);
+    resetLongRunStateForTests();
+    restoreLongRunState(reboundSnapshot);
+    mocks.getSession.mockResolvedValue({
+      id: SESSION,
+      conversationId: reboundConversation,
+      recovery: null,
+      origin: { kind: 'desktop' }
+    });
+    mocks.loadSessionProjectRuntimeProfile.mockResolvedValue({
+      projectId: 'project-1',
+      projectName: 'Generic project',
+      projectReal: '/project',
+      profilePath: '/project/.cos/project.json',
+      profile: {
+        version: 1,
+        tasks: { verify: { argv: ['verifier'], timeoutMs: 5_000 } },
+        completion: {
+          mode: 'all',
+          autoStop: true,
+          checks: [{ kind: 'task_success', task: 'verify' }]
+        }
+      }
+    });
+    mocks.evaluateSessionProjectCompletion.mockResolvedValue({
+      state: 'satisfied',
+      projectId: 'project-1',
+      projectName: 'Generic project',
+      profilePath: '/project/.cos/project.json',
+      mode: 'all',
+      checks: [{ check: { kind: 'task_success', task: 'verify' }, state: 'satisfied', detail: 'ok' }]
+    });
+
+    await pollLongRunRuntime(Date.now());
+
+    expect(mocks.loadSessionProjectRuntimeProfile).not.toHaveBeenCalled();
+    expect(mocks.evaluateSessionProjectCompletion).not.toHaveBeenCalled();
+    expect(mocks.enqueueInput).toHaveBeenCalledTimes(1);
+    expect(longRunStatus(SESSION).work).toMatchObject({
+      id: owed.id,
+      conversationId: reboundConversation,
+      state: 'queued',
+      completionCheckClaimedAt: claimedAt
+    });
+  });
+
   it('resolves a GitHub Actions run locally and wakes the durable task once', async () => {
     mocks.runCommand.mockResolvedValue({
       exitCode: 0,
@@ -168,6 +400,63 @@ describe('local long-run supervisor', () => {
     expect(longRunStatus(SESSION).work).toMatchObject({ state: 'queued', reason: 'wait_resolved' });
     expect(mocks.enqueueInput).toHaveBeenCalledTimes(1);
     expect(mocks.enqueueInput.mock.calls[0]?.[0]?.text).toContain('completed with conclusion success');
+  });
+
+  it('parks connectivity-dependent providers offline without spending their failure budget', async () => {
+    mocks.transportReady = false;
+    const wait = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT,
+      sourceTurnId: 'turn-offline-provider',
+      kind: 'fixture_job',
+      providerKey: 'fixture:offline',
+      providerData: { job: 7 }
+    });
+
+    await pollLongRunRuntime(wait.nextCheckAt + 1);
+
+    expect(customInspect).not.toHaveBeenCalled();
+    expect(longRunStatus(SESSION).wait).toMatchObject({
+      id: wait.id,
+      state: 'waiting',
+      attempts: 0,
+      lastError: null
+    });
+    expect(longRunStatus(SESSION).work).toMatchObject({ state: 'waiting' });
+    expect(mocks.enqueueInput).not.toHaveBeenCalled();
+
+    mocks.transportReady = true;
+    const deferred = longRunStatus(SESSION).wait!;
+    await pollLongRunRuntime(deferred.nextCheckAt + 1);
+
+    expect(customInspect).toHaveBeenCalledTimes(1);
+    expect(longRunStatus(SESSION).wait).toMatchObject({ state: 'resolved' });
+    expect(longRunStatus(SESSION).work).toMatchObject({ state: 'queued', reason: 'wait_resolved' });
+    expect(mocks.enqueueInput).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets a local timer resolve offline but parks its provider continuation until reconnect', async () => {
+    mocks.transportReady = false;
+    const dueAt = Date.now() + 1_000;
+    await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT,
+      sourceTurnId: 'turn-offline-timer',
+      kind: 'timer',
+      dueAt
+    });
+
+    await pollLongRunRuntime(dueAt + 1);
+
+    expect(longRunStatus(SESSION).wait).toMatchObject({ state: 'resolved' });
+    expect(longRunStatus(SESSION).work).toMatchObject({ state: 'owed', reason: 'wait_resolved' });
+    expect(mocks.enqueueInput).not.toHaveBeenCalled();
+
+    mocks.transportReady = true;
+    await pollLongRunRuntime(dueAt + 2);
+
+    expect(longRunStatus(SESSION).work).toMatchObject({ state: 'queued' });
+    expect(mocks.enqueueInput).toHaveBeenCalledTimes(1);
   });
 
   it('dispatches a project-specific wait through the generic provider registry', async () => {
@@ -251,6 +540,45 @@ describe('local long-run supervisor', () => {
       reason: 'recovery_resume',
       state: 'queued'
     });
+  });
+
+  it('does not spend recovery probation while provider transport is suspended', async () => {
+    mocks.agentInfoForOwnedConversation.mockReturnValue({
+      id: 'worker-1',
+      role: 'worker',
+      runId: 'run-1',
+      primeConversationId: 'prime-conversation',
+      state: 'sleeping'
+    });
+    const commit = vi.fn();
+    mocks.stageWorkerContinuation.mockImplementation((_conversationId: string, stableId: string) => ({
+      messages: [{ id: stableId }], waking: ['worker-1'], runId: 'run-1', commit, rollback: vi.fn()
+    }));
+    mocks.getSession.mockResolvedValue({
+      id: SESSION,
+      conversationId: CHAT,
+      recovery: { phase: 'recovered' },
+      origin: { kind: 'worker' }
+    });
+    const work = await ensureRecoveryWorkNow(SESSION, CHAT, 'recovery:episode:transport-budget');
+    expect(work).not.toBeNull();
+
+    const pausedAt = work!.createdAt + 30_000;
+    await pauseLongRunTransportNow(pausedAt);
+    mocks.transportReady = false;
+    await pollLongRunRuntime(pausedAt + 10 * 60_000);
+    expect(mocks.stageWorkerContinuation).not.toHaveBeenCalled();
+
+    const resumedAt = pausedAt + 10 * 60_000;
+    await resumeLongRunTransportNow(resumedAt);
+    mocks.transportReady = true;
+    await pollLongRunRuntime(resumedAt + 59_999);
+    expect(mocks.stageWorkerContinuation).not.toHaveBeenCalled();
+
+    await pollLongRunRuntime(resumedAt + 60_000);
+    expect(mocks.stageWorkerContinuation).toHaveBeenCalledTimes(1);
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(longRunStatus(SESSION).work).toMatchObject({ id: work!.id, state: 'queued' });
   });
 
   it('reconciles a revoked provably-unsent worker continuation out of the durable broker', async () => {

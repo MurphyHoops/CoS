@@ -216,11 +216,15 @@ interface Continuation {
    * itself is longer instead — see CONTINUATION_PRO_WRITING_TTL_MS.
    */
   touchedAt: number;
+  /** Mutable provider-wait budget anchor corresponding to touchedAt. */
+  deadlineTouchedAt: number;
   sourceProgress: number;
   /** Auto-compaction ticket: survives page/retry clocks until commit or explicit Off/cancel. */
   automatic: boolean;
   /** When the brief request first went on its way; the automatic clock starts here. */
   askedAt: number | null;
+  /** Mutable provider-wait budget anchor corresponding to askedAt. */
+  deadlineAskedAt: number | null;
   state: ContinuationState;
   /** The brief, once captured. Handed to whoever opens chat B, and to nothing else. */
   summary: string;
@@ -273,11 +277,15 @@ interface ContinuationRecord {
   openedAt: number;
   /** Absent in snapshots written before the manual deadline counted from activity. */
   touchedAt?: number;
+  /** Mutable provider-wait budget anchor; absent in snapshots before transport suspension. */
+  deadlineTouchedAt?: number;
   sourceProgress?: number;
   /** Absent in records written before durable auto-compaction tickets existed. */
   automatic?: boolean;
   /** Absent in records written before automatic handovers had a deadline. */
   askedAt?: number | null;
+  /** Mutable provider-wait budget anchor; absent in snapshots before transport suspension. */
+  deadlineAskedAt?: number | null;
   /** Absent in records written before Project affinity was carried; null means the site root. */
   project?: string | null;
   state: ContinuationState;
@@ -296,7 +304,12 @@ export interface ContinuationSnapshot {
   version: 1;
   savedAt: number;
   entries: ContinuationRecord[];
+  /** Durable proof that provider-wait budgets were paused when this WAL was written. */
+  transportPausedAt?: number | null;
 }
+
+/** Start of the current provider-unavailable interval for continuation waiting budgets. */
+let transportPausedAt: ContinuationSnapshot['transportPausedAt'] = null;
 
 function durableRecord(entry: Continuation): ContinuationRecord {
   return {
@@ -308,9 +321,11 @@ function durableRecord(entry: Continuation): ContinuationRecord {
     to: entry.to,
     openedAt: entry.openedAt,
     touchedAt: entry.touchedAt,
+    deadlineTouchedAt: entry.deadlineTouchedAt,
     sourceProgress: entry.sourceProgress,
     automatic: entry.automatic,
     askedAt: entry.askedAt,
+    deadlineAskedAt: entry.deadlineAskedAt,
     project: entry.project,
     state: entry.state,
     summary: entry.summary.slice(0, 512 * 1024),
@@ -335,7 +350,8 @@ function snapshotWith(token?: string, replacement?: ContinuationRecord): Continu
   return {
     version: 1,
     savedAt: Date.now(),
-    entries
+    entries,
+    transportPausedAt
   };
 }
 
@@ -351,6 +367,33 @@ async function changedNow(): Promise<void> {
   await writeDurableNow(CONTINUATIONS_STATE, snapshotContinuations());
 }
 
+function transportBudgetNow(now = Date.now()): number {
+  return typeof transportPausedAt === 'number' ? Math.min(now, transportPausedAt) : now;
+}
+
+export async function pauseContinuationTransportNow(now = Date.now()): Promise<void> {
+  if (typeof transportPausedAt === 'number') return;
+  transportPausedAt = now;
+  await changedNow();
+}
+
+export async function resumeContinuationTransportNow(now = Date.now()): Promise<void> {
+  if (typeof transportPausedAt !== 'number') return;
+  const pausedAt = transportPausedAt;
+  transportPausedAt = null;
+  for (const entry of byToken.values()) {
+    if (entry.state === 'committed') continue;
+    if (entry.state === 'aborted') continue;
+    const touchedOverlap = Math.max(0, now - Math.max(pausedAt, entry.deadlineTouchedAt));
+    entry.deadlineTouchedAt += touchedOverlap;
+    if (entry.deadlineAskedAt !== null) {
+      const askedOverlap = Math.max(0, now - Math.max(pausedAt, entry.deadlineAskedAt));
+      entry.deadlineAskedAt += askedOverlap;
+    }
+  }
+  await changedNow();
+}
+
 function publishRecord(entry: Continuation, record: ContinuationRecord): void {
   // Terminal either way, so nothing is still opening a chat for this transaction. The gate
   // self-expires regardless; releasing it here just stops an unrelated brand-new chat from
@@ -363,6 +406,10 @@ function publishRecord(entry: Continuation, record: ContinuationRecord): void {
   // existed reports nothing, and reading that as "last touched when it opened" would expire a
   // handoff that has been progressing since.
   entry.touchedAt = Math.max(entry.touchedAt, record.touchedAt ?? record.openedAt);
+  entry.deadlineTouchedAt = Math.max(
+    entry.deadlineTouchedAt,
+    record.deadlineTouchedAt ?? record.touchedAt ?? record.openedAt
+  );
   entry.sourceProgress = record.sourceProgress ?? 0;
   entry.automatic = record.automatic === true;
   entry.state = record.state;
@@ -379,7 +426,13 @@ function publishRecord(entry: Continuation, record: ContinuationRecord): void {
     : { state: 'not-attempted', conversationId: null, messageId: null };
   entry.error = record.error;
   if (entry.askedAt === null && handoffAsked(entry)) {
-    entry.askedAt = typeof record.askedAt === 'number' && Number.isFinite(record.askedAt) ? record.askedAt : Date.now();
+    const askedAt = typeof record.askedAt === 'number' && Number.isFinite(record.askedAt) ? record.askedAt : Date.now();
+    entry.askedAt = askedAt;
+    entry.deadlineAskedAt = typeof record.deadlineAskedAt === 'number' && Number.isFinite(record.deadlineAskedAt)
+      ? record.deadlineAskedAt
+      : (typeof record.askedAt === 'number' && Number.isFinite(record.askedAt) ? askedAt : transportBudgetNow());
+  } else if (entry.deadlineAskedAt !== null && typeof record.deadlineAskedAt === 'number' && Number.isFinite(record.deadlineAskedAt)) {
+    entry.deadlineAskedAt = Math.max(entry.deadlineAskedAt, record.deadlineAskedAt);
   }
 }
 
@@ -392,7 +445,11 @@ async function transitionNow(
   // Any semantic transition is forward progress, so it renews the waiting deadline. Without this
   // the stamp would only ever be set at open and the manual clock would be back to counting from
   // there — the same bug in a new field.
-  if (JSON.stringify(next) !== JSON.stringify(current)) next.touchedAt = Date.now();
+  if (JSON.stringify(next) !== JSON.stringify(current)) {
+    const touchedAt = Date.now();
+    next.touchedAt = touchedAt;
+    next.deadlineTouchedAt = transportBudgetNow(touchedAt);
+  }
   try {
     // Persist the proposed semantic state before publishing it into the live transaction.
     // If the durable boundary rejects, callers still see the previous state and can retry or
@@ -499,13 +556,30 @@ const manualWaitingTtlMs = (state: ContinuationState, requested: RequestedModel 
  * a Pro brief is still being written; an automatic one has no clock until it is asked for and
  * AUTOMATIC_HANDOVER_TTL_MS from then.
  */
-const expired = (entry: Continuation, now = Date.now()): boolean =>
-  entry.automatic
-    ? entry.askedAt !== null && now - entry.askedAt >= AUTOMATIC_HANDOVER_TTL_MS
-    : now - entry.touchedAt >= manualWaitingTtlMs(entry.state, entry.requestedModel);
+const expired = (entry: Continuation, now = Date.now()): boolean => {
+  const budgetNow = transportBudgetNow(now);
+  return entry.automatic
+    ? entry.deadlineAskedAt !== null && budgetNow - entry.deadlineAskedAt >= AUTOMATIC_HANDOVER_TTL_MS
+    : budgetNow - entry.deadlineTouchedAt >= manualWaitingTtlMs(entry.state, entry.requestedModel);
+};
 
 const isOpen = (entry: Continuation): boolean =>
   entry.state !== 'committed' && entry.state !== 'aborted' && !expired(entry);
+
+/** Provider-ready deadline for bridge custody; causal touched/asked timestamps remain unchanged. */
+export function continuationProviderDeadlineAt(token: string): number | null {
+  const entry = byToken.get(token);
+  if (!entry || entry.state === 'committed' || entry.state === 'aborted') return null;
+  if (entry.automatic) {
+    return entry.deadlineAskedAt === null ? null : entry.deadlineAskedAt + AUTOMATIC_HANDOVER_TTL_MS;
+  }
+  return entry.deadlineTouchedAt + manualWaitingTtlMs(entry.state, entry.requestedModel);
+}
+
+/** Provider-ready anchor for the durable source-send phase, used only by browser pickup scheduling. */
+export function continuationProviderAskedAt(token: string): number | null {
+  return byToken.get(token)?.deadlineAskedAt ?? null;
+}
 
 function sweep(): void {
   for (const entry of [...byToken.values()]) {
@@ -748,6 +822,7 @@ export async function repairPrimeFromResumeShadow(conversationId: string): Promi
  * own handoff and its own fresh tab.
  */
 function makeContinuation(sessionId: string, fromConversationId: string, automatic: boolean, project: string | null): Continuation {
+  const openedAt = Date.now();
   return {
     requestedModel: null,
     sourceTurnId: null,
@@ -755,11 +830,13 @@ function makeContinuation(sessionId: string, fromConversationId: string, automat
     sessionId,
     from: fromConversationId,
     project,
-    openedAt: Date.now(),
-    touchedAt: Date.now(),
+    openedAt,
+    touchedAt: openedAt,
+    deadlineTouchedAt: transportBudgetNow(openedAt),
     sourceProgress: 0,
     automatic,
     askedAt: null,
+    deadlineAskedAt: null,
     state: 'awaiting-summary',
     summary: '',
     handoffId: null,
@@ -1595,6 +1672,11 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
   byToken.clear();
   if (!snapshot || snapshot.version !== 1 || !Array.isArray(snapshot.entries)) return;
   const now = Date.now();
+  const persistedPauseAt = typeof snapshot.transportPausedAt === 'number' && Number.isFinite(snapshot.transportPausedAt)
+    ? snapshot.transportPausedAt
+    : null;
+  const restartSuspensionMs = persistedPauseAt === null ? 0 : Math.max(0, now - persistedPauseAt);
+  transportPausedAt = persistedPauseAt === null ? null : now;
   const validStates = new Set<ContinuationState>([
     'awaiting-summary',
     'awaiting-chat',
@@ -1610,6 +1692,11 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
     // rather than vanish silently at twice the ordinary TTL.
     const retentionMs = manualWaitingTtlMs(raw.state, requestedModel(raw.requestedModel)) * 2;
     const lastTouchedAt = Number.isFinite(raw.touchedAt) && raw.touchedAt! <= now ? raw.touchedAt! : raw.openedAt;
+    const terminal = raw.state === 'committed' || raw.state === 'aborted';
+    let deadlineTouchedAt = Number.isFinite(raw.deadlineTouchedAt) && raw.deadlineTouchedAt! <= now
+      ? Number(raw.deadlineTouchedAt)
+      : lastTouchedAt;
+    if (!terminal && persistedPauseAt !== null) deadlineTouchedAt += restartSuspensionMs;
     if (
       !/^[A-Za-z0-9_-]{16,64}$/.test(raw.token) ||
       !/^[0-9a-z-]{8,64}$/i.test(raw.sessionId) ||
@@ -1617,8 +1704,8 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
       raw.from.length === 0 || raw.from.length > 256 ||
       !validStates.has(raw.state) ||
       !Number.isFinite(raw.openedAt) ||
-      ((raw.state === 'committed' || raw.state === 'aborted') && now - lastTouchedAt >= retentionMs) ||
-      (raw.automatic !== true && now - lastTouchedAt >= retentionMs)
+      (terminal && now - lastTouchedAt >= retentionMs) ||
+      (!terminal && raw.automatic !== true && now - deadlineTouchedAt >= retentionMs)
     ) {
       continue;
     }
@@ -1634,8 +1721,10 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
       // Older snapshots have no touch stamp; the open time is the honest floor for them.
       sourceProgress: Number.isSafeInteger(raw.sourceProgress) && raw.sourceProgress! >= 0 && raw.sourceProgress! <= 4_000_000 ? raw.sourceProgress! : 0,
       touchedAt: Number.isFinite(raw.touchedAt) && raw.touchedAt! >= raw.openedAt && raw.touchedAt! <= now ? Number(raw.touchedAt) : raw.openedAt,
+      deadlineTouchedAt,
       automatic: raw.automatic === true,
       askedAt: null,
+      deadlineAskedAt: null,
       state: raw.state,
       summary: typeof raw.summary === 'string' ? raw.summary.slice(0, 512 * 1024) : '',
       handoffId: typeof raw.handoffId === 'string' ? raw.handoffId : null,
@@ -1673,9 +1762,15 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
       error: typeof raw.error === 'string' ? raw.error : null
     };
     if (handoffAsked(entry)) {
-      // A record from before the automatic deadline existed starts its clock at this
-      // restart: this process has watched the handover for exactly no time.
-      entry.askedAt = typeof raw.askedAt === 'number' && Number.isFinite(raw.askedAt) ? raw.askedAt : now;
+      // Preserve authored evidence separately from the provider-wait budget. A legacy record that
+      // had no automatic deadline starts its budget at this restart without inventing old evidence.
+      const askedAt = typeof raw.askedAt === 'number' && Number.isFinite(raw.askedAt) ? raw.askedAt : now;
+      entry.askedAt = askedAt;
+      let deadlineAskedAt = typeof raw.deadlineAskedAt === 'number' && Number.isFinite(raw.deadlineAskedAt)
+        ? raw.deadlineAskedAt
+        : (typeof raw.askedAt === 'number' && Number.isFinite(raw.askedAt) ? askedAt : now);
+      if (!terminal && persistedPauseAt !== null) deadlineAskedAt += restartSuspensionMs;
+      entry.deadlineAskedAt = deadlineAskedAt;
     }
     const waitingExpired = entry.state !== 'committed' && entry.state !== 'aborted' && expired(entry, now);
     if (entry.handoffId) {
@@ -1821,6 +1916,7 @@ export function resetContinuationsForTests(): void {
   openingBySession.clear();
   commitLocks.clear();
   checkpointLocks.clear();
+  transportPausedAt = null;
   recoveryHooks = {};
   // The gate is part of this module's state even though it lives next door, and a claim
   // outlives a cleared transaction by RESUME_CLAIM_WINDOW_MS. Left behind, it makes the

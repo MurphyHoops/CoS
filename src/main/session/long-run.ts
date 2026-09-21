@@ -64,6 +64,16 @@ export interface WorkObligation {
   inputId: string | null;
   result: string | null;
   createdAt: number;
+  /** Mutable provider-ready budget anchor for recovery probation; evidence remains createdAt. */
+  providerBudgetAt?: number;
+  /**
+   * Durable one-shot claim for automatic Project Runtime completion evaluation.
+   *
+   * This is written before any project verifier command may start. If the process crashes after
+   * the claim, the recovered obligation fails open to ordinary continuation instead of replaying
+   * an ambiguous command-backed check.
+   */
+  completionCheckClaimedAt?: number | null;
   updatedAt: number;
   issuedAt: number | null;
 }
@@ -104,6 +114,8 @@ export interface LongRunSnapshot {
   epochs: ExecutionEpoch[];
   obligations: WorkObligation[];
   waits: LongRunWaitContract[];
+  /** Durable proof that provider-time budgets were paused when this WAL was written. */
+  transportPausedAt?: number | null;
 }
 
 export interface ArmLongRunWaitInput {
@@ -124,6 +136,7 @@ export interface ArmLongRunWaitInput {
 const epochs = new Map<string, ExecutionEpoch>();
 const obligations = new Map<string, WorkObligation>();
 const waits = new Map<string, LongRunWaitContract>();
+let transportPausedAt: number | null = null;
 let chain: Promise<unknown> = Promise.resolve();
 
 function serial<T>(work: () => Promise<T>): Promise<T> {
@@ -170,7 +183,8 @@ export function snapshotLongRunState(): LongRunSnapshot {
     savedAt: Date.now(),
     epochs: [...epochs.values()].map(cloneEpoch),
     obligations: [...obligations.values()].map(cloneWork),
-    waits: [...waits.values()].map(cloneWait)
+    waits: [...waits.values()].map(cloneWait),
+    transportPausedAt
   };
 }
 
@@ -178,11 +192,47 @@ function persistSoon(): void {
   writeDurableSoon(LONG_RUN_STATE, snapshotLongRunState());
 }
 
+export async function pauseLongRunTransportNow(now = Date.now()): Promise<void> {
+  return serial(async () => {
+    if (transportPausedAt !== null) return;
+    transportPausedAt = now;
+    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    catch (error) { persistSoon(); throw error; }
+  });
+}
+
+export async function resumeLongRunTransportNow(now = Date.now()): Promise<void> {
+  return serial(async () => {
+    const pausedAt = transportPausedAt;
+    if (pausedAt === null) return;
+    transportPausedAt = null;
+    for (const [sessionId, work] of obligations) {
+      if (work.reason !== 'recovery_resume' || work.state !== 'owed') continue;
+      const anchor = work.providerBudgetAt ?? work.createdAt;
+      const overlap = Math.max(0, now - Math.max(pausedAt, anchor));
+      obligations.set(sessionId, { ...work, providerBudgetAt: anchor + overlap });
+    }
+    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    catch (error) { persistSoon(); throw error; }
+  });
+}
+
+export function longRunProviderBudgetAge(work: WorkObligation, now = Date.now()): number {
+  const budgetNow = transportPausedAt === null ? now : Math.min(now, transportPausedAt);
+  return Math.max(0, budgetNow - (work.providerBudgetAt ?? work.createdAt));
+}
+
 export function restoreLongRunState(snapshot: LongRunSnapshot | null): void {
   epochs.clear();
   obligations.clear();
   waits.clear();
+  transportPausedAt = null;
   if (!snapshot || snapshot.version !== 1) return;
+  const now = Date.now();
+  const persistedPauseAt = typeof snapshot.transportPausedAt === 'number' && Number.isFinite(snapshot.transportPausedAt)
+    ? snapshot.transportPausedAt
+    : null;
+  transportPausedAt = persistedPauseAt === null ? null : now;
 
   for (const raw of Array.isArray(snapshot.epochs) ? snapshot.epochs : []) {
     if (!validSessionId(raw?.sessionId) || !validConversationId(raw?.conversationId) ||
@@ -204,8 +254,19 @@ export function restoreLongRunState(snapshot: LongRunSnapshot | null): void {
     const epoch = epochs.get(raw.sessionId);
     if (!epoch || epoch.conversationId !== raw.conversationId || epoch.generation !== raw.epochGeneration) continue;
     const current = obligations.get(raw.sessionId);
+    let providerBudgetAt = Number.isFinite(raw.providerBudgetAt) && Number(raw.providerBudgetAt) > 0
+      ? Number(raw.providerBudgetAt)
+      : raw.createdAt;
+    if (raw.reason === 'recovery_resume' && raw.state === 'owed' && persistedPauseAt !== null) {
+      providerBudgetAt += Math.max(0, now - Math.max(persistedPauseAt, providerBudgetAt));
+    }
     const normalized = cloneWork({
       ...raw,
+      providerBudgetAt,
+      completionCheckClaimedAt:
+        Number.isSafeInteger(raw.completionCheckClaimedAt) && Number(raw.completionCheckClaimedAt) > 0
+          ? Number(raw.completionCheckClaimedAt)
+          : null,
       sourceRequestId: typeof raw.sourceRequestId === 'string' && raw.sourceRequestId.length > 0
         ? raw.sourceRequestId.slice(0, 200)
         : null
@@ -669,6 +730,7 @@ export async function ensureRecoveryWorkNow(
       inputId: null,
       result: null,
       createdAt: now,
+      providerBudgetAt: now,
       updatedAt: now,
       issuedAt: null
     };
@@ -762,6 +824,58 @@ export function dispatchableLongRunWork(): WorkObligation[] {
   return [...obligations.values()]
     .filter((row) => row.state === 'owed' || row.state === 'dispatching')
     .map(cloneWork);
+}
+
+/**
+ * Persists the automatic Project Runtime evaluation intent before any verifier command can run.
+ *
+ * The claim intentionally survives executor rebinds for the same obligation. A rebind may happen
+ * while an old verifier process is already running, so clearing the claim would make the new
+ * executor replay an ambiguous side effect. New obligations receive new ids and therefore a fresh
+ * completion opportunity.
+ */
+export async function claimProjectCompletionCheckNow(
+  sessionId: string,
+  obligationId: string,
+  ticket: ExecutionTicket
+): Promise<boolean> {
+  return serial(async () => {
+    const work = obligations.get(sessionId);
+    if (!work || work.id !== obligationId || work.state !== 'owed' ||
+        !executionTicketCurrent(ticket) || work.epochGeneration !== ticket.generation ||
+        (work.completionCheckClaimedAt ?? null) !== null) return false;
+    const before = cloneWork(work);
+    obligations.set(sessionId, {
+      ...work,
+      completionCheckClaimedAt: Date.now(),
+      updatedAt: Date.now()
+    });
+    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    catch (err) { obligations.set(sessionId, before); persistSoon(); throw err; }
+    return true;
+  });
+}
+
+/**
+ * Closes an owed continuation before publication when independent machine evidence proves the
+ * project is already complete. Only the pre-dispatch state is eligible: once input dispatch has
+ * begun, the outbox/broker owns reconciliation and this function must not retract it.
+ */
+export async function fulfillOwedLongRunWorkNow(
+  sessionId: string,
+  obligationId: string,
+  ticket: ExecutionTicket
+): Promise<boolean> {
+  return serial(async () => {
+    const work = obligations.get(sessionId);
+    if (!work || work.id !== obligationId || work.state !== 'owed' ||
+        !executionTicketCurrent(ticket) || work.epochGeneration !== ticket.generation) return false;
+    const before = cloneWork(work);
+    obligations.set(sessionId, { ...work, state: 'fulfilled', updatedAt: Date.now() });
+    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    catch (err) { obligations.set(sessionId, before); persistSoon(); throw err; }
+    return true;
+  });
 }
 
 export async function leaseLongRunWorkNow(
@@ -879,5 +993,6 @@ export function resetLongRunStateForTests(): void {
   epochs.clear();
   obligations.clear();
   waits.clear();
+  transportPausedAt = null;
   chain = Promise.resolve();
 }

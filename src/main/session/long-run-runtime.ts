@@ -15,17 +15,27 @@ import {
   stageWorkerContinuation
 } from '../agents.js';
 import { goalSwitchFor } from '../goal.js';
-import { getConfig } from '../config.js';
+import { effectiveCapabilities, getConfig } from '../config.js';
 import { logInfo, logWarn } from '../logger.js';
+import {
+  evaluateSessionProjectCompletion,
+  loadSessionProjectRuntimeProfile,
+  ProjectRuntimeAuthorityError
+} from '../project-runtime.js';
 import { enqueueInput } from './input.js';
+import { providerTransportReady } from './connectivity.js';
 import { getSession, sessionAutonomyPaused } from './store.js';
 import {
   captureExecutionTicket,
+  claimProjectCompletionCheckNow,
   deferLongRunWaitNow,
   dispatchableLongRunWork,
   dueLongRunWaits,
   executionTicketCurrent,
+  fulfillOwedLongRunWorkNow,
   leaseLongRunWorkNow,
+  longRunProviderBudgetAge,
+  longRunWorkFor,
   markLongRunWorkQueuedNow,
   resolveLongRunWaitNow,
   snapshotLongRunState,
@@ -45,6 +55,53 @@ const WAIT_FAILURE_LIMIT = 6;
 let timer: NodeJS.Timeout | null = null;
 let pollInFlight: Promise<void> | null = null;
 let stopped = true;
+
+async function stopAtSatisfiedProjectCompletion(work: WorkObligation): Promise<boolean> {
+  if (work.state !== 'owed' || (work.completionCheckClaimedAt ?? null) !== null) return false;
+  const ticket = captureExecutionTicket(work.sessionId, work.conversationId);
+  if (!ticket || ticket.generation !== work.epochGeneration) return false;
+  const currentAuthority = () => {
+    if (!executionTicketCurrent(ticket)) return false;
+    const current = longRunWorkFor(work.sessionId);
+    return !!current && current.id === work.id && current.state === 'owed' &&
+      current.conversationId === work.conversationId && current.epochGeneration === ticket.generation;
+  };
+  try {
+    if (!currentAuthority()) return false;
+    const caps = effectiveCapabilities(getConfig());
+    // The profile is project-owned policy, not a capability grant. When the current runtime has
+    // disabled file read/metadata/command access, auto-stop fails open and normal continuation wins.
+    if (!caps.read) return false;
+    const loaded = await loadSessionProjectRuntimeProfile(work.sessionId);
+    if (!currentAuthority() || !loaded?.profile?.completion?.autoStop) return false;
+    // The claim is the crash boundary. It must be durable before evaluateSessionProjectCompletion
+    // can start a command-backed task_success check. If persistence fails or another executor
+    // already claimed this obligation, fail open to the ordinary continuation path.
+    if (!(await claimProjectCompletionCheckNow(work.sessionId, work.id, ticket))) return false;
+    if (!currentAuthority()) return false;
+    const result = await evaluateSessionProjectCompletion(work.sessionId, {
+      allowCommands: caps.command,
+      allowMetadata: caps.metadata,
+      authority: currentAuthority
+    });
+    if (result.state !== 'satisfied') {
+      logInfo(`long-run: project completion for ${work.sessionId} is ${result.state}; continuation remains owed`);
+      return false;
+    }
+    if (!currentAuthority()) return false;
+    if (!(await fulfillOwedLongRunWorkNow(work.sessionId, work.id, ticket))) return false;
+    logInfo(`long-run: machine completion satisfied for session ${work.sessionId}; no continuation queued`);
+    return true;
+  } catch (error) {
+    if (error instanceof ProjectRuntimeAuthorityError) return false;
+    // A malformed profile or unavailable verification environment must not strand durable work.
+    // The explicit project_runtime tool reports the error; the supervisor proceeds normally.
+    logWarn(
+      `long-run: project completion gate for ${work.sessionId} could not be evaluated — ${error instanceof Error ? error.message : String(error)}`
+    );
+    return false;
+  }
+}
 
 function retryDelay(attempts: number): number {
   return Math.min(WAIT_RETRY_MAX_MS, WAIT_RETRY_BASE_MS * 2 ** Math.min(4, Math.max(0, attempts)));
@@ -68,6 +125,13 @@ async function inspectWait(wait: LongRunWaitContract, ticket: ExecutionTicket, n
       return;
     }
     await deferLongRunWaitNow(wait.sessionId, wait.id, ticket, now + retryDelay(wait.attempts), error);
+    return;
+  }
+
+  if (provider.requiresConnectivity !== false && !providerTransportReady()) {
+    // Transport suspension is not a provider failure. Park the same durable wait without
+    // spending its consecutive-error budget; local timer/process providers opt out above.
+    await deferLongRunWaitNow(wait.sessionId, wait.id, ticket, now + WAIT_PENDING_MS, null);
     return;
   }
 
@@ -130,6 +194,10 @@ function continuationText(work: WorkObligation): string {
 async function dispatchWork(work: WorkObligation, now: number): Promise<void> {
   const session = await getSession(work.sessionId);
   if (!session?.conversationId || session.conversationId !== work.conversationId) return;
+  // A durable obligation may become owed while offline (timer/process completion, restored
+  // state, or a wait that resolved just before the outage). Provider delivery is parked until
+  // the one transport authority says connected; the debt itself remains durable.
+  if (!providerTransportReady()) return;
   // A user pause is the master autonomous-execution fence. External waits may keep being
   // observed and become owed, but no continuation is leased/enqueued until the same durable
   // session is explicitly resumed.
@@ -145,8 +213,10 @@ async function dispatchWork(work: WorkObligation, now: number): Promise<void> {
     if (!goalSwitchFor(work.conversationId).enabled && !agentInfoForOwnedConversation(work.conversationId)) return;
     // The Emergency Resume bootstrap itself is already an executing continuation. Give it one
     // bounded probation window to produce certified progress before filing a second message.
-    if (now - work.createdAt < RECOVERY_CONTINUATION_GRACE_MS) return;
+    if (longRunProviderBudgetAge(work, now) < RECOVERY_CONTINUATION_GRACE_MS) return;
   }
+
+  if (await stopAtSatisfiedProjectCompletion(work)) return;
 
   const leased = await leaseLongRunWorkNow(work.sessionId, work.conversationId);
   if (!leased?.work.inputId || !executionTicketCurrent(leased.ticket)) return;

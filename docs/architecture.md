@@ -71,6 +71,14 @@ The local runtime may continue a mission only while a live obligation exists. No
 
 This is the central defense against runaway continuation loops.
 
+### Project-owned completion
+
+A project may optionally define `.cos/project.json` with named verification tasks and machine completion predicates. The project owns the definition; CoS owns validation, sandboxing, execution custody and the durable decision about whether an eligible obligation may close.
+
+Model prose is never completion authority by itself. When `completion.auto_stop` is explicitly enabled, a machine result of `satisfied` may fulfill only work that is still durably owed. Work already crossing a dispatch boundary is not revoked retroactively.
+
+See [project-runtime.md](project-runtime.md).
+
 ## 5. Execution epochs and stale-owner fencing
 
 Every mutating execution belongs to an execution epoch.
@@ -195,6 +203,16 @@ A wait records:
 
 A successful arm ends the source turn's right to keep mutating that obligation. The continuation is delivered exactly once when the local supervisor has evidence that the wait resolved.
 
+### Provider transport is another waiting dimension
+
+Provider/network reachability is not executor health. The connection authority projects one provider-transport phase: ready, suspended or blocked. While transport is unavailable, provider-dependent deadlines, recovery escalation and continuation delivery are parked. Local timers/processes may still advance and durable debt may become owed, but it is not dispatched until transport is ready.
+
+When connectivity returns, CoS reconciles the same commands, waits, Stop intent, workers and recovery transaction before resuming. Offline time does not buy a new executor and does not consume executor-recovery budget.
+
+There is also only one owner for the next automatic provider transition: an active Long-Run WorkObligation/WaitContract parks Goal browser driving for the same session.
+
+See [transport-suspension.md](transport-suspension.md).
+
 ## 14. Tool and process custody
 
 Tool calls and background processes are owned by durable execution context, not by whichever chat happens to be visible later.
@@ -248,6 +266,8 @@ Current behavior is defined by:
 - `AGENTS.md` — implementation invariants and code ownership map;
 - `docs/tool-surface.md` — model-facing tool contracts;
 - `docs/long-run-runtime.md` — long-run state machine and waits;
+- `docs/project-runtime.md` — project-owned verification/completion contract;
+- `docs/transport-suspension.md` — provider connectivity and reconnect semantics;
 - `docs/setup.md` — user setup and runtime operation;
 - `SECURITY.md` — permission and threat model.
 

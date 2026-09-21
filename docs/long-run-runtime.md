@@ -52,7 +52,9 @@ Built-in wait providers:
 | `process` | One background `exec_command` process owned by the same durable session |
 | `timer` | One local deadline |
 
-The provider registry is extensible, so project-specific adapters can add external conditions without changing the scheduler core.
+The provider registry is extensible, so reusable adapters can add external conditions without changing the scheduler core.
+
+Providers explicitly declare whether observation requires connectivity. GitHub waits do; local process/timer waits do not. Custom/open-world providers default to connectivity-required unless they explicitly opt out.
 
 ## Terminal yield
 
@@ -119,6 +121,34 @@ The continuation must inspect the actual run result and current Git/PR state bef
 ## Timers
 
 Timers are local scheduling primitives, not progress evidence. A timer expiration means only that its deadline arrived.
+
+## Provider transport suspension
+
+The Long-Run Runtime does not turn provider/network loss into a wait-provider error.
+
+While provider transport is unavailable:
+
+- connectivity-dependent providers are not inspected and their consecutive-error budget remains unchanged;
+- local process/timer providers may continue to resolve;
+- a resolved local wait may make its WorkObligation `owed`;
+- provider continuation dispatch remains parked;
+- Goal is not allowed to become a competing next-message owner for the same active Long-Run work.
+
+When transport is ready again, the ordinary supervisor loop resumes from the same durable WaitContract/WorkObligation. It does not create a replacement wait or generic `continue` message.
+
+See [transport-suspension.md](transport-suspension.md).
+
+## Machine completion
+
+A bound project may optionally supply machine completion predicates through `.cos/project.json`.
+
+If `completion.auto_stop` is true and the evaluator returns `satisfied`, Long-Run may fulfill an obligation only while it is still in the eligible owed state. `unsatisfied`, `blocked` and `unconfigured` never manufacture completion.
+
+For command-backed checks, the automatic completion attempt is durably claimed before the verifier
+starts. That claim survives crash/rebind for the same obligation so ambiguous verifier execution is
+not replayed automatically.
+
+See [project-runtime.md](project-runtime.md).
 
 ## Recovery interaction
 

@@ -2119,6 +2119,7 @@ function normalizeSelfHealingRecovery(value: unknown): SelfHealingRecoveryState 
         state: 'not-attempted' as const,
         commandId: null,
         dispatchedAt: null,
+        dispatchedBudgetAt: null,
         conversationId: null,
         messageId: null
       }
@@ -2127,9 +2128,10 @@ function normalizeSelfHealingRecovery(value: unknown): SelfHealingRecoveryState 
         ['not-attempted', 'attempted-unresolved', 'dispatched-unresolved', 'sent'].includes(rawDestination.state) &&
         (rawDestination.commandId === null || (typeof rawDestination.commandId === 'string' && /^[A-Za-z0-9_-]{8,128}$/.test(rawDestination.commandId))) &&
         nullableTime(rawDestination.dispatchedAt) &&
+        (rawDestination.dispatchedBudgetAt === undefined || nullableTime(rawDestination.dispatchedBudgetAt)) &&
         (rawDestination.conversationId === null || (typeof rawDestination.conversationId === 'string' && rawDestination.conversationId.length > 0 && rawDestination.conversationId.length <= 256)) &&
         (rawDestination.messageId === null || (typeof rawDestination.messageId === 'string' && rawDestination.messageId.length > 0 && rawDestination.messageId.length <= 256))
-      ? rawDestination
+      ? { ...rawDestination, dispatchedBudgetAt: rawDestination.dispatchedBudgetAt ?? rawDestination.dispatchedAt }
       : null
     );
   if (!destinationSend) return null;
@@ -2138,7 +2140,10 @@ function normalizeSelfHealingRecovery(value: unknown): SelfHealingRecoveryState 
     typeof raw.failureEpisodeId !== 'string' || !/^[0-9a-f-]{8,64}$/i.test(raw.failureEpisodeId) ||
     !Number.isSafeInteger(raw.recoveryGeneration) || (raw.recoveryGeneration ?? 0) < 1 ||
     !Number.isSafeInteger(raw.recoveryAttempts) || (raw.recoveryAttempts ?? -1) < 0 ||
-    !nullableTime(raw.lastRecoveryAt) || !nullableTime(raw.lastProgressAt) ||
+    !nullableTime(raw.lastRecoveryAt) ||
+    (raw.lastRecoveryBudgetAt !== undefined && !nullableTime(raw.lastRecoveryBudgetAt)) ||
+    (raw.transportPausedAt !== undefined && !nullableTime(raw.transportPausedAt)) ||
+    !nullableTime(raw.lastProgressAt) ||
     typeof raw.previousConversationId !== 'string' || raw.previousConversationId.length === 0 || raw.previousConversationId.length > 256 ||
     !(raw.replacementConversationId === null || (typeof raw.replacementConversationId === 'string' && raw.replacementConversationId.length > 0 && raw.replacementConversationId.length <= 256)) ||
     !raw.failureKind || !failures.has(raw.failureKind) ||
@@ -2148,6 +2153,8 @@ function normalizeSelfHealingRecovery(value: unknown): SelfHealingRecoveryState 
   ) return null;
   return {
     ...(raw as SelfHealingRecoveryState),
+    lastRecoveryBudgetAt: raw.lastRecoveryBudgetAt ?? raw.lastRecoveryAt,
+    transportPausedAt: raw.transportPausedAt ?? null,
     agentLineage: normalizedLineage,
     destinationSend
   };

@@ -37,6 +37,7 @@ const { registerIpc } = await import('../src/main/ipc.js');
 const { bridgePort, startBridge, stopBridge } = await import('../src/main/bridge.js');
 const input = await import('../src/main/session/input.js');
 const goal = await import('../src/main/goal.js');
+const { resetProviderTransportForTests } = await import('../src/main/session/connectivity.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
 let directory: string;
 let bearer: string;
@@ -51,6 +52,10 @@ async function post(route: string, body: unknown) {
 beforeAll(async () => {
   directory = await makeTempDir('clf-input-integration-');
   initConfigPath(directory); initSecretsPath(directory); initDurableStore(directory); initSessionStore(directory);
+  resetProviderTransportForTests({
+    state: 'connected', detail: '', publicUrl: null, localUrl: null,
+    handshakeAt: Date.now(), lastRequestAt: null, lastToolCallAt: null, health: null, surfaces: []
+  });
   await saveConfig(defaultConfig());
   registerIpc(() => ({ isDestroyed: () => false, webContents: { send: pushed } }) as never, () => undefined);
   await startBridge();

@@ -2,11 +2,16 @@
 import { bridgeStatus, browserWakeConnected } from './bridge.js';
 import { isPreferredBrowserRunning, openInPreferredBrowser } from './browser.js';
 import { getConfig } from './config.js';
+import { providerTransportReady, waitForProviderTransport } from './session/connectivity.js';
 
 let waking: { lastSeenAt: number | null; selected: string; work: Promise<void>; failed: boolean; finished: boolean } | null = null;
 /** One browser startup per absence episode, shared by authored sends, discovery and owed recovery. */
 export async function wakeBrowserUrl(url: string, retry = false, backgroundStartup = false,
   authority?: { current(): boolean }): Promise<void> {
+  if (authority && !authority.current()) return;
+  // Browser startup is provider work: unknown/transient transport waits here without spending a
+  // browser failure/retry budget. Terminal setup/auth states still reject via the shared gate.
+  await waitForProviderTransport();
   if (authority && !authority.current()) return;
   const browser = await bridgeStatus();
   if (browserWakeConnected()) { waking = null; return; }
@@ -22,7 +27,19 @@ export async function wakeBrowserUrl(url: string, retry = false, backgroundStart
   // the exact recovery meanwhile; a missing socket alone never proves Chrome exited.
   if (authority && !authority.current()) return;
   if (browserWakeConnected()) { waking = null; return; }
-  if (!absent) return;
+  let confirmedAbsent = absent;
+  if (!providerTransportReady()) {
+    // The process probe yielded across a transport transition. Wait for the same authority to
+    // recover, then re-probe process absence so stale evidence can never launch another browser.
+    await waitForProviderTransport();
+    if (authority && !authority.current()) return;
+    if (browserWakeConnected()) { waking = null; return; }
+    if (selected !== (getConfig().ui.chatBrowser ?? 'chrome')) return;
+    confirmedAbsent = await isPreferredBrowserRunning() === false;
+    if (authority && !authority.current()) return;
+    if (!providerTransportReady()) return wakeBrowserUrl(url, retry, backgroundStartup, authority);
+  }
+  if (!confirmedAbsent) return;
   if (retry && waking === prior && (waking?.failed || waking?.finished)) waking = null;
   // Until the extension registers, another explicit send belongs to the same startup.
   // A changed browser choice starts a distinct attempt without adopting the old family.

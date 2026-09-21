@@ -596,8 +596,17 @@ describe('surface boundaries', () => {
     everything();
     const names = toolNames(await core('tools/list'));
     // find is absent because exec_command is present — they are mutually exclusive.
-    expect(names).toEqual(['agents', 'apply_patch', 'exec', 'exec_command', 'read', 'session_wait', 'update_plan', 'view_image', 'write_stdin']);
+    expect(names).toEqual(['agents', 'apply_patch', 'exec', 'exec_command', 'project_runtime', 'read', 'session_wait', 'update_plan', 'view_image', 'write_stdin']);
     for (const name of surfaceDefinition('desktop').tools.filter(name => name !== 'exec')) expect(names, name).not.toContain(name);
+  });
+
+  it('publishes one bounded project_runtime procedure with status/check actions', async () => {
+    everything();
+    const tool = toolList(await core('tools/list')).find(entry => entry.name === 'project_runtime')!;
+    expect(tool.inputSchema.properties.action.enum).toEqual(['status', 'check']);
+    expect(tool.inputSchema.required).toContain('action');
+    expect(tool.inputSchema.additionalProperties).toBe(false);
+    expect(tool.description).toMatch(/\.cos\/project\.json|completion predicates/i);
   });
 
   it('rejects the removed file-saving tool even when every permission is enabled', async () => {
@@ -811,7 +820,7 @@ describe('surface boundaries', () => {
     const desktopTools = toolList(await desktop('tools/list'));
 
     // Each populated surface includes code mode; find and the shell exec pair remain exclusive.
-    expect(coreTools).toHaveLength(9); // session_wait is the ninth Core control-plane tool.
+    expect(coreTools).toHaveLength(10); // project_runtime adds one bounded project-contract procedure.
     expect(desktopTools).toHaveLength(BROWSER_TOOLS.length + (IS_WINDOWS ? 16 : process.platform === 'darwin' ? 3 : 1));
 
     // And the size, which is what a discovery pull actually costs the model on every

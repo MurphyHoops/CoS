@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SessionEvent } from '../src/shared/session.js';
+import type { ConnectionStatus } from '../src/shared/types.js';
 import type { CallContext } from '../src/main/mcp/call-context.js';
 
 vi.mock('electron', () => ({
@@ -39,6 +40,7 @@ const {
   swarmState
 } = await import('../src/main/agents.js');
 const { initDurableStore, readDurable, resetDurableForTests, writeDurableNow } = await import('../src/main/durable.js');
+const { publishProviderTransportStatus, resetProviderTransportForTests } = await import('../src/main/session/connectivity.js');
 const { emptyEvidence, holdWhileSettling, settlingToolCalls } = await import('../src/main/mcp/call-context.js');
 const {
   GOAL_OBJECTIVES_STATE,
@@ -79,6 +81,10 @@ const {
   reconcileSelfHealingAfterRestart,
   recoveryMutationSafety,
   recoveryStatusLabel,
+  pauseSelfHealingTransportNow,
+  resumeSelfHealingTransportNow,
+  selfHealingDispatchBudgetAge,
+  selfHealingRecoveryBudgetAge,
   setSelfHealingRecoveryHooksForTests
 } = await import('../src/main/session/self-healing.js');
 const {
@@ -97,6 +103,17 @@ const PRIME_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const PRIME_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const WORKER_A = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 const WORKER_B = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+const connectedTransport: ConnectionStatus = {
+  state: 'connected',
+  detail: '',
+  publicUrl: null,
+  localUrl: null,
+  handshakeAt: Date.now(),
+  lastRequestAt: null,
+  lastToolCallAt: null,
+  health: null,
+  surfaces: []
+};
 
 let dir: string;
 
@@ -106,6 +123,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
+  resetProviderTransportForTests(connectedTransport);
   resetAgentsForTests();
   resetBridgeForTests();
   resetGoalStateForTests();
@@ -197,6 +215,93 @@ describe('self-healing mutation safety', () => {
     expect(recoveryMutationSafety([callEvent('read')])).toBe('mutating_or_ambiguous');
     expect(recoveryMutationSafety([start, callEvent('exec_command')])).toBe('mutating_or_ambiguous');
     expect(recoveryMutationSafety([start, callEvent('read', [{ path: '/tmp/x' }])])).toBe('mutating_or_ambiguous');
+  });
+
+  it('treats confirmed provider transport suspension as waiting, not executor failure', async () => {
+    const session = await createSession({ title: 'offline is not executor failure', conversationId: CHAT_A });
+    publishProviderTransportStatus({ ...connectedTransport, state: 'offline', detail: 'No internet', handshakeAt: null });
+
+    expect(await beginSelfHealingEpisode(session.id, CHAT_A, 'silence')).toBeNull();
+    expect((await getSession(session.id))?.recovery).toBeNull();
+
+    publishProviderTransportStatus({ ...connectedTransport, state: 'connected', detail: '' });
+    expect(await beginSelfHealingEpisode(session.id, CHAT_A, 'silence')).toMatchObject({
+      phase: 'suspected_stall',
+      failureKind: 'silence',
+      recoveryAttempts: 0
+    });
+  });
+
+  it('freezes recovery cooldown and emergency-send reconciliation clocks during provider suspension', async () => {
+    const session = await createSession({ title: 'provider budget clocks', conversationId: CHAT_A });
+    const episode = await beginSelfHealingEpisode(session.id, CHAT_A, 'silence');
+    expect(episode).not.toBeNull();
+    const soft = await markSoftRecovery(session.id, CHAT_A, episode!.failureEpisodeId, episode!.recoveryGeneration);
+    expect(soft?.lastRecoveryAt).toEqual(expect.any(Number));
+    const recoveryEvidenceAt = soft!.lastRecoveryAt!;
+
+    const cooldownPausedAt = recoveryEvidenceAt + 10_000;
+    await pauseSelfHealingTransportNow(cooldownPausedAt);
+    const paused = (await getSession(session.id))!.recovery!;
+    expect(paused.lastRecoveryAt).toBe(recoveryEvidenceAt);
+    expect(paused.transportPausedAt).toBe(cooldownPausedAt);
+    expect(selfHealingRecoveryBudgetAge(paused, cooldownPausedAt + 30 * 60_000)).toBe(10_000);
+
+    const cooldownResumedAt = cooldownPausedAt + 30 * 60_000;
+    await resumeSelfHealingTransportNow(cooldownResumedAt);
+    const resumed = (await getSession(session.id))!.recovery!;
+    expect(resumed.lastRecoveryAt).toBe(recoveryEvidenceAt);
+    expect(resumed.transportPausedAt).toBeNull();
+    expect(selfHealingRecoveryBudgetAge(resumed, cooldownResumedAt)).toBe(10_000);
+
+    const prepared = await prepareEmergencyResume(session.id, CHAT_A, episode!.failureEpisodeId);
+    expect(prepared?.state.phase).toBe('hard_recovery');
+    const generation = prepared!.state.recoveryGeneration;
+    const commandId = 'transport-budget-send';
+    expect((await beginEmergencyResumeDestinationSend(session.id, episode!.failureEpisodeId, generation, commandId))?.allowed).toBe(true);
+    expect(await dispatchEmergencyResumeDestinationSend(session.id, episode!.failureEpisodeId, generation, commandId)).toBe(true);
+    const dispatched = (await getSession(session.id))!.recovery!;
+    const dispatchEvidenceAt = dispatched.destinationSend.dispatchedAt!;
+    expect(dispatched.destinationSend.dispatchedBudgetAt).toBe(dispatchEvidenceAt);
+
+    const dispatchPausedAt = dispatchEvidenceAt + 5_000;
+    await pauseSelfHealingTransportNow(dispatchPausedAt);
+    const dispatchPaused = (await getSession(session.id))!.recovery!;
+    expect(selfHealingDispatchBudgetAge(dispatchPaused, dispatchPausedAt + 30 * 60_000)).toBe(5_000);
+
+    const dispatchResumedAt = dispatchPausedAt + 30 * 60_000;
+    await resumeSelfHealingTransportNow(dispatchResumedAt);
+    const dispatchResumed = (await getSession(session.id))!.recovery!;
+    expect(dispatchResumed.destinationSend.dispatchedAt).toBe(dispatchEvidenceAt);
+    expect(selfHealingDispatchBudgetAge(dispatchResumed, dispatchResumedAt)).toBe(5_000);
+  });
+
+  it('serializes a fast transport reconnect behind the durable self-healing pause scan', async () => {
+    const session = await createSession({ title: 'transport edge ordering', conversationId: CHAT_A });
+    const episode = await beginSelfHealingEpisode(session.id, CHAT_A, 'silence');
+    expect(episode).not.toBeNull();
+    const soft = await markSoftRecovery(
+      session.id,
+      CHAT_A,
+      episode!.failureEpisodeId,
+      episode!.recoveryGeneration
+    );
+    expect(soft?.lastRecoveryAt).toEqual(expect.any(Number));
+    const evidenceAt = soft!.lastRecoveryAt!;
+
+    const pausedAt = evidenceAt + 5_000;
+    const resumedAt = pausedAt + 120_000;
+    // Do not await the pause first. bridge.ts observes these edges synchronously and intentionally
+    // fires the multi-session WAL scan in the background; reconnect can arrive before that scan's
+    // first indexedSessions() await has settled.
+    const pausing = pauseSelfHealingTransportNow(pausedAt);
+    const resuming = resumeSelfHealingTransportNow(resumedAt);
+    await Promise.all([pausing, resuming]);
+
+    const held = (await getSession(session.id))!.recovery!;
+    expect(held.transportPausedAt).toBeNull();
+    expect(held.lastRecoveryAt).toBe(evidenceAt);
+    expect(selfHealingRecoveryBudgetAge(held, resumedAt)).toBe(5_000);
   });
 
   it('classifies a read-only Message delivery timed out turn as SAFE_RETRY without losing the recovery fence', async () => {
