@@ -8,7 +8,11 @@ vi.mock('../src/main/bridge.js', () => ({ bridgeStatus: async () => ({ ...browse
 vi.mock('../src/main/browser.js', () => ({ openInPreferredBrowser: open, isPreferredBrowserRunning: running }));
 vi.mock('../src/main/connection.js', () => ({ connect: vi.fn(), getStatus: vi.fn(), onStatusChange: vi.fn() }));
 import { resetBrowserStartupForTests, wakeBrowserUrl } from '../src/main/browser-startup.js';
-beforeEach(() => { resetBrowserStartupForTests(); config.ui.chatBrowser = 'chrome'; browser.connected = false; browser.present = false; browser.lastSeenAt = null; open.mockReset().mockResolvedValue('chrome'); running.mockReset().mockResolvedValue(false); });
+import { resetProviderTransportForTests } from '../src/main/session/connectivity.js';
+beforeEach(() => { resetBrowserStartupForTests(); resetProviderTransportForTests({
+  state: 'connected', detail: '', publicUrl: null, localUrl: null,
+  handshakeAt: Date.now(), lastRequestAt: null, lastToolCallAt: null, health: null, surfaces: []
+}); config.ui.chatBrowser = 'chrome'; browser.connected = false; browser.present = false; browser.lastSeenAt = null; open.mockReset().mockResolvedValue('chrome'); running.mockReset().mockResolvedValue(false); });
 
 it('starts the newly selected family without reusing the old attempt or overriding a connected companion', async () => {
   await wakeBrowserUrl('https://chatgpt.com/?cos-model-catalog=old');

@@ -9,6 +9,11 @@ export type LongRunWaitVerdict =
 
 export interface LongRunWaitProvider {
   kind: LongRunWaitKind;
+  /**
+   * Whether inspection needs provider/network transport. Custom/open-world adapters default to
+   * true; explicitly local providers opt out so timer/process waits keep advancing offline.
+   */
+  requiresConnectivity?: boolean;
   inspect(wait: LongRunWaitContract, now: number): Promise<LongRunWaitVerdict>;
   describe(wait: LongRunWaitContract, detail: string): string;
 }
@@ -35,6 +40,7 @@ function describeGithub(wait: LongRunWaitContract, detail: string): string {
 
 registerLongRunWaitProvider({
   kind: 'github_run',
+  requiresConnectivity: true,
   describe: describeGithub,
   async inspect(wait) {
     const result = await runCommand(
@@ -65,6 +71,7 @@ registerLongRunWaitProvider({
 
 registerLongRunWaitProvider({
   kind: 'process',
+  requiresConnectivity: false,
   describe: (wait, detail) => `Background process session ${wait.processId}: ${detail}`,
   async inspect(wait) {
     const state = backgroundExecObligations(wait.sessionId);
@@ -90,6 +97,7 @@ registerLongRunWaitProvider({
 
 registerLongRunWaitProvider({
   kind: 'timer',
+  requiresConnectivity: false,
   describe: (_wait, detail) => `Timer wait completed: ${detail}`,
   async inspect(wait, now) {
     if ((wait.dueAt ?? Number.MAX_SAFE_INTEGER) > now) {

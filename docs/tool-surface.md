@@ -25,6 +25,7 @@ Common Core tools include:
 - `exec_command` — OS command/process execution;
 - `write_stdin` — interact with an owned background process;
 - `update_plan` — display/update executor plan state;
+- `project_runtime` — inspect/check the current project's optional machine runtime contract without exposing executable argv in status;
 - `session_wait` — arm/query/cancel durable external waits;
 - `session_finish` — optional finish-hold boundary for supported execution modes;
 - `agents` — Prime/worker coordination when multi-agent mode is enabled;
@@ -93,11 +94,19 @@ A refusal is not permission to create an alternate side effect.
 
 Approved roots are permission containers, often parents of one or more projects. Paths must name the complete path under the root; do not assume the approved root itself is the project root.
 
+## Project runtime contract
+
+A bound project may provide `.cos/project.json` with named direct-exec tasks and machine completion predicates. `project_runtime status` publishes only the safe declarative summary; executable argv remains local. `project_runtime check` evaluates the contract under the caller's current command/filesystem permissions.
+
+See [project-runtime.md](project-runtime.md).
+
 ## Long-running external conditions
 
 Use `session_wait` for CI/process/timer waits instead of keeping the provider turn alive with polling.
 
-See [long-run-runtime.md](long-run-runtime.md).
+Provider/network unavailability is a separate local transport gate. It parks provider-dependent delivery and recovery rather than converting connectivity loss into executor failure.
+
+See [long-run-runtime.md](long-run-runtime.md) and [transport-suspension.md](transport-suspension.md).
 
 ## Source authority
 

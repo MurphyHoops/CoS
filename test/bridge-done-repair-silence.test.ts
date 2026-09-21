@@ -39,6 +39,7 @@ const {
   resetSessionStoreForTests
 } = await import('../src/main/session/store.js');
 const { recordToolCall, resetRecorderForTests } = await import('../src/main/session/recorder.js');
+const { resetProviderTransportForTests } = await import('../src/main/session/connectivity.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
 
 const CHAT = 'f0f00002-1111-4111-8111-111111111111';
@@ -159,6 +160,10 @@ afterAll(async () => {
 
 beforeEach(async () => {
   resetBridgeForTests();
+  resetProviderTransportForTests({
+    state: 'connected', detail: '', publicUrl: null, localUrl: null,
+    handshakeAt: Date.now(), lastRequestAt: null, lastToolCallAt: null, health: null, surfaces: []
+  });
   resetRecorderForTests();
   writeDurableSoon('bridge-commands', null);
   await flushDurable();

@@ -55,8 +55,10 @@ export interface SelfHealingDestinationCheckpoint {
   state: SelfHealingSendState;
   /** Bridge command whose page owns this send attempt. Null before any page prepares Send. */
   commandId: string | null;
-  /** Durable pre-click timestamp used to bound ambiguous post-dispatch custody. */
+  /** Durable pre-click evidence timestamp; never shifted by transport suspension. */
   dispatchedAt: number | null;
+  /** Mutable provider-ready budget anchor corresponding to dispatchedAt. */
+  dispatchedBudgetAt?: number | null;
   /** Provider destination once ACK or the stable Emergency Resume marker proves it. */
   conversationId: string | null;
   /** Stable provider-authored user-message id when marker reconciliation supplied one. */
@@ -75,7 +77,12 @@ export interface SelfHealingRecoveryState {
   failureEpisodeId: string;
   recoveryGeneration: number;
   recoveryAttempts: number;
+  /** Immutable evidence: when recovery was actually attempted/failed. */
   lastRecoveryAt: number | null;
+  /** Mutable provider-ready cooldown/episode budget anchor corresponding to lastRecoveryAt. */
+  lastRecoveryBudgetAt?: number | null;
+  /** Durable pause marker for recovery timing across app restart. */
+  transportPausedAt?: number | null;
   lastProgressAt: number | null;
   previousConversationId: string;
   replacementConversationId: string | null;

@@ -1,5 +1,10 @@
 /** Explicit desktop sends bring up the existing connection/browser authorities. */
-import { connect, getStatus, onStatusChange } from '../connection.js';
+import { connect } from '../connection.js';
+import {
+  onProviderTransportChange,
+  providerTransportReady,
+  waitForProviderTransport
+} from './connectivity.js';
 import { startBridge } from '../bridge.js';
 import { wakeBrowserUrl, resetBrowserStartupForTests } from '../browser-startup.js';
 import { getConfig } from '../config.js';
@@ -12,23 +17,10 @@ function wakeBrowser(entry: InputEntry, retry = false): Promise<void> {
 async function ready(signal?: AbortSignal): Promise<void> {
   await connect();
   signal?.throwIfAborted();
-  // startTunnel returns a lifecycle handle before OpenAI /readyz or cloudflared's URL.
-  // Await the existing status authority before browser work; local admission is already durable.
-  await new Promise<void>((resolve, reject) => {
-    let unsubscribe = () => {};
-    const timer = setTimeout(() => { unsubscribe(); signal?.removeEventListener('abort', abort); reject(new Error('The connector did not become ready. Check its connection status and try again.')); }, 65000);
-    timer.unref?.();
-    const abort = () => { clearTimeout(timer); unsubscribe(); reject(signal?.reason); };
-    signal?.addEventListener('abort', abort, { once: true });
-    const inspect = () => {
-      const status = getStatus();
-      if (['starting-server', 'connecting-tunnel', 'offline'].includes(status.state)) return;
-      clearTimeout(timer); unsubscribe(); signal?.removeEventListener('abort', abort);
-      if (status.state === 'connected') resolve();
-      else reject(new Error(status.detail || 'Finish connection setup before sending.'));
-    };
-    unsubscribe = onStatusChange(inspect); inspect();
-  });
+  // ConnectionStatus is the one transport authority. A confirmed/transient outage is waiting,
+  // not browser failure: accepted input remains durable and this background task simply resumes
+  // when the provider transport is ready. Explicit setup/auth failures still reject immediately.
+  await waitForProviderTransport(signal);
   signal?.throwIfAborted();
   if (!await startBridge()) throw new Error('The browser bridge could not start.');
   signal?.throwIfAborted();
@@ -44,6 +36,40 @@ async function deliver(entry: InputEntry, retry = false): Promise<InputEntry> {
 // Only transient startup work lives here; the outbox owns accepted messages.
 const starting = new Map<string, AbortController>();
 let stopped = false;
+let transportSubscription: (() => void) | null = null;
+let reconnectScan: Promise<void> | null = null;
+
+function retryEligible(entry: InputEntry | undefined): entry is InputEntry {
+  return !!entry && entry.state === 'queued' && entry.purpose !== 'decision' &&
+    !!(entry.error?.startsWith('Message queued. Browser startup failed:') ||
+       entry.error?.startsWith('Local chat setup failed:'));
+}
+
+async function retryQueuedAfterTransportReady(): Promise<void> {
+  if (stopped || !providerTransportReady()) return;
+  if (reconnectScan) return reconnectScan;
+  reconnectScan = (async () => {
+    // One UUID, one durable queue row. Reconnect only re-attempts browser delivery and never
+    // re-enqueues authored input. Bound the scan so a corrupted/ancient queue cannot monopolize
+    // the reconnect event; the next status transition or explicit Retry can handle the rest.
+    const candidates = (await listInputs()).filter(retryEligible).slice(0, 50);
+    for (const entry of candidates) {
+      if (stopped || !providerTransportReady()) break;
+      if (!starting.has(entry.id)) await retryQueuedInputBrowser(entry.id);
+    }
+  })().finally(() => { reconnectScan = null; });
+  return reconnectScan;
+}
+
+export function startInputStartupRuntime(): void {
+  if (stopped) stopped = false;
+  if (!transportSubscription) {
+    transportSubscription = onProviderTransportChange(({ after }) => {
+      if (after.phase === 'ready') void retryQueuedAfterTransportReady();
+    });
+  }
+  if (providerTransportReady()) void retryQueuedAfterTransportReady();
+}
 export async function cancelDesktopInput(id: string): Promise<boolean> {
   const start = starting.get(id);
   start?.abort(new Error('Input cancelled'));
@@ -83,13 +109,15 @@ export async function sendDesktopInput(input: InputArgs): Promise<InputEntry> {
 }
 export function stopInputStartup(): void {
   stopped = true;
+  transportSubscription?.();
+  transportSubscription = null;
+  reconnectScan = null;
   for (const controller of starting.values()) controller.abort(new Error('The app is shutting down'));
   starting.clear();
 }
 export async function retryQueuedInputBrowser(id: string): Promise<InputEntry | null> {
   if (stopped || starting.has(id)) return null;
-  const eligible = (entry: InputEntry | undefined): entry is InputEntry => !!entry && entry.state === 'queued' && entry.purpose !== 'decision' && !!(entry.error?.startsWith('Message queued. Browser startup failed:') || entry.error?.startsWith('Local chat setup failed:'));
-  if (!eligible((await listInputs()).find(entry => entry.id === id)) || stopped || starting.has(id)) return null;
+  if (!retryEligible((await listInputs()).find(entry => entry.id === id)) || stopped || starting.has(id)) return null;
   const controller = new AbortController(); starting.set(id, controller);
   try {
     const repaired = await noteInputStartupError(id, null);
@@ -103,4 +131,9 @@ export async function retryQueuedInputBrowser(id: string): Promise<InputEntry | 
     return await noteInputStartupError(id, 'Message queued. Browser startup failed: ' + (error as Error).message);
   } finally { if (starting.get(id) === controller) starting.delete(id); }
 }
-export function resetInputStartupForTests(): void { stopInputStartup(); stopped = false; resetBrowserStartupForTests(); }
+export function resetInputStartupForTests(): void {
+  stopInputStartup();
+  stopped = false;
+  reconnectScan = null;
+  resetBrowserStartupForTests();
+}

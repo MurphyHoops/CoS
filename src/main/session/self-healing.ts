@@ -32,6 +32,7 @@ import {
 } from '../agents.js';
 import { goalObjectiveFor, goalSwitchFor } from '../goal.js';
 import { ensureRecoveryWorkNow } from './long-run.js';
+import { providerTransportReady, providerTransportUnavailable } from './connectivity.js';
 import { logInfo, logWarn } from '../logger.js';
 import { bindAgentWorkspace } from '../workspace.js';
 import { publishRecoveryRebindProjectionDurably } from './rebind.js';
@@ -70,6 +71,104 @@ let recoveryHooks: SelfHealingRecoveryHooks = {};
 
 export function setSelfHealingRecoveryHooksForTests(hooks: SelfHealingRecoveryHooks): void {
   recoveryHooks = hooks;
+}
+
+function recoveryTimingExpected(held: SelfHealingRecoveryState) {
+  return {
+    failureEpisodeId: held.failureEpisodeId,
+    recoveryGeneration: held.recoveryGeneration,
+    phases: [held.phase] as const,
+    previousConversationId: held.previousConversationId,
+    replacementConversationId: held.replacementConversationId,
+    destinationSendState: held.destinationSend.state,
+    destinationCommandId: held.destinationSend.commandId
+  };
+}
+
+function recoveryBudgetNow(held: SelfHealingRecoveryState, now = Date.now()): number {
+  return typeof held.transportPausedAt === 'number' && Number.isFinite(held.transportPausedAt)
+    ? Math.min(now, held.transportPausedAt)
+    : now;
+}
+
+function lastRecoveryBudgetAt(held: SelfHealingRecoveryState): number | null {
+  return held.lastRecoveryBudgetAt ?? held.lastRecoveryAt ?? null;
+}
+
+export function selfHealingRecoveryBudgetAge(held: SelfHealingRecoveryState, now = Date.now()): number {
+  const anchor = lastRecoveryBudgetAt(held) ?? held.updatedAt;
+  return Math.max(0, recoveryBudgetNow(held, now) - anchor);
+}
+
+export function selfHealingDispatchBudgetAge(held: SelfHealingRecoveryState, now = Date.now()): number {
+  const anchor = held.destinationSend.dispatchedBudgetAt ?? held.destinationSend.dispatchedAt ?? held.updatedAt;
+  return Math.max(0, recoveryBudgetNow(held, now) - anchor);
+}
+
+/**
+ * Provider transport edges are observed synchronously by bridge.ts, but each edge may need to
+ * update many session WALs. Serialize those scans in invocation order so a fast offline→online
+ * transition cannot let resume inspect old rows, return, and then have the slower pause persist a
+ * stale transportPausedAt marker after connectivity is already back.
+ */
+let transportTimingChain: Promise<unknown> = Promise.resolve();
+function serialTransportTiming<T>(work: () => Promise<T>): Promise<T> {
+  const next = transportTimingChain.then(work, work);
+  transportTimingChain = next.then(() => undefined, () => undefined);
+  return next;
+}
+
+/** Persist the outage boundary before provider-time recovery budgets may be observed again. */
+export async function pauseSelfHealingTransportNow(now = Date.now()): Promise<number> {
+  return serialTransportTiming(async () => {
+    let changed = 0;
+    for (const session of await indexedSessions()) {
+      const held = session.recovery;
+      if (!session.conversationId || !held || held.transportPausedAt != null) continue;
+      const next: SelfHealingRecoveryState = {
+        ...held,
+        transportPausedAt: now,
+        lastRecoveryBudgetAt: lastRecoveryBudgetAt(held),
+        destinationSend: held.destinationSend.state === 'dispatched-unresolved'
+          ? {
+              ...held.destinationSend,
+              dispatchedBudgetAt: held.destinationSend.dispatchedBudgetAt ?? held.destinationSend.dispatchedAt
+            }
+          : held.destinationSend
+      };
+      if (await setSessionRecoveryState(session.id, session.conversationId, next, recoveryTimingExpected(held))) changed += 1;
+    }
+    return changed;
+  });
+}
+
+/** Shift only provider-budget anchors on reconnect; causal recovery/send evidence is immutable. */
+export async function resumeSelfHealingTransportNow(now = Date.now()): Promise<number> {
+  return serialTransportTiming(async () => {
+    let changed = 0;
+    for (const session of await indexedSessions()) {
+      const held = session.recovery;
+      const pausedAt = held?.transportPausedAt;
+      if (!session.conversationId || !held || typeof pausedAt !== 'number' || !Number.isFinite(pausedAt)) continue;
+      const shift = (anchor: number | null | undefined): number | null => {
+        if (anchor == null || !Number.isFinite(anchor)) return null;
+        return anchor + Math.max(0, now - Math.max(pausedAt, anchor));
+      };
+      const next: SelfHealingRecoveryState = {
+        ...held,
+        transportPausedAt: null,
+        lastRecoveryBudgetAt: shift(lastRecoveryBudgetAt(held)),
+        destinationSend: held.destinationSend.state === 'dispatched-unresolved'
+          ? {
+              ...held.destinationSend,
+              dispatchedBudgetAt: shift(held.destinationSend.dispatchedBudgetAt ?? held.destinationSend.dispatchedAt)
+            }
+          : held.destinationSend
+      };
+      if (await setSessionRecoveryState(session.id, session.conversationId, next, recoveryTimingExpected(held))) changed += 1;
+    }
+    return changed;
+  });
 }
 
 function lineageFor(agent: AgentInfo | null, conversationId: string): SelfHealingAgentLineage | null {
@@ -134,7 +233,7 @@ export async function beginSelfHealingEpisode(
 ): Promise<SelfHealingRecoveryState | null> {
   const session = await getSession(sessionId);
   if (!session || session.conversationId !== conversationId || session.lastTurnOutcome === 'stopped' ||
-      sessionAutonomyPaused(session)) return null;
+      sessionAutonomyPaused(session) || providerTransportUnavailable()) return null;
   // Compact & Resume and Emergency Resume share one provider-replacement owner. Once a
   // continuation owns it, Self-Healing must not create a competing reload/replacement episode.
   if (session.replacementTransfer?.kind === 'continuation') return null;
@@ -163,7 +262,8 @@ export async function beginSelfHealingEpisode(
     // is what earns another episode; the cooldown prevents a rapid failure/retry storm even then.
     if (previous.phase === 'recovery_failed') {
       if (!observedProgress || observedProgress <= (previous.lastProgressAt ?? 0)) return null;
-      if (now - (previous.lastRecoveryAt ?? previous.updatedAt) < SELF_HEAL_COOLDOWN_MS) return null;
+      const recoveryBudgetAt = lastRecoveryBudgetAt(previous) ?? previous.updatedAt;
+      if (recoveryBudgetNow(previous, now) - recoveryBudgetAt < SELF_HEAL_COOLDOWN_MS) return null;
     }
   }
   const recovery: SelfHealingRecoveryState = {
@@ -172,6 +272,8 @@ export async function beginSelfHealingEpisode(
     recoveryGeneration: (previous?.recoveryGeneration ?? 0) + 1,
     recoveryAttempts: 0,
     lastRecoveryAt: previous?.lastRecoveryAt ?? null,
+    lastRecoveryBudgetAt: previous?.lastRecoveryBudgetAt ?? previous?.lastRecoveryAt ?? null,
+    transportPausedAt: null,
     lastProgressAt: observedProgress,
     previousConversationId: conversationId,
     replacementConversationId: null,
@@ -182,6 +284,7 @@ export async function beginSelfHealingEpisode(
       state: 'not-attempted',
       commandId: null,
       dispatchedAt: null,
+      dispatchedBudgetAt: null,
       conversationId: null,
       messageId: null
     },
@@ -225,6 +328,7 @@ export async function noteSelfHealingProgress(
   const next: SelfHealingRecoveryState = {
     ...held,
     phase: 'healthy',
+    transportPausedAt: null,
     lastProgressAt: Math.max(progressAt, held.lastProgressAt ?? 0),
     updatedAt: Date.now(),
     error: null
@@ -251,12 +355,15 @@ export async function markSoftRecovery(
   if (session.lastTurnOutcome === 'stopped') return null;
   if (held.phase === 'soft_recovery') return held;
   if (held.phase !== 'suspected_stall') return null;
+  const now = Date.now();
   const next: SelfHealingRecoveryState = {
     ...held,
     phase: 'soft_recovery',
     recoveryAttempts: held.recoveryAttempts + 1,
-    lastRecoveryAt: Date.now(),
-    updatedAt: Date.now(),
+    lastRecoveryAt: now,
+    lastRecoveryBudgetAt: now,
+    transportPausedAt: null,
+    updatedAt: now,
     error: null
   };
   return (await setSessionRecoveryState(sessionId, conversationId, next, {
@@ -294,6 +401,7 @@ export async function beginEmergencyResumeDestinationSend(
       state: 'attempted-unresolved',
       commandId,
       dispatchedAt: null,
+      dispatchedBudgetAt: null,
       conversationId: null,
       messageId: null
     },
@@ -330,14 +438,16 @@ export async function dispatchEmergencyResumeDestinationSend(
       held.phase !== 'hard_recovery') return false;
   if (held.destinationSend.state === 'dispatched-unresolved' && held.destinationSend.commandId === commandId) return true;
   if (held.destinationSend.state !== 'attempted-unresolved' || held.destinationSend.commandId !== commandId) return false;
+  const dispatchedAt = Date.now();
   const next: SelfHealingRecoveryState = {
     ...held,
     destinationSend: {
       ...held.destinationSend,
       state: 'dispatched-unresolved',
-      dispatchedAt: Date.now()
+      dispatchedAt,
+      dispatchedBudgetAt: dispatchedAt
     },
-    updatedAt: Date.now(),
+    updatedAt: dispatchedAt,
     error: null
   };
   return setSessionRecoveryState(sessionId, session.conversationId, next, {
@@ -370,6 +480,7 @@ export async function releaseEmergencyResumeDestinationSend(
       state: 'not-attempted',
       commandId: null,
       dispatchedAt: null,
+      dispatchedBudgetAt: null,
       conversationId: null,
       messageId: null
     },
@@ -468,6 +579,9 @@ export async function prepareEmergencyResume(
   if (!session || session.conversationId !== conversationId || !held || held.failureEpisodeId !== episodeId) return null;
   if (session.lastTurnOutcome === 'stopped') return null;
   if (held.phase !== 'soft_recovery' && held.phase !== 'suspected_stall' && held.phase !== 'hard_recovery') return null;
+  // Offline may restore custody for an already-durable hard recovery, but it must never promote
+  // a softer executor-health suspicion into provider replacement while transport is unavailable.
+  if (providerTransportUnavailable() && held.phase !== 'hard_recovery') return null;
 
   const now = Date.now();
   if (session.lastTurnOutcome === 'completed' && !session.activeTurnId) return null;
@@ -482,6 +596,10 @@ export async function prepareEmergencyResume(
         agentLineage: capturedLineage,
         recoveryAttempts: held.phase === 'hard_recovery' ? held.recoveryAttempts : held.recoveryAttempts + 1,
         lastRecoveryAt: held.phase === 'hard_recovery' ? held.lastRecoveryAt : now,
+        lastRecoveryBudgetAt: held.phase === 'hard_recovery' ? lastRecoveryBudgetAt(held) : now,
+        // Existing hard-recovery custody may be inspected while offline; preserve its durable
+        // suspension marker instead of accidentally restarting the provider clock.
+        transportPausedAt: held.phase === 'hard_recovery' ? (held.transportPausedAt ?? null) : null,
         updatedAt: now,
         error: null
       }
@@ -898,6 +1016,55 @@ export async function reconcileSelfHealingAfterRestart(): Promise<number> {
   return repaired;
 }
 
+const TRANSPORT_FAILURE_RACE_MS = 5_000;
+const LEGACY_TRANSPORT_FAILURE = /did not report back in time|offline|network|tunnel|connection|browser.*(?:startup|unavailable|closed|wake)/i;
+
+/**
+ * Reopens only a recovery transaction that provably never crossed the provider Send boundary.
+ *
+ * This is the v3.0 compatibility escape from the old offline→recovery_failed deadlock. Ambiguous
+ * or sent destinations are never touched. A recent failure tied to the just-ended outage is
+ * eligible regardless of wording; older failures require the narrow legacy transport signature.
+ */
+export async function resumeUnattemptedRecoveryAfterTransportNow(
+  sessionId: string,
+  conversationId: string,
+  outageStartedAt: number | null
+): Promise<SelfHealingRecoveryState | null> {
+  if (!providerTransportReady()) return null;
+  const session = await getSession(sessionId);
+  const held = session?.recovery;
+  if (!session || session.conversationId !== conversationId || session.lastTurnOutcome === 'stopped' ||
+      sessionAutonomyPaused(session) || !held || held.phase !== 'recovery_failed' ||
+      held.previousConversationId !== conversationId || held.replacementConversationId !== null ||
+      held.destinationSend.state !== 'not-attempted') return null;
+
+  const tiedToOutage = outageStartedAt !== null && held.updatedAt >= outageStartedAt - TRANSPORT_FAILURE_RACE_MS;
+  const legacyTransportFailure = LEGACY_TRANSPORT_FAILURE.test(held.error ?? '');
+  if (!tiedToOutage && !legacyTransportFailure) return null;
+
+  const resumed: SelfHealingRecoveryState = {
+    ...held,
+    phase: 'soft_recovery',
+    // Hard-recovery admission incremented this just before the transport attempt. An outage that
+    // proved no Send happened does not consume executor-recovery budget.
+    recoveryAttempts: Math.max(0, held.recoveryAttempts - 1),
+    updatedAt: Date.now(),
+    error: null
+  };
+  const changed = await setSessionRecoveryState(sessionId, conversationId, resumed, {
+    failureEpisodeId: held.failureEpisodeId,
+    recoveryGeneration: held.recoveryGeneration,
+    phases: ['recovery_failed'],
+    previousConversationId: held.previousConversationId,
+    replacementConversationId: null,
+    destinationSendState: 'not-attempted'
+  });
+  if (!changed) return null;
+  logInfo(`self-healing: resumed unattempted recovery ${held.failureEpisodeId} for session ${sessionId} after provider transport returned`);
+  return resumed;
+}
+
 export async function failSelfHealingRecovery(
   sessionId: string,
   conversationId: string,
@@ -911,11 +1078,14 @@ export async function failSelfHealingRecovery(
   const held = session?.recovery;
   if (!session || session.conversationId !== conversationId || !held || held.failureEpisodeId !== episodeId ||
       held.recoveryGeneration !== generation || held.phase !== expectedPhase) return false;
+  const failedAt = Date.now();
   const failed = await setSessionRecoveryState(sessionId, conversationId, {
     ...held,
     phase: 'recovery_failed',
-    updatedAt: Date.now(),
-    lastRecoveryAt: Date.now(),
+    updatedAt: failedAt,
+    lastRecoveryAt: failedAt,
+    lastRecoveryBudgetAt: failedAt,
+    transportPausedAt: providerTransportUnavailable() ? (held.transportPausedAt ?? failedAt) : null,
     error: clip(error, 500)
   }, {
     failureEpisodeId: held.failureEpisodeId,

@@ -13,6 +13,24 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [3.1.0] — 2026-09-22
+
+### Generic project runtime and transport suspension
+
+- Added the optional `.cos/project.json` Project Runtime Profile: projects can declare named verification tasks and machine completion predicates without adding language/domain logic to the scheduler.
+- Added `project_runtime status/check`; status publishes task names/descriptions and declarative completion rules while keeping executable argv and native project paths local.
+- Added machine `auto_stop` for explicitly opted-in project completion, gated to still-owed Long-Run work so model prose cannot declare a mission finished.
+- Added a provider-transport control plane derived from the existing ConnectionStatus authority. Offline/startup connectivity is now suspension, not executor failure.
+- Provider-dependent Long-Run monitors, Self-Healing escalation, Goal/compaction pickup, browser command deadlines, Stop, worker revival and queued browser delivery park while transport is unavailable and reconcile when it returns.
+- Local process/timer waits can still resolve offline; their resulting continuation remains durable and undispatched until provider transport is ready.
+- Fixed the 3.0 deadlock where a network outage could leave an unattempted Emergency Resume in `recovery_failed` forever. Only provably unattempted legacy transport failures are resumed; ambiguous/sent recovery transactions remain fail-closed.
+- Removed the 65-second transient-connectivity failure from authored browser input and added reconnect retry for the same durable input UUID.
+- Enforced one next-message authority: active Long-Run work parks Goal browser driving instead of letting Goal race a WaitContract continuation.
+- Preserved user Stop across network outages and resume the same exact-turn command after reconnect rather than timing it out or minting a duplicate.
+- Added regression coverage for transport phase collapse, outage budget preservation, reconnect behavior, Long-Run local/external waits, Self-Healing admission, Stop custody, project-profile symlink containment and status redaction.
+
+See [Project Runtime Profile](docs/project-runtime.md), [Provider Transport Suspension](docs/transport-suspension.md) and [the 3.1.0 release notes](docs/release-notes/v3.1.0.md).
+
 ## [3.0.0] — 2026-09-21
 
 ### Independent durable runtime

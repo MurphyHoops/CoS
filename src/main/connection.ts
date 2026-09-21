@@ -19,6 +19,7 @@ import { setupApiKeySlot } from '../shared/setup-profile.js';
 import { startTunnel, TunnelError, type TunnelHandle } from './tunnel/index.js';
 import { desktopAutomationSupported } from './platform.js';
 import { publishPluginSurface, unpublishPluginSurface, pluginRefreshPublications } from './plugin-refresh.js';
+import { publishProviderTransportStatus } from './session/connectivity.js';
 import { pluginManager } from './plugins/manager.js';
 
 let endpoint: McpEndpoint | null = null;
@@ -88,6 +89,7 @@ export function onStatusChange(listener: (status: ConnectionStatus) => void): ()
 
 function setStatus(next: Partial<ConnectionStatus>): void {
   status = { ...status, ...next };
+  publishProviderTransportStatus(status);
   for (const listener of listeners) listener(status);
 }
 

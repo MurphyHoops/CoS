@@ -26,12 +26,14 @@ That separation enables multi-hour work without requiring one model turn to stay
 ### Local work
 - Read and edit approved project files.
 - Run commands and keep background processes under durable custody.
+- Optionally define a project-owned `.cos/project.json` contract for named verification tasks and machine completion predicates.
 - Inspect tool results in the local timeline.
 - Use browser/desktop capabilities when explicitly enabled.
 
 ### Durable long-running work
 - Goal and Loop drive unfinished work through durable obligations.
 - `session_wait` hands long external waits to the local supervisor.
+- Provider/network outages become transport suspension rather than executor failure; durable debt resumes after connectivity reconciliation.
 - Compact & Resume replaces a context-heavy conversation without changing the mission.
 - Self-Healing can replace a stalled Prime or worker while preserving mission identity.
 - Late/stale executors are fenced from new mutations after authority moves.
@@ -57,6 +59,8 @@ Canonical 3.x documentation:
 - [Setup and operation](docs/setup.md)
 - [Model-facing tools](docs/tool-surface.md)
 - [Long-Run Runtime](docs/long-run-runtime.md)
+- [Project Runtime Profile](docs/project-runtime.md)
+- [Provider Transport Suspension](docs/transport-suspension.md)
 - [Security model](SECURITY.md)
 - [Implementation invariants](AGENTS.md)
 - [Documentation map](docs/README.md)

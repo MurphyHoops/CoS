@@ -1,6 +1,6 @@
 {
   "name": "chat-on-steroids",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "Durable local runtime for long-running AI work with persistent missions, replaceable executors, recovery, external waits, and multi-agent coordination.",
   "license": "MIT",
   "author": "Chat On Steroids",

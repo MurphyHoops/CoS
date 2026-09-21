@@ -83,7 +83,10 @@ import {
   withdrawSilenceGoalReplyNow,
   setGoalObjectiveNow,
   setGoalSwitchNow,
-  startGoalDraft
+  startGoalDraft,
+  pauseGoalReplyTransportNow,
+  resumeGoalReplyTransportNow,
+  resumeTransportParkedGoalDrafts
 } from './goal.js';
 import { logInfo, logWarn } from './logger.js';
 import {
@@ -178,10 +181,13 @@ import {
   claimContinuationNow,
   continuationClaimedBy,
   commitContinuationResult,
-  CONTINUATION_TTL_MS,
   continuationByToken,
+  continuationProviderAskedAt,
+  continuationProviderDeadlineAt,
   continuationForSession,
   pendingContinuations,
+  pauseContinuationTransportNow,
+  resumeContinuationTransportNow,
   supersededSourceConversations,
   dispatchContinuationDestinationSendNow,
   dispatchContinuationSourceSendNow,
@@ -208,7 +214,12 @@ import {
   prepareEmergencyResume,
   releaseEmergencyResumeDestinationSend,
   reconcileSelfHealingAfterRestart,
-  recoveryStatusLabel
+  recoveryStatusLabel,
+  selfHealingDispatchBudgetAge,
+  selfHealingRecoveryBudgetAge,
+  pauseSelfHealingTransportNow,
+  resumeSelfHealingTransportNow,
+  resumeUnattemptedRecoveryAfterTransportNow
 } from './session/self-healing.js';
 import { readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
 import { APP_VERSION, BRIDGE_PROTOCOL } from './version.js';
@@ -220,8 +231,17 @@ import {
   cancelLongRunNow,
   longRunMessageAuthority,
   longRunWorkFor,
-  noteLongRunProgressNow
+  noteLongRunProgressNow,
+  pauseLongRunTransportNow,
+  resumeLongRunTransportNow
 } from './session/long-run.js';
+import {
+  onProviderTransportChange,
+  providerTransportReady,
+  providerTransportSnapshot,
+  providerTransportUnavailable,
+  type ProviderTransportTransition
+} from './session/connectivity.js';
 
 /** Fixed candidates so the extension can find the app without being told a port. */
 export const DEFAULT_PORTS = [8765, 8766, 8767, 8768, 8769];
@@ -472,7 +492,15 @@ type CommandSpec =
 interface Command {
   id: string;
   spec: CommandSpec;
+  /** Immutable causal evidence: when this logical command was created. */
   createdAt: number;
+  /**
+   * Transport-budget anchor corresponding to createdAt.
+   *
+   * Unlike createdAt this may move forward across a provider-transport suspension so outage time
+   * consumes zero delivery budget. It never participates in provenance/evidence comparisons.
+   */
+  deadlineCreatedAt: number;
   /**
    * When this command was handed to a page, and so when its deadline started.
    *
@@ -482,6 +510,8 @@ interface Command {
    * already on it.
    */
   claimedAt: number | null;
+  /** Transport-budget anchor corresponding to claimedAt; mutable only to freeze outage time. */
+  deadlineClaimedAt: number | null;
   /** Transient uncollected placement, owned by this command and removed on handout. */
   placement?: { conversationId: string | null; background: boolean };
   /**
@@ -520,9 +550,15 @@ interface CommandReceipt {
 interface DurableCommandRecord {
   id: string;
   spec: CommandSpec;
+  /** Immutable command creation evidence. */
   createdAt: number;
+  /** Mutable transport-budget anchor; absent in pre-3.1 snapshots. */
+  deadlineCreatedAt?: number;
   phase: CommandPhase;
+  /** Immutable browser handout evidence. */
   claimedAt: number | null;
+  /** Mutable transport-budget anchor; absent in pre-3.1 snapshots. */
+  deadlineClaimedAt?: number | null;
   owner: string | null;
   lastError: string | null;
 }
@@ -531,6 +567,8 @@ interface DurableCommandSnapshot {
   version: 5;
   commands: DurableCommandRecord[];
   receipts: CommandReceipt[];
+  /** Durable projection that transport budgets were paused when this snapshot was written. */
+  transportPausedAt?: number | null;
 }
 
 /** The wire form the extension receives. */
@@ -1494,21 +1532,29 @@ export async function stopSessionTurn(sessionId: string, expectedTurnId: string)
     await releaseSessionFinish(sessionId, expectedTurnId, 'stop');
     await assertCurrent();
   } catch (error) { retire(command, 'stop request could not be saved or its turn changed'); throw error; }
-  armDeadline(command);
+  if (providerTransportReady()) armDeadline(command);
   await revokeSilenceInputs(sessionId);
   endActivity(id);
   repairsInFlight.delete(id);
-  wakeBrowserWork();
+  if (providerTransportReady()) wakeBrowserWork();
   changed();
-  if (!alreadyQueued) {
+  if (!alreadyQueued && providerTransportReady()) {
     const lifecycle = bridgeLifecycleEpoch;
-    // The shared startup owner launches only on positive process absence. An
-    // existing browser remains the extension election's responsibility.
-    await wakeBrowserUrl(chatUrl(id), false, getConfig().ui.backgroundChats === true, {
-      current: () => bridgeLifecycleEpoch === lifecycle && !bridgeShutdownRequested && commands.includes(command) &&
-        Date.now() < command.createdAt + STOP_COMMAND_TIMEOUT_MS &&
-        liveConversations().some(row => row.sessionId === sessionId && row.conversationId === id && row.activeTurnId === expectedTurnId)
-    });
+    // The shared startup owner launches only on positive process absence. An existing browser
+    // remains the extension election's responsibility. If connectivity disappears during this
+    // exact wake, keep the already-durable Stop command rather than converting transport loss
+    // into a terminal Stop failure.
+    try {
+      await wakeBrowserUrl(chatUrl(id), false, getConfig().ui.backgroundChats === true, {
+        current: () => bridgeLifecycleEpoch === lifecycle && !bridgeShutdownRequested &&
+          providerTransportReady() && commands.includes(command) &&
+          Date.now() < command.deadlineCreatedAt + STOP_COMMAND_TIMEOUT_MS &&
+          liveConversations().some(row => row.sessionId === sessionId && row.conversationId === id && row.activeTurnId === expectedTurnId)
+      });
+    } catch (error) {
+      if (!providerTransportUnavailable()) throw error;
+      logInfo(`bridge: Stop for ${id} is durable and parked until provider transport returns`);
+    }
   }
   return sessionControlsFor(sessionId);
 }
@@ -1519,16 +1565,18 @@ async function stopCommandCurrent(spec: Extract<CommandSpec, { type: 'stop' }>):
 }
 function stopRequestedFor(conversationId: string, turnId = liveConversations().find(row => row.conversationId === conversationId)?.activeTurnId): boolean {
   return commands.some(command => command.spec.type === 'stop' && command.spec.conversationId === conversationId &&
-    (!turnId || command.spec.turnId === turnId) && Date.now() - command.createdAt < STOP_COMMAND_TIMEOUT_MS);
+    (!turnId || command.spec.turnId === turnId) &&
+    (providerTransportUnavailable() || Date.now() - command.deadlineCreatedAt < STOP_COMMAND_TIMEOUT_MS));
 }
 async function pendingStopCommands(): Promise<Array<{ id: string; conversationId: string; turnId: string; expiresAt: number }>> {
   const pending = [];
   for (const command of [...commands]) {
     if (command.spec.type !== 'stop' || commandWrites.has(command.id)) continue;
-    if (Date.now() - command.createdAt >= STOP_COMMAND_TIMEOUT_MS || !await stopCommandCurrent(command.spec)) {
+    if ((!providerTransportUnavailable() && Date.now() - command.deadlineCreatedAt >= STOP_COMMAND_TIMEOUT_MS) ||
+        !await stopCommandCurrent(command.spec)) {
       retire(command, 'the requested turn is no longer stoppable'); continue;
     }
-    if (commands.includes(command)) pending.push({ id: command.id, conversationId: command.spec.conversationId, turnId: command.spec.turnId, expiresAt: command.createdAt + STOP_COMMAND_TIMEOUT_MS });
+    if (commands.includes(command)) pending.push({ id: command.id, conversationId: command.spec.conversationId, turnId: command.spec.turnId, expiresAt: command.deadlineCreatedAt + STOP_COMMAND_TIMEOUT_MS });
   }
   return pending;
 }
@@ -2017,7 +2065,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const allowed = current && repairsInFlight.get(conversationId) === repair && repair.state === 'handed' && !repair.claimed;
     if (allowed) {
       repair.claimed = true;
-      repair.claimedAt = Date.now();
+      const claimedAt = Date.now();
+      repair.claimedAt = claimedAt;
+      repair.claimBudgetAt = claimedAt;
       repair.ambiguous = false;
       if (repair.attribution && repair.attribution.incident.firstAttemptAt === null)
         repair.attribution.incident.firstAttemptAt = Date.now();
@@ -2382,6 +2432,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       const currentPending = goalPendingReplyFor(id);
       if (pending && (currentPending?.replyId !== pending.replyId || currentPending.turnId !== pending.turnId ||
           currentPending.acceptedAt !== pending.acceptedAt)) pending = null;
+      const pendingView = pending ? {
+        replyId: pending.replyId,
+        turnId: pending.turnId,
+        eventSeq: pending.eventSeq,
+        acceptedAt: pending.acceptedAt,
+        ...(pending.silenceSourceTurnId ? { silenceSourceTurnId: pending.silenceSourceTurnId } : {}),
+        ...(pending.silencePro ? { silencePro: true } : {}),
+        ...(pending.listenUntil ? { listenUntil: pending.listenUntil } : {})
+      } : null;
       return ({
       enabled: !superseded && !finishOnly && goalEnabledFor(id),
       configuredEnabled: !superseded && goalEnabledFor(id),
@@ -2409,7 +2468,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // script resumes this instead of manufacturing a turn from the rendered transcript.
       // A blocked chat's owed decision is withheld too, so the page cannot pick it up and
       // draft into a chat whose tools are refused.
-      pending: superseded || goalFencedChat(id) || silenceSuppressed || queuePending ? null : pending,
+      pending: superseded || goalFencedChat(id) || silenceSuppressed || queuePending ? null : pendingView,
       draft
     });
     };
@@ -3260,6 +3319,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         ...durableCommand(command),
         phase: 'queued',
         claimedAt: null,
+        deadlineClaimedAt: null,
         owner: null
       };
       try {
@@ -3272,6 +3332,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         return false;
       }
       command.claimedAt = null;
+      command.deadlineClaimedAt = null;
       command.owner = null;
       command.lastError = null;
       if (command.timer) clearTimeout(command.timer);
@@ -3484,6 +3545,20 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         { error: 'session_not_recorded', message: 'This chat has no recorded local session to continue from.' },
         origin
       );
+    }
+    if (providerTransportUnavailable()) {
+      return goalJson(res, 409, {
+        error: 'transport_suspended',
+        retryable: true,
+        message: 'Provider transport is temporarily unavailable; the durable Goal reply remains parked.'
+      }, origin);
+    }
+    if (longRunOwnsNextTransition(sessionId)) {
+      return goalJson(res, 409, {
+        error: 'long_run_owned',
+        retryable: true,
+        message: 'A durable Long-Run wait/continuation owns the next transition for this session.'
+      }, origin);
     }
     if (await goalInputPriority(id, sessionId, turnId))
       return goalJson(res, 409, { error: 'user_input_pending', retryable: true }, origin);
@@ -3958,10 +4033,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return json(res, 404, { error: 'no_such_command' }, origin);
     }
     if (command.spec.type === 'stop') {
-      if (!client || Date.now() - command.createdAt >= STOP_COMMAND_TIMEOUT_MS || reportedConversation !== command.spec.conversationId || !await stopCommandCurrent(command.spec))
+      const stopExpired = () => !providerTransportUnavailable() &&
+        Date.now() - command.deadlineCreatedAt >= STOP_COMMAND_TIMEOUT_MS;
+      if (!client || stopExpired() || reportedConversation !== command.spec.conversationId || !await stopCommandCurrent(command.spec))
         return json(res, 409, { error: 'stop_turn_changed' }, origin);
       if (!await persistCommandLease(command, client, Date.now(), false)) return json(res, 409, { error: 'stop_not_owned' }, origin);
-      if (!commands.includes(command) || Date.now() - command.createdAt >= STOP_COMMAND_TIMEOUT_MS || !await stopCommandCurrent(command.spec)) return json(res, 409, { error: 'stop_turn_changed' }, origin);
+      if (!commands.includes(command) || stopExpired() || !await stopCommandCurrent(command.spec))
+        return json(res, 409, { error: 'stop_turn_changed' }, origin);
       return json(res, 200, { command: describe(command, client) }, origin);
     }
     if (revivalDeliveryProven(command)) {
@@ -4744,6 +4822,7 @@ async function durableQuiescence(conversationId: string, now: number): Promise<D
  * This sweep exists for the abandoned-tail case where no such next call arrives.
  */
 export async function sweepStaleSwarm(now = Date.now()): Promise<boolean> {
+  if (providerTransportUnavailable()) return false;
   const silent = await inspectSilentChats(now);
   const emergency = await startEmergencyRecoveryForSpent(silent.spent, now);
   const fallbackSpent = emergency.fallback;
@@ -4777,7 +4856,7 @@ export async function sweepStaleSwarm(now = Date.now()): Promise<boolean> {
  */
 async function startEmergencyRecoveryForSpent(
   spent: readonly string[],
-  now: number
+  now: number,
 ): Promise<{ recovering: string[]; fallback: string[] }> {
   if (!getConfig().multiAgent.selfHealingSessions) return { recovering: [], fallback: [...spent] };
   const recovering: string[] = [];
@@ -4993,6 +5072,187 @@ let bridgeShutdownRequested = false;
 let bridgeRecovering = false;
 let dropSpawnRequestListener: (() => void) | null = null;
 let dropReviveRequestListener: (() => void) | null = null;
+let dropProviderTransportListener: (() => void) | null = null;
+let providerUnavailableSince: number | null = null;
+let transportRecoveryInFlight: Promise<void> | null = null;
+/** Fresh post-network observation grace for durable soft-recovery episodes. */
+const softRecoveryTransportGrace = new Map<string, number>();
+
+function longRunOwnsNextTransition(sessionId: string): boolean {
+  const work = longRunWorkFor(sessionId);
+  return !!work && (work.state === 'waiting' || work.state === 'owed' ||
+    work.state === 'dispatching' || work.state === 'queued');
+}
+
+function pauseBridgeTransport(now = Date.now()): void {
+  const newlyPaused = providerUnavailableSince === null;
+  if (newlyPaused) providerUnavailableSince = now;
+  for (const command of commands) {
+    if (command.timer) clearTimeout(command.timer);
+    command.timer = null;
+  }
+  if (silenceTimer) clearTimeout(silenceTimer);
+  silenceTimer = null;
+  if (newlyPaused) {
+    void pauseContinuationTransportNow(now).catch((error) =>
+      logWarn(`bridge: could not persist continuation transport suspension — ${error instanceof Error ? error.message : String(error)}`));
+    void pauseGoalReplyTransportNow(now).catch((error) =>
+      logWarn(`bridge: could not persist Goal transport suspension — ${error instanceof Error ? error.message : String(error)}`));
+    void pauseLongRunTransportNow(now).catch((error) =>
+      logWarn(`bridge: could not persist Long-Run transport suspension — ${error instanceof Error ? error.message : String(error)}`));
+    void pauseSelfHealingTransportNow(now).catch((error) =>
+      logWarn(`bridge: could not persist Self-Healing transport suspension — ${error instanceof Error ? error.message : String(error)}`));
+    if (commands.length > 0) {
+      void persistCommandsNow().catch((error) =>
+        logWarn(`bridge: could not persist provider-transport suspension — ${error instanceof Error ? error.message : String(error)}`));
+    }
+  }
+}
+
+/** Freeze only budgets/deadlines; evidence timestamps remain the time evidence actually happened. */
+function shiftBridgeTransportBudgets(suspendedAt: number | null, recoveredAt: number): void {
+  if (suspendedAt === null || !Number.isFinite(suspendedAt) || recoveredAt <= suspendedAt) return;
+  const overlap = (anchor: number): number => Math.max(0, recoveredAt - Math.max(suspendedAt, anchor));
+  for (const command of commands) {
+    command.deadlineCreatedAt += overlap(command.deadlineCreatedAt);
+    if (command.deadlineClaimedAt !== null) command.deadlineClaimedAt += overlap(command.deadlineClaimedAt);
+  }
+  for (const grant of activeUntil.values()) {
+    const shift = overlap(grant.budgetAt);
+    grant.budgetAt += shift;
+    grant.until += shift;
+  }
+  for (const watch of goalWatch.values()) {
+    const dueShift = overlap(watch.budgetAt);
+    watch.dueAt += dueShift;
+    watch.budgetAt += dueShift;
+    const expiryShift = overlap(watch.expiryBudgetAt);
+    watch.expiresAt += expiryShift;
+    watch.expiryBudgetAt += expiryShift;
+  }
+  for (const watch of compactionWatch.values()) {
+    if (watch.since > 0) watch.since += overlap(watch.since);
+  }
+  for (const repair of repairsInFlight.values()) {
+    const repairShift = overlap(repair.budgetAt);
+    repair.notBefore += repairShift;
+    repair.budgetAt += repairShift;
+    if (repair.claimBudgetAt) repair.claimBudgetAt += overlap(repair.claimBudgetAt);
+  }
+  for (const [conversationId, anchor] of lastBrowserRecoveryBudgetAt) {
+    lastBrowserRecoveryBudgetAt.set(conversationId, anchor + overlap(anchor));
+  }
+  if (goalWatchFloor !== null) goalWatchFloor += overlap(goalWatchFloor);
+  if (compactionWatchFloor !== null) compactionWatchFloor += overlap(compactionWatchFloor);
+}
+
+/** Gives a restored/old transport attempt a real post-reconnect budget without rewriting evidence. */
+function refreshExpiredTransportBudgets(now = Date.now()): void {
+  for (const command of commands) {
+    if (commandDeadlineDelay(command, now) > 0) continue;
+    command.deadlineCreatedAt = now;
+    if (command.claimedAt !== null) command.deadlineClaimedAt = now;
+  }
+}
+
+async function resumePendingStopsAfterTransport(): Promise<void> {
+  const stops = commands.filter((command): command is Command & { spec: Extract<CommandSpec, { type: 'stop' }> } =>
+    command.spec.type === 'stop');
+  if (stops.length === 0) return;
+  wakeBrowserWork();
+  for (const command of stops) {
+    if (!await stopCommandCurrent(command.spec)) continue;
+    const lifecycle = bridgeLifecycleEpoch;
+    await wakeBrowserUrl(
+      chatUrl(command.spec.conversationId),
+      false,
+      getConfig().ui.backgroundChats === true,
+      {
+        current: () =>
+          bridgeLifecycleEpoch === lifecycle &&
+          !bridgeShutdownRequested &&
+          providerTransportReady() &&
+          commands.includes(command)
+      }
+    ).catch((error) => {
+      logWarn(`bridge: pending Stop wake will retry after transport recovery — ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+}
+
+async function resumePersistedProviderBudgetsNow(now = Date.now()): Promise<void> {
+  await resumeContinuationTransportNow(now).catch((error) =>
+    logWarn(`bridge: could not persist resumed continuation transport budgets — ${error instanceof Error ? error.message : String(error)}`));
+  await resumeGoalReplyTransportNow(now).catch((error) =>
+    logWarn(`bridge: could not persist resumed Goal transport budgets — ${error instanceof Error ? error.message : String(error)}`));
+  await resumeLongRunTransportNow(now).catch((error) =>
+    logWarn(`bridge: could not persist resumed Long-Run transport budgets — ${error instanceof Error ? error.message : String(error)}`));
+  await resumeSelfHealingTransportNow(now).catch((error) =>
+    logWarn(`bridge: could not persist resumed Self-Healing transport budgets — ${error instanceof Error ? error.message : String(error)}`));
+}
+
+async function recoverBridgeTransport(transition?: ProviderTransportTransition): Promise<void> {
+  const now = Date.now();
+  const localSuspendedAt = providerUnavailableSince;
+  providerUnavailableSince = null;
+  const outageStartedAt = transition?.before.suspendedAt ?? localSuspendedAt;
+  const knownDowntime = transition?.recoveredAfterMs ??
+    (outageStartedAt === null ? 0 : Math.max(0, now - outageStartedAt));
+  shiftBridgeTransportBudgets(outageStartedAt, now);
+  if (knownDowntime > 0) refreshExpiredTransportBudgets(now);
+  await resumePersistedProviderBudgetsNow(now);
+
+  // v3.0 could persist a terminal-looking recovery even though no browser Send was attempted.
+  // Re-open only that exact safe state, then give the original executor a fresh observation window.
+  for (const session of await indexedSessions()) {
+    if (!session.conversationId) continue;
+    await resumeUnattemptedRecoveryAfterTransportNow(
+      session.id,
+      session.conversationId,
+      transition?.before.suspendedAt ?? localSuspendedAt
+    ).catch((error) => {
+      logWarn(`bridge: could not resume unattempted recovery for ${session.id} — ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+  for (const session of await indexedSessions()) {
+    const recovery = session.recovery;
+    if (recovery?.phase === 'soft_recovery') {
+      softRecoveryTransportGrace.set(recovery.failureEpisodeId, now + SELF_HEAL_POST_RELOAD_MS);
+    }
+  }
+
+  // The adjusted command anchors are durable so another crash cannot resurrect pre-outage age.
+  await persistCommandsNow().catch(() => persistCommands());
+  rearmRetainedCommandDeadlines();
+  await restoreSoftRecoveryWatches(now);
+  resumeTransportParkedGoalDrafts();
+  await resumePendingStopsAfterTransport();
+  scheduleDeliver();
+  armSilenceSweep(now);
+  void runStaleSwarmSweep().catch((error: Error) =>
+    logWarn(`post-connectivity recovery sweep failed: ${error.message}`));
+}
+
+function startBridgeTransportRecovery(transition?: ProviderTransportTransition): void {
+  if (transportRecoveryInFlight) return;
+  const work = recoverBridgeTransport(transition).finally(() => {
+    if (transportRecoveryInFlight !== work) return;
+    transportRecoveryInFlight = null;
+    // A second suspend->ready cycle can happen while the first recovery is awaiting disk/session
+    // state. Its pause anchor is preserved above; immediately reconcile that newer episode rather
+    // than dropping the ready edge because one recovery happened to be in flight.
+    if (providerTransportReady() && providerUnavailableSince !== null) startBridgeTransportRecovery();
+  });
+  transportRecoveryInFlight = work;
+}
+
+function handleProviderTransportTransition(transition: ProviderTransportTransition): void {
+  if (transition.after.phase !== 'ready') {
+    pauseBridgeTransport(transition.after.suspendedAt ?? Date.now());
+    return;
+  }
+  startBridgeTransportRecovery(transition);
+}
 
 function runStaleSwarmSweep(): Promise<boolean> {
   if (staleSweepInFlight) return staleSweepInFlight;
@@ -5101,11 +5361,23 @@ async function startBridgeOnce(epoch: number): Promise<number | null> {
       // replay listeners, no timers, and especially no browser delivery belong to a stopped app.
       if (epoch !== bridgeLifecycleEpoch) return closeCancelledBridgeStart(instance, actual);
       // A settings-driven stop/start is not a process restart: the in-memory commands survive,
-      // so restoreCommands() quite correctly skips their durable duplicates. stopBridge(),
-      // however, cleared their memory-only deadline timers. Re-arm those retained leases from
-      // their durable claimedAt before delivery is allowed to inspect the queue; otherwise an
-      // expired lease looks queued again and can open the same bootstrap a second time, while
-      // a still-live lease can sit forever with no timer to end it.
+      // so restoreCommands() quite correctly skips their durable duplicates. Install the one
+      // connection-authority listener before any transport deadline is re-armed: if the app is
+      // already offline, those restored leases remain frozen rather than spending budget between
+      // bridge publication and the next connection event.
+      dropProviderTransportListener?.();
+      dropProviderTransportListener = onProviderTransportChange(handleProviderTransportTransition);
+      const transport = providerTransportSnapshot();
+      // Module-load placeholder state is not evidence of a real outage. Wait for connection.ts
+      // to publish an authoritative state before starting a durable suspension interval.
+      if (transport.changedAt > 0 && transport.phase !== 'ready') pauseBridgeTransport(transport.suspendedAt ?? Date.now());
+      const recoveredBeforeListener = transport.phase === 'ready' && providerUnavailableSince !== null;
+      // Some provider-budget ledgers can prove an outage even when no bridge command existed to
+      // carry the command-ledger marker. Clear/shift those WAL markers before any timer is armed.
+      if (transport.phase === 'ready') await resumePersistedProviderBudgetsNow();
+
+      // stopBridge() cleared memory-only deadline timers. Re-arm retained leases from their
+      // durable anchors only when the provider transport is ready.
       rearmRetainedCommandDeadlines();
       dropSpawnRequestListener?.();
       dropSpawnRequestListener = onSpawnRequest((workers) => {
@@ -5165,6 +5437,9 @@ async function startBridgeOnce(epoch: number): Promise<number | null> {
           const stored = await getSecret('bridgeToken');
           return !!stored && stored !== BROWSER_DISCONNECTED && safeEqual(candidate, stored);
         });
+      // connect() can win startup before the listener exists. Reconcile a restored suspension
+      // explicitly so its durable marker cannot leak into the next outage.
+      if (recoveredBeforeListener) await recoverBridgeTransport();
       deliver();
       logInfo(`bridge listening on 127.0.0.1:${actual}`);
       changed();
@@ -5210,6 +5485,9 @@ export async function stopBridge(): Promise<void> {
     dropSpawnRequestListener = null;
     dropReviveRequestListener?.();
     dropReviveRequestListener = null;
+    dropProviderTransportListener?.();
+    dropProviderTransportListener = null;
+    providerUnavailableSince = null;
     if (staleSwarmTimer) clearInterval(staleSwarmTimer);
     staleSwarmTimer = null;
     if (silenceTimer) clearTimeout(silenceTimer);
@@ -5277,8 +5555,10 @@ function durableCommand(command: Command): DurableCommandRecord {
     id: command.id,
     spec: command.spec,
     createdAt: command.createdAt,
+    deadlineCreatedAt: command.deadlineCreatedAt,
     phase: commandPhase(command),
     claimedAt: command.claimedAt,
+    deadlineClaimedAt: command.deadlineClaimedAt,
     owner: command.owner,
     lastError: command.lastError
   };
@@ -5312,7 +5592,12 @@ function commandSnapshot(options: {
     receipts = [...receipts.filter((receipt) => receipt.id !== addReceipt.id), addReceipt];
   }
   receipts = receipts.slice(-MAX_COMMAND_RECEIPTS);
-  return { version: 5, commands: records, receipts };
+  return { version: 5, commands: records, receipts, transportPausedAt: providerUnavailableSince };
+}
+
+async function persistCommandsNow(): Promise<void> {
+  if (commandWrites.size) await Promise.allSettled([...commandWrites.values()]);
+  await writeDurableNow(COMMANDS_STATE, commandSnapshot());
 }
 
 function persistCommands(): void {
@@ -5351,6 +5636,7 @@ async function persistCommandLease(
       ...durableCommand(command),
       phase: 'leased',
       claimedAt,
+      deadlineClaimedAt: claimedAt,
       owner
     };
     try {
@@ -5365,6 +5651,7 @@ async function persistCommandLease(
     }
     if (!commands.includes(command)) return false;
     command.claimedAt = claimedAt;
+    command.deadlineClaimedAt = claimedAt;
     command.owner = owner;
     return true;
   });
@@ -5552,8 +5839,11 @@ function queue(spec: CommandSpec): Command {
       // An identical repeat must leave the claim alone: releasing it would let the
       // deliver() that follows open a second tab for a chat that is already opening,
       // which is precisely the storm of duplicate chats this queue exists to prevent.
-      existing.createdAt = Date.now();
+      const createdAt = Date.now();
+      existing.createdAt = createdAt;
+      existing.deadlineCreatedAt = createdAt;
       existing.claimedAt = null;
+      existing.deadlineClaimedAt = null;
       // Any page that redeemed the previous payload no longer owns the replacement. Current
       // pages echo their document client on ACK, so a late result from that old payload is
       // refused by /commands/ack rather than applied to this newer one.
@@ -5570,11 +5860,14 @@ function queue(spec: CommandSpec): Command {
     persistCommands();
     return existing;
   }
+  const createdAt = Date.now();
   const command: Command = {
     id: randomBytes(8).toString('hex'),
     spec,
-    createdAt: Date.now(),
+    createdAt,
+    deadlineCreatedAt: createdAt,
     claimedAt: null,
+    deadlineClaimedAt: null,
     timer: null,
     lastError: null,
     owner: null
@@ -5886,7 +6179,7 @@ export async function queueEmergencyResume(
   fromConversationId: string,
   episodeId: string
 ): Promise<BridgeCommand | null> {
-  if (!getConfig().multiAgent.selfHealingSessions) return null;
+  if (!getConfig().multiAgent.selfHealingSessions || providerTransportUnavailable()) return null;
   if (runningToolCalls(fromConversationId) > 0 || settlingToolCalls(fromConversationId) > 0) return null;
   // Close the zero-inflight race synchronously. From this point A cannot begin another local
   // operation while the durable hard-recovery transition and browser command are prepared.
@@ -6216,6 +6509,8 @@ interface ActivityGrant {
   /** Durable session principal whose current frontend owned this activity when it was proven. */
   sessionId: string;
   evidenceAt: number;
+  /** Mutable provider-ready budget anchor corresponding to evidenceAt. */
+  budgetAt: number;
   until: number;
   turnId: string | null;
   model: 'pro' | 'other' | 'unknown';
@@ -6246,7 +6541,7 @@ function grantActivity(conversationId: string, sessionId: string, at = Date.now(
   // same still-open provider turn again; keep the spent soft-recovery marker across that replay
   // instead of silently refunding the one-reload budget.
   const selfHealingSoft = sameTurn ? previous?.selfHealingSoft : undefined;
-  activeUntil.set(conversationId, { sessionId, evidenceAt, until: evidenceAt + (ownership.model === 'pro' ? PRO_SILENCE_MS : window), turnId: ownership.turnId, model: ownership.model,
+  activeUntil.set(conversationId, { sessionId, evidenceAt, budgetAt: evidenceAt, until: evidenceAt + (ownership.model === 'pro' ? PRO_SILENCE_MS : window), turnId: ownership.turnId, model: ownership.model,
     ...(mcpBacked ? { mcpBacked: true } : {}),
     ...(selfHealingSoft ? { selfHealingSoft } : {}) });
   awaitingReturn.delete(conversationId);
@@ -6310,7 +6605,7 @@ export function sessionActivityExpiresAt(summary: SessionSummary): number | null
   // An abandoned open recorder turn is not fresh work, even if a later picker selection
   // differs from the model that owned the retired grant.
   if (!grant || grant.sessionId !== summary.id || grant.thinkingFailed) return null;
-  return grant.model !== 'other' ? grant.evidenceAt + activityLifetime(grant) : undefined;
+  return grant.model !== 'other' ? grant.budgetAt + activityLifetime(grant) : undefined;
 }
 
 async function extendedSilenceWindowFor(conversationId: string, sessionId?: string): Promise<boolean> {
@@ -6489,7 +6784,7 @@ async function fileSilenceTickets(spent: readonly string[], now: number): Promis
       if (!grant?.turnId || start?.turnId !== grant.turnId) continue;
     } else if (!await silenceContinuationAllowed(conversationId, session.id)) continue;
     if (!grant || activeUntil.get(conversationId) !== grant ||
-        (grant.model !== 'other' && !(grant.model === 'pro' && (handledOnly || loopAfterTurnFor(conversationId)) && (grant.thinkingFailed || now - grant.evidenceAt >= PRO_SILENCE_MS)))) continue;
+        (grant.model !== 'other' && !(grant.model === 'pro' && (handledOnly || loopAfterTurnFor(conversationId)) && (grant.thinkingFailed || now - grant.budgetAt >= PRO_SILENCE_MS)))) continue;
     if (goalPendingReplyFor(conversationId) || runningToolCalls(conversationId) > 0) continue;
     if (continuationForSession(session.id)) continue;
     // Canonical message replacement leaves sequence gaps; the summary count is not a cursor.
@@ -6528,7 +6823,7 @@ async function fileSilenceTickets(spent: readonly string[], now: number): Promis
 async function fileSilenceInputTicket(conversationId: string, now: number, listenUntil?: number): Promise<boolean> {
   const grant = activeUntil.get(conversationId);
   const repair = repairsInFlight.get(conversationId);
-  if (!grant?.turnId || (!grant.thinkingFailed && now - grant.evidenceAt < (grant.model === 'other' ? CHAT_SILENCE_MS : PRO_SILENCE_MS)) ||
+  if (!grant?.turnId || (!grant.thinkingFailed && now - grant.budgetAt < (grant.model === 'other' ? CHAT_SILENCE_MS : PRO_SILENCE_MS)) ||
       repair?.reason !== 'silence' || repair.state !== 'done' || repair.ambiguous || repair.sessionId !== grant.sessionId) return false;
   const current = () => activeUntil.get(conversationId) === grant && repairsInFlight.get(conversationId) === repair &&
     !stopRequestedFor(conversationId) && !isChatBlocked(conversationId) &&
@@ -6596,6 +6891,11 @@ function forgetActivity(conversationId: string): void {
  * forward by later activity only costs one early wake-up that finds nothing expired.
  */
 function armSilenceSweep(now = Date.now()): void {
+  if (providerTransportUnavailable()) {
+    if (silenceTimer) clearTimeout(silenceTimer);
+    silenceTimer = null;
+    return;
+  }
   let earliest = Number.POSITIVE_INFINITY;
   for (const grant of activeUntil.values()) if (grant.until > now) earliest = Math.min(earliest, grant.until);
   if (!Number.isFinite(earliest)) {
@@ -6612,6 +6912,7 @@ function armSilenceSweep(now = Date.now()): void {
   silenceTimer = setTimeout(
     () => {
       silenceTimer = null;
+      if (providerTransportUnavailable()) return;
       // Deliberately the ledger pass alone, not runStaleSwarmSweep(). The maintenance sweep is
       // async and de-duplicated against itself, so a tick that lands while an earlier one is still
       // reading durable state is dropped — and the punctual wake-up would be exactly the tick to
@@ -6718,7 +7019,7 @@ async function sessionRecoveryCountdowns(sessionId: string, conversationId: stri
   }
   // A confirmed reload's listening deadline is not fresh work. Real activity
   // replaces the grant and retires the receipt, withdrawing this row immediately.
-  const normalReloadDeadline = confirmed ? (lastBrowserRecoveryAt.get(conversationId) ?? 0) + SILENCE_RELOAD_LISTEN_MS : undefined;
+  const normalReloadDeadline = confirmed ? (lastBrowserRecoveryBudgetAt.get(conversationId) ?? lastBrowserRecoveryAt.get(conversationId) ?? 0) + SILENCE_RELOAD_LISTEN_MS : undefined;
   const postReloadDeadline = owned && confirmed && !grant.thinkingFailed && grant.model === 'other' &&
     grant.until === normalReloadDeadline ? grant.until : undefined;
   if (owned && !grant.thinkingFailed && !postReloadDeadline && grant.until > Date.now()) return result;
@@ -6750,6 +7051,8 @@ interface Repair {
   claimed?: boolean;
   /** When the extension won the exact browser-action claim; null again only before any action. */
   claimedAt?: number | null;
+  /** Mutable ACK-custody budget anchor corresponding to claimedAt. */
+  claimBudgetAt?: number | null;
   /** Lost browser receipt: action may have happened, so this episode must never issue it again. */
   ambiguous?: boolean;
   /** Stable local owner; the browser action is valid only while this session is still here. */
@@ -6761,6 +7064,8 @@ interface Repair {
   reason: 'unattributed' | 'assistant-error' | 'no-tab' | 'silence' | 'goal' | 'compaction';
   /** Cooldown boundary. The browser is never asked before this instant. */
   notBefore: number;
+  /** Mutable provider-time anchor for notBefore; evidence remains elsewhere. */
+  budgetAt: number;
   /**
    * Names this exact handout, and is what a receipt has to quote to be believed.
    *
@@ -6791,6 +7096,8 @@ const TURN_SCOPED_REPAIRS: ReadonlySet<Repair['reason']> = new Set(['unattribute
 const repairsInFlight = new Map<string, Repair>();
 /** Last browser action per exact chat. Error/no-tab recovery shares a cooldown; owned schedules do not. */
 const lastBrowserRecoveryAt = new Map<string, number>();
+/** Provider-time budget anchor corresponding to the evidence timestamp above. */
+const lastBrowserRecoveryBudgetAt = new Map<string, number>();
 
 /**
  * The user turn on which each chat has already spent its one error reload.
@@ -6900,7 +7207,7 @@ function queueBrowserRecovery(
   const notBefore =
     reason === 'silence' || reason === 'goal' || reason === 'compaction' || reason === 'no-tab' || reason === 'unattributed'
       ? now
-      : Math.max(now, (lastBrowserRecoveryAt.get(conversationId) ?? 0) + BROWSER_RECOVERY_COOLDOWN_MS);
+      : Math.max(now, (lastBrowserRecoveryBudgetAt.get(conversationId) ?? lastBrowserRecoveryAt.get(conversationId) ?? 0) + BROWSER_RECOVERY_COOLDOWN_MS);
   const repair: Repair = {
     ...(assistantSource ? { assistantSource } : {}),
     sessionId,
@@ -6911,6 +7218,7 @@ function queueBrowserRecovery(
     episode,
     reason,
     notBefore,
+    budgetAt: now,
     token: '',
     progressId: `browser-repair:${randomBytes(9).toString('base64url')}`
   };
@@ -7087,8 +7395,10 @@ async function noteRecoveryObservations(
   if (thinkingFailed && ended.turnId && sessionId && activity.terminal) {
     // The recorder closes input immediately. The existing silence owner separately
     // owes one early refresh; real work replaces this grant and cancels the episode.
+    const failureEvidenceAt = Math.min(Date.now(), ended.time);
     terminalGrant = { sessionId, turnId: ended.turnId, model: terminalGrant?.model ?? provenModel,
-      evidenceAt: Math.min(Date.now(), ended.time),
+      evidenceAt: failureEvidenceAt,
+      budgetAt: failureEvidenceAt,
       until: sameFailedRepair && repairsInFlight.get(conversationId) === sameFailedRepair
         ? confirmedAt! + 5 * 60_000 : Date.now(), thinkingFailed: true };
     activeUntil.set(conversationId, terminalGrant);
@@ -7129,7 +7439,8 @@ async function noteRecoveryObservations(
     if (lastEnd === 'completed' && terminalGrant.model === 'other' && ended &&
         !(repaired?.reason === 'silence' && repaired.state === 'done' && !repaired.ambiguous)) {
       terminalGrant.evidenceAt = Math.max(terminalGrant.evidenceAt, Math.min(Date.now(), ended.time));
-      terminalGrant.until = terminalGrant.evidenceAt + CHAT_SILENCE_MS;
+      terminalGrant.budgetAt = terminalGrant.evidenceAt;
+      terminalGrant.until = terminalGrant.budgetAt + CHAT_SILENCE_MS;
       armSilenceSweep();
     }
   }
@@ -7357,6 +7668,7 @@ function browserRecoveryMonitoring(): boolean {
  * it off — see the supersede rule in `queueBrowserRecovery`.
  */
 async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent: string[] }> {
+  if (providerTransportUnavailable()) return { queued: false, spent: [] };
   let queued = false;
   let deferred = false;
   const spent: string[] = [];
@@ -7380,7 +7692,10 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
           episodeId: recovery.failureEpisodeId,
           generation: recovery.recoveryGeneration
         };
-        const dueAt = (recovery.lastRecoveryAt ?? recovery.updatedAt) + SELF_HEAL_POST_RELOAD_MS;
+        const dueAt = Math.max(
+          (recovery.lastRecoveryBudgetAt ?? recovery.lastRecoveryAt ?? recovery.updatedAt) + SELF_HEAL_POST_RELOAD_MS,
+          softRecoveryTransportGrace.get(recovery.failureEpisodeId) ?? 0
+        );
         grant.until = Math.min(grant.until, dueAt);
         if (now < dueAt) {
           deferred = true;
@@ -7392,7 +7707,10 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
       // A genuinely certified completion may already have retired the WAL while this projection
       // still carries its old marker. Drop only the marker; the ordinary open-turn watch, if any,
       // remains valid and continues through the normal path below.
-      if (grant.selfHealingSoft) delete grant.selfHealingSoft;
+      if (grant.selfHealingSoft) {
+        softRecoveryTransportGrace.delete(grant.selfHealingSoft.episodeId);
+        delete grant.selfHealingSoft;
+      }
     }
     if (compacting.has(conversationId)) continue;
     if (grant.until > now) continue;
@@ -7416,16 +7734,16 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
     // Recovery and queued delivery share the same model clock. Missing selection
     // is not evidence of a normal model, even when no follow-up input is queued.
     // Thinking failed keeps its separately proven immediate refresh authority.
-    if ((afterTurn || tabRecoveryWanted(conversationId)) && grant.model !== 'other' && !grant.thinkingFailed && now < grant.evidenceAt + PRO_SILENCE_MS) {
-      grant.until = grant.evidenceAt + PRO_SILENCE_MS;
+    if ((afterTurn || tabRecoveryWanted(conversationId)) && grant.model !== 'other' && !grant.thinkingFailed && now < grant.budgetAt + PRO_SILENCE_MS) {
+      grant.until = grant.budgetAt + PRO_SILENCE_MS;
       deferred = true;
       continue;
     }
     // Not a chat the user wants brought back: its silence is spent the same way, without the
     // reload that would otherwise be its one chance.
     if (!grant.thinkingFailed && !tabRecoveryWanted(conversationId) && !afterTurn) {
-      if (pro && now < grant.evidenceAt + activityLifetime(grant)) {
-        grant.until = grant.evidenceAt + activityLifetime(grant);
+      if (pro && now < grant.budgetAt + activityLifetime(grant)) {
+        grant.until = grant.budgetAt + activityLifetime(grant);
         deferred = true;
         continue;
       }
@@ -7434,8 +7752,8 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
     }
     const held = repairsInFlight.get(conversationId);
     if (held?.state === 'done' && !TURN_SCOPED_REPAIRS.has(held.reason)) {
-      if (!grant.thinkingFailed && pro && now < grant.evidenceAt + activityLifetime(grant)) {
-        grant.until = grant.evidenceAt + activityLifetime(grant);
+      if (!grant.thinkingFailed && pro && now < grant.budgetAt + activityLifetime(grant)) {
+        grant.until = grant.budgetAt + activityLifetime(grant);
         deferred = true;
         continue;
       }
@@ -7454,7 +7772,7 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
     // for three more minutes. The page gets the recovery floor to come back; its first sign of
     // life resets the clock as usual, and a page that never returns is reloaded when the floor
     // has run out.
-    const lastReload = lastBrowserRecoveryAt.get(conversationId) ?? 0;
+    const lastReload = lastBrowserRecoveryBudgetAt.get(conversationId) ?? lastBrowserRecoveryAt.get(conversationId) ?? 0;
     if (awaitingReturn.has(conversationId) && now - lastReload < BROWSER_RECOVERY_COOLDOWN_MS) {
       grant.until = lastReload + BROWSER_RECOVERY_COOLDOWN_MS;
       deferred = true;
@@ -7495,10 +7813,15 @@ async function restoreSoftRecoveryWatches(now: number): Promise<void> {
       );
       continue;
     }
-    const deadline = (recovery.lastRecoveryAt ?? recovery.updatedAt) + SELF_HEAL_POST_RELOAD_MS;
+    const deadline = Math.max(
+      (recovery.lastRecoveryBudgetAt ?? recovery.lastRecoveryAt ?? recovery.updatedAt) + SELF_HEAL_POST_RELOAD_MS,
+      softRecoveryTransportGrace.get(recovery.failureEpisodeId) ?? 0
+    );
+    const evidenceAt = recovery.lastProgressAt ?? recovery.updatedAt;
     activeUntil.set(conversationId, {
       sessionId: session.id,
-      evidenceAt: recovery.lastProgressAt ?? recovery.updatedAt,
+      evidenceAt,
+      budgetAt: evidenceAt,
       until: Math.max(deadline, now + 1),
       turnId: session.activeTurnId ?? null,
       model: 'other',
@@ -7549,7 +7872,7 @@ const GOAL_WATCH_BACKOFF_MS = [2, 2, 5, 10, 15].map((minutes) => minutes * 60_00
  * The row is keyed to the exact `replyId` it was armed for. A newer final answer is a different
  * obligation and gets its own schedule; a discharged one takes its schedule with it.
  */
-const goalWatch = new Map<string, { replyId: string; dueAt: number; attempts: number; pro: boolean; expiresAt: number }>();
+const goalWatch = new Map<string, { replyId: string; dueAt: number; attempts: number; pro: boolean; expiresAt: number; budgetAt: number; expiryBudgetAt: number }>();
 const PICKUP_WATCH_LIFETIME_MS = 12 * 60 * 60_000;
 
 /**
@@ -7635,7 +7958,10 @@ function noteGoalWatchActivity(conversationId: string): void {
   const watch = goalWatch.get(conversationId);
   if (!watch) return;
   const gap = GOAL_WATCH_BACKOFF_MS[Math.min(watch.attempts, GOAL_WATCH_BACKOFF_MS.length - 1)]!;
-  watch.dueAt = Date.now() + Math.max(gap, watch.pro ? PRO_SILENCE_MS : 0);
+  const now = Date.now();
+  if (providerTransportUnavailable()) return;
+  watch.budgetAt = now;
+  watch.dueAt = now + Math.max(gap, watch.pro ? PRO_SILENCE_MS : 0);
 }
 
 /**
@@ -7654,8 +7980,8 @@ function noteGoalWatchActivity(conversationId: string): void {
  * never asked for — which is also why a goal that failed once retries: the next reload is a new
  * request, and the obligation was never discharged by the failure.
  */
-async function owedPickups(now: number): Promise<Map<string, { conversationId: string; sessionId: string; replyId: string; acceptedAt: number; listenUntil: number; pro: boolean; queued: boolean }>> {
-  const owed = new Map<string, { conversationId: string; sessionId: string; replyId: string; acceptedAt: number; listenUntil: number; pro: boolean; queued: boolean }>();
+async function owedPickups(now: number): Promise<Map<string, { conversationId: string; sessionId: string; replyId: string; acceptedAt: number; expiresAt: number; listenUntil: number; pro: boolean; queued: boolean }>> {
+  const owed = new Map<string, { conversationId: string; sessionId: string; replyId: string; acceptedAt: number; expiresAt: number; listenUntil: number; pro: boolean; queued: boolean }>();
   for (const reply of pendingGoalReplies(now)) {
     const pending = goalPendingReplyFor(reply.conversationId);
     if (!pending) continue;
@@ -7676,12 +8002,12 @@ async function owedPickups(now: number): Promise<Map<string, { conversationId: s
       listenUntil: pending.listenUntil ?? 0, pro: loopAfterTurnFor(reply.conversationId), queued: false });
   }
   for (const input of await pendingQueuedPickups()) owed.set(input.conversationId,
-    { ...input, replyId: input.sourceTurnId, queued: true });
-  for (const [id, pickup] of owed) if (now - pickup.acceptedAt >= PICKUP_WATCH_LIFETIME_MS) owed.delete(id);
+    { ...input, replyId: input.sourceTurnId, expiresAt: input.acceptedAt + PICKUP_WATCH_LIFETIME_MS, queued: true });
   return owed;
 }
 
 async function inspectOwedGoals(now: number): Promise<boolean> {
+  if (providerTransportUnavailable()) return false;
   const floor = goalWatchFloor;
   if (floor === null) return false;
   const owed = await owedPickups(now);
@@ -7689,23 +8015,42 @@ async function inspectOwedGoals(now: number): Promise<boolean> {
   // Keep the spent episode while its source is absent: cancellation/reordering must not
   // refund retries if another queue item or Goal later uses that same boundary.
   for (const [conversationId, watch] of goalWatch) {
-    if (now >= watch.expiresAt) goalWatch.delete(conversationId);
-    if (now < watch.expiresAt && owed.get(conversationId)?.replyId === watch.replyId) continue;
+    const sameSource = owed.get(conversationId)?.replyId === watch.replyId;
     const repair = repairsInFlight.get(conversationId);
-    if (repair?.reason === 'goal' && (now >= watch.expiresAt || repair.state !== 'handed' || owed.has(conversationId))) repairsInFlight.delete(conversationId);
+    if (now >= watch.expiresAt) {
+      if (repair?.reason === 'goal') repairsInFlight.delete(conversationId);
+      // Keep the expired watch as a tombstone while the exact queued/Goal source remains current.
+      // Otherwise every sweep would mint a fresh lifetime for the same durable debt.
+      if (sameSource) {
+        owed.delete(conversationId);
+        continue;
+      }
+      goalWatch.delete(conversationId);
+      continue;
+    }
+    if (sameSource) continue;
+    if (repair?.reason === 'goal' && (repair.state !== 'handed' || owed.has(conversationId))) repairsInFlight.delete(conversationId);
   }
   let queued = false;
   for (const reply of owed.values()) {
     const session = await getSession(reply.sessionId);
     if (session?.conversationId !== reply.conversationId || isChatBlocked(reply.conversationId) ||
         stopRequestedFor(reply.conversationId) || await conversationWasSuperseded(reply.conversationId) ||
-        continuationForSession(reply.sessionId)) continue;
+        continuationForSession(reply.sessionId) || longRunOwnsNextTransition(reply.sessionId)) continue;
     if (goalWatchFloor !== floor) return queued;
     let watch = goalWatch.get(reply.conversationId);
     if (!watch || watch.replyId !== reply.replyId) {
+      const budgetAt = Math.max(reply.acceptedAt, floor);
+      const expiryBudgetAt = reply.queued
+        ? budgetAt
+        : Number.isFinite(reply.expiresAt)
+          ? reply.expiresAt - PICKUP_WATCH_LIFETIME_MS
+          : budgetAt;
       watch = { replyId: reply.replyId, attempts: 0, pro: reply.pro,
-        expiresAt: reply.acceptedAt + PICKUP_WATCH_LIFETIME_MS,
-        dueAt: Math.max(reply.acceptedAt, floor) + Math.max(GOAL_WATCH_BACKOFF_MS[0], reply.pro ? PRO_SILENCE_MS : 0) };
+        expiresAt: expiryBudgetAt + PICKUP_WATCH_LIFETIME_MS,
+        expiryBudgetAt,
+        dueAt: budgetAt + Math.max(GOAL_WATCH_BACKOFF_MS[0], reply.pro ? PRO_SILENCE_MS : 0),
+        budgetAt };
       goalWatch.set(reply.conversationId, watch);
     }
     watch.pro = reply.pro;
@@ -7720,6 +8065,7 @@ async function inspectOwedGoals(now: number): Promise<boolean> {
     if (!queueBrowserRecovery(reply.conversationId, reply.sessionId,
       `goal:${reply.replyId}:${watch.attempts}`, 'goal', 0, now)) continue;
     watch.attempts += 1;
+    watch.budgetAt = now;
     watch.dueAt = now + Math.max(GOAL_WATCH_BACKOFF_MS[Math.min(watch.attempts, GOAL_WATCH_BACKOFF_MS.length - 1)]!, reply.pro ? PRO_SILENCE_MS : 0);
     queued = true;
     logInfo(`bridge: next queued/Goal step uncollected in ${reply.conversationId} — reload ${watch.attempts}`);
@@ -7736,6 +8082,7 @@ async function inspectOwedGoals(now: number): Promise<boolean> {
  * Auto Off additionally cancels threshold-created tickets, never manual requests.
  */
 async function inspectOwedCompactions(now: number): Promise<boolean> {
+  if (providerTransportUnavailable()) return false;
   if (compactionWatchFloor === null) return false;
   const owed = new Map(pendingContinuations().map((entry) => [entry.from, entry]));
   for (const [conversationId, watch] of compactionWatch) {
@@ -7746,6 +8093,7 @@ async function inspectOwedCompactions(now: number): Promise<boolean> {
 
   let queued = false;
   for (const entry of owed.values()) {
+    if (longRunOwnsNextTransition(entry.sessionId)) continue;
     if (entry.automatic && !automaticCompactionAllowed(await getSession(entry.sessionId))) {
       await cancelAutomaticResumesNow(entry.sessionId);
       continue;
@@ -7756,7 +8104,14 @@ async function inspectOwedCompactions(now: number): Promise<boolean> {
       // The clock starts when the phase did, not when this sweep noticed: the ticket's opening
       // for asking, the durable dispatch stamp for writing. The brief's landing has no stamp
       // of its own, and at a quarter-hour cadence the sweep's half-minute lag does not matter.
-      const since = Math.max(compactionWatchFloor, phase === 'asking' ? entry.openedAt : phase === 'writing' ? (entry.askedAt ?? now) : now);
+      const since = Math.max(
+        compactionWatchFloor,
+        phase === 'asking'
+          ? entry.openedAt
+          : phase === 'writing'
+            ? (continuationProviderAskedAt(entry.token) ?? entry.askedAt ?? now)
+            : now
+      );
       watch = { token: entry.token, phase, attempts: 0, since };
       compactionWatch.set(entry.from, watch);
     }
@@ -7845,6 +8200,10 @@ async function inspectOwedCompactions(now: number): Promise<boolean> {
  * indistinguishable from a close the extension never reported.
  */
 async function queueMissingTab(conversationId: string, working: boolean, now = Date.now()): Promise<void> {
+  if (providerTransportUnavailable()) {
+    logInfo(`bridge: ${conversationId} lost its tab while provider transport is unavailable — recovery parked`);
+    return;
+  }
   const agent = agentInfoForOwnedConversation(conversationId);
   // Read after closeConversation() has ended the session, so `endedAt` is this exact close.
   const session = await findSessionByConversation(conversationId);
@@ -8203,7 +8562,7 @@ async function takePendingRepairs(
   // starved every other chat behind it — precisely when several chats break at once.
   for (const [conversationId, repair] of [...repairsInFlight]) {
     if (repair.state === 'handed' && repair.claimed && repair.claimedAt &&
-        now - repair.claimedAt >= BROWSER_REPAIR_ACK_CUSTODY_MS) {
+        now - (repair.claimBudgetAt ?? repair.claimedAt) >= BROWSER_REPAIR_ACK_CUSTODY_MS) {
       // The browser won this exact action claim, so executing it again is forbidden even though
       // its result receipt never arrived. Release only *custody*: mark the old action ambiguous
       // and let silence/no-tab/self-healing inspect current durable state on the next pass.
@@ -8220,6 +8579,7 @@ async function takePendingRepairs(
     if (repair.state !== 'handed' || repair.claimed || repair.reason === 'goal' || repair.reason === 'unattributed' || repair.reason === 'assistant-error') continue;
     repair.state = 'queued';
     repair.claimedAt = null;
+    repair.claimBudgetAt = null;
     repair.ambiguous = false;
     repairsInFlight.delete(conversationId);
     repairsInFlight.set(conversationId, repair);
@@ -8241,6 +8601,7 @@ async function takePendingRepairs(
       repair.token = randomBytes(9).toString('base64url');
       repair.claimed = false;
       repair.claimedAt = null;
+    repair.claimBudgetAt = null;
       repair.ambiguous = false;
       await updateRepairProgress(conversationId, repair, `Trying to reload chat to recover ${repairReason(repair)}…`);
     }
@@ -8309,7 +8670,9 @@ async function confirmRepair(token: string, action: 'reloaded' | 'reopened' | nu
       repair.ambiguous = false;
       if (repair.attribution && repair.attribution.incident.firstAttemptAt === null)
         repair.attribution.incident.firstAttemptAt = Date.now();
-      lastBrowserRecoveryAt.set(conversationId, Date.now());
+      const recoveredAt = Date.now();
+      lastBrowserRecoveryAt.set(conversationId, recoveredAt);
+      lastBrowserRecoveryBudgetAt.set(conversationId, recoveredAt);
       awaitingReturn.add(conversationId);
       if (repair.reason === 'silence') {
         const failedGrant = activeUntil.get(conversationId);
@@ -8376,7 +8739,7 @@ async function confirmRepair(token: string, action: 'reloaded' | 'reopened' | nu
           armSilenceSweep();
         } else if (pro) {
           if (grant && activeUntil.get(conversationId) === grant) {
-            grant.until = Math.max(Date.now(), grant.evidenceAt + activityLifetime(grant));
+            grant.until = Math.max(Date.now(), grant.budgetAt + activityLifetime(grant));
             armSilenceSweep();
           }
         } else if (grant && (goalActiveFor(conversationId) || inputFiled || !goalWorkerChat(conversationId))) {
@@ -8418,6 +8781,7 @@ async function failRepairAttempt(token: string, action: 'reloaded' | 'reopened' 
       repair.state = 'queued';
       repair.claimed = false;
       repair.claimedAt = null;
+    repair.claimBudgetAt = null;
       repair.ambiguous = false;
       repairsInFlight.delete(conversationId);
       repairsInFlight.set(conversationId, repair);
@@ -8478,6 +8842,7 @@ function clearUnattributedIncident(): void {
   unattributedIncidents.clear();
   repairsInFlight.clear();
   lastBrowserRecoveryAt.clear();
+  lastBrowserRecoveryBudgetAt.clear();
   turnRepairSpent.clear();
 }
 
@@ -8505,6 +8870,7 @@ async function deliver(): Promise<void> {
 }
 
 async function deliverOne(): Promise<void> {
+  if (providerTransportUnavailable()) return;
   tidyCommands();
   const command = nextDeliverable();
   if (!command) return;
@@ -8627,36 +8993,39 @@ function revivalDeliveryProven(command: Command): boolean {
  * delivery moves it to the longer budget and nothing else does.
  */
 function revivalDeadlineAt(command: Command): number {
-  return command.createdAt + (revivalDeliveryProven(command) ? REVIVAL_ACTIVITY_MS : REVIVAL_DEADLINE_MS);
+  return command.deadlineCreatedAt + (revivalDeliveryProven(command) ? REVIVAL_ACTIVITY_MS : REVIVAL_DEADLINE_MS);
 }
 
 function commandDeadlineDelay(command: Command, now = Date.now()): number {
-  if (command.spec.type === 'stop') return command.createdAt + STOP_COMMAND_TIMEOUT_MS - now;
+  if (command.spec.type === 'stop') return command.deadlineCreatedAt + STOP_COMMAND_TIMEOUT_MS - now;
   if (command.spec.type === 'revive') return revivalDeadlineAt(command) - now;
   if (command.spec.type === 'resume' && continuationByToken(command.spec.token)?.automatic) {
     // One checkpoint, not a failure trigger. Expiry releases only this browser transport;
     // the auto-compaction ticket remains and the next 15-minute pickup may open it again.
-    return (command.claimedAt ?? command.createdAt) + COMPACTION_PICKUPS.opening.every - now;
+    return (command.deadlineClaimedAt ?? command.deadlineCreatedAt) + COMPACTION_PICKUPS.opening.every - now;
   }
   if (command.spec.type === 'resume' && command.owner !== null) {
     const continuation = continuationByToken(command.spec.token);
-    if (continuation?.state === 'claimed') return continuation.touchedAt + CONTINUATION_TTL_MS - now;
+    if (continuation?.state === 'claimed') {
+      const deadline = continuationProviderDeadlineAt(command.spec.token);
+      if (deadline !== null) return deadline - now;
+    }
   }
   if (command.spec.type === 'worker') {
     // Absolute, from the invitation. Whatever else this command is waiting for, the slot it
     // holds stops being `invited` by this instant. A command still in line has no clock of its
     // own: every ending of the command ahead of it calls deliver(), and this limit is the fence.
-    const limit = command.createdAt + WORKER_BOOTSTRAP_LIMIT_MS;
+    const limit = command.deadlineCreatedAt + WORKER_BOOTSTRAP_LIMIT_MS;
     if (command.claimedAt === null) return limit - now;
     // Opened but not yet redeemed: the page's round trip, not its typing budget. A browser this
     // app had to start is given its launch window on top, since nothing can redeem before it is up.
     if (command.owner === null) {
-      const redeemBy = Math.max(command.claimedAt + WORKER_REDEEM_MS, lastBrowserLaunchAt + BROWSER_LAUNCH_GRACE_MS);
+      const redeemBy = Math.max((command.deadlineClaimedAt ?? command.claimedAt) + WORKER_REDEEM_MS, lastBrowserLaunchAt + BROWSER_LAUNCH_GRACE_MS);
       return Math.min(redeemBy, limit) - now;
     }
-    return Math.min(command.claimedAt + COMMAND_DEADLINE_MS, limit) - now;
+    return Math.min((command.deadlineClaimedAt ?? command.claimedAt) + COMMAND_DEADLINE_MS, limit) - now;
   }
-  const claimedAt = command.claimedAt ?? now;
+  const claimedAt = command.deadlineClaimedAt ?? command.claimedAt ?? now;
   return claimedAt + COMMAND_DEADLINE_MS - now;
 }
 
@@ -8671,6 +9040,7 @@ function armDeadline(command: Command, delay = commandDeadlineDelay(command)): v
 
 /** Re-arms leased commands whose timers were intentionally cleared by stopBridge(). */
 function rearmRetainedCommandDeadlines(): void {
+  if (providerTransportUnavailable()) return;
   const now = Date.now();
   const expired: Command[] = [];
   for (const command of commands) {
@@ -8704,6 +9074,10 @@ function rearmRetainedCommandDeadlines(): void {
  */
 function expire(command: Command): void {
   if (!commands.includes(command)) return;
+  if (providerTransportUnavailable()) {
+    command.timer = null;
+    return;
+  }
   const spec = command.spec;
   // A wake's deadline moves once when its delivery is proven, and the timer armed at the wake
   // does not know that. Re-arm for the remainder rather than end a worker that is reading.
@@ -8931,8 +9305,7 @@ function drop(command: Command, why: string): boolean {
             }
           }
           if (checkpoint.state === 'dispatched-unresolved') {
-            const dispatchedAt = checkpoint.dispatchedAt ?? recovery.updatedAt;
-            if (Date.now() - dispatchedAt < SELF_HEAL_MARKER_RECONCILE_MS) {
+            if (selfHealingDispatchBudgetAge(recovery) < SELF_HEAL_MARKER_RECONCILE_MS) {
               // Missing ACK after native Send is ambiguity, not non-execution. Keep this exact
               // command as inert custody and renew B's admission gate; never reopen or retype it.
               noteResumeClaim(command.spec.episodeId);
@@ -9068,6 +9441,7 @@ function drop(command: Command, why: string): boolean {
  * Retires and expires commands. Run before anything is handed out or delivered.
  */
 function tidyCommands(): void {
+  if (providerTransportUnavailable()) return;
   const now = Date.now();
   const pendingWorkers = new Set(pendingWorkerSpawns().map(worker => `${worker.runId}:${worker.id}`));
   const wakingWorkers = new Set(pendingWorkerRevivals().map(revival => `${revival.runId}:${revival.id}`));
@@ -9098,7 +9472,7 @@ function tidyCommands(): void {
       command.spec.type === 'resume' && continuationByToken(command.spec.token)?.automatic === true;
     const stale = command.spec.type === 'revive'
       ? now >= revivalDeadlineAt(command)
-      : !automaticResume && now - command.createdAt > COMMAND_TTL_MS;
+      : !automaticResume && now - command.deadlineCreatedAt > COMMAND_TTL_MS;
     if (stale) {
       drop(command, 'it has been waiting too long to still be what the user expects');
     }
@@ -9344,6 +9718,8 @@ interface CommandRestorePlan {
   resumeTokens: Array<{ sessionId: string; token: string }>;
   /** Number of durable commands newly reconstructed rather than retained from this process. */
   restored: number;
+  /** Process-local restart anchor when the durable ledger proves transport was already paused. */
+  transportPausedAt: number | null;
 }
 
 /** One durable receipt that is still useful, rebuilt field-by-field. */
@@ -9478,14 +9854,16 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
 function restoredCommandSnapshot(
   plannedCommands: readonly Command[],
   plannedReceipts: readonly CommandReceipt[],
-  now: number
+  now: number,
+  transportPausedAt: DurableCommandSnapshot['transportPausedAt']
 ): DurableCommandSnapshot {
   return {
     version: 5,
     commands: plannedCommands.map(durableCommand),
     receipts: plannedReceipts
       .filter((receipt) => now - receipt.completedAt <= COMMAND_TTL_MS)
-      .slice(-MAX_COMMAND_RECEIPTS)
+      .slice(-MAX_COMMAND_RECEIPTS),
+    transportPausedAt
   };
 }
 
@@ -9498,11 +9876,17 @@ function restoredCommandSnapshot(
  * awaits can still fail.
  */
 function planCommandRestore(
-  saved: { version?: number; commands?: unknown; receipts?: unknown },
-  now: number
+  saved: { version?: number; commands?: unknown; receipts?: unknown; transportPausedAt?: unknown },
+  now: number,
 ): CommandRestorePlan | null {
   const version = saved.version;
   if (version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 || !Array.isArray(saved.commands)) return null;
+  const persistedPauseAt =
+    typeof saved.transportPausedAt === 'number' && Number.isFinite(saved.transportPausedAt)
+      ? saved.transportPausedAt
+      : null;
+  const restartSuspensionMs = persistedPauseAt === null ? 0 : Math.max(0, now - persistedPauseAt);
+  const freezeTransportAge = persistedPauseAt !== null;
 
   const plannedCommands = [...commands];
   const plannedReceipts = commandReceipts
@@ -9565,11 +9949,16 @@ function planCommandRestore(
   for (const { raw, spec, createdAt } of durableCandidates.values()) {
     if (spec.type === 'resume') resumeTokens.push({ sessionId: spec.sessionId, token: spec.token });
     const persistedLeased = version !== 1 && raw.phase === 'leased';
+    let deadlineCreatedAt =
+      typeof raw.deadlineCreatedAt === 'number' && Number.isFinite(raw.deadlineCreatedAt)
+        ? raw.deadlineCreatedAt
+        : createdAt;
     // The broker cannot yet say whether a restored wake was delivered, so disk rows get the
     // longer budget here; the deadline re-armed below applies the exact one.
+    if (freezeTransportAge) deadlineCreatedAt += restartSuspensionMs;
     const stale = spec.type === 'revive'
-      ? now - createdAt >= REVIVAL_ACTIVITY_MS
-      : now - createdAt > COMMAND_TTL_MS;
+      ? now >= deadlineCreatedAt + REVIVAL_ACTIVITY_MS
+      : now - deadlineCreatedAt > COMMAND_TTL_MS;
     if (stale) {
       if (spec.type === 'revive') expiredRevivals.push({ id: raw.id!, spec });
       continue;
@@ -9583,12 +9972,20 @@ function planCommandRestore(
     let claimedAt = leased && typeof raw.claimedAt === 'number' && Number.isFinite(raw.claimedAt) ? raw.claimedAt : null;
     if (leased && claimedAt === null) claimedAt = now;
     if (claimedAt !== null && claimedAt > now + COMMAND_DEADLINE_MS) claimedAt = now;
+    let deadlineClaimedAt = claimedAt === null
+      ? null
+      : typeof raw.deadlineClaimedAt === 'number' && Number.isFinite(raw.deadlineClaimedAt)
+        ? raw.deadlineClaimedAt
+        : claimedAt;
+    if (freezeTransportAge && deadlineClaimedAt !== null) deadlineClaimedAt += restartSuspensionMs;
     plannedCommands.push({
       id: raw.id!,
       spec,
       createdAt,
+      deadlineCreatedAt,
       claimedAt,
-        timer: null,
+      deadlineClaimedAt,
+      timer: null,
       lastError: typeof raw.lastError === 'string' ? raw.lastError : null,
       owner: leased && typeof raw.owner === 'string' ? raw.owner.slice(0, 64) : null
     });
@@ -9613,7 +10010,8 @@ function planCommandRestore(
     receipts: plannedReceipts.slice(-MAX_COMMAND_RECEIPTS),
     expiredRevivals,
     resumeTokens,
-    restored
+    restored,
+    transportPausedAt: freezeTransportAge ? now : null
   };
 }
 
@@ -9626,6 +10024,9 @@ function planCommandRestore(
  * the authority; this helper only recreates a missing command inside the same bounded episode.
  */
 async function restoreMissingEmergencyResumes(plan: CommandRestorePlan, now: number): Promise<void> {
+  // Startup connectivity may still be the module placeholder. Only the persisted command-ledger
+  // suspension marker proves wall time belonged to an outage and may freeze provider budgets.
+  const transportPausedOnRestore = plan.transportPausedAt !== null;
   const existing = new Set(
     plan.commands
       .filter((command): command is Command & { spec: Extract<CommandSpec, { type: 'recovery' }> } => command.spec.type === 'recovery')
@@ -9649,7 +10050,7 @@ async function restoreMissingEmergencyResumes(plan: CommandRestorePlan, now: num
     // this leased row is never eligible to open or type another chat.
     if (recovery.destinationSend.state === 'dispatched-unresolved') {
       const dispatchedAt = recovery.destinationSend.dispatchedAt ?? recovery.updatedAt;
-      if (now - dispatchedAt >= SELF_HEAL_MARKER_RECONCILE_MS) {
+      if (!transportPausedOnRestore && selfHealingDispatchBudgetAge(recovery, now) >= SELF_HEAL_MARKER_RECONCILE_MS) {
         await failSelfHealingRecovery(
           session.id,
           session.conversationId,
@@ -9679,7 +10080,9 @@ async function restoreMissingEmergencyResumes(plan: CommandRestorePlan, now: num
         id: commandId,
         spec,
         createdAt: dispatchedAt,
-        claimedAt: now,
+        deadlineCreatedAt: dispatchedAt,
+        claimedAt: dispatchedAt,
+        deadlineClaimedAt: now,
         timer: null,
         lastError: 'Emergency Resume Send is awaiting stable marker reconciliation.',
         owner: null
@@ -9710,7 +10113,7 @@ async function restoreMissingEmergencyResumes(plan: CommandRestorePlan, now: num
     }
 
     const episodeAt = recovery.lastRecoveryAt ?? recovery.updatedAt;
-    if (!Number.isFinite(episodeAt) || now - episodeAt > COMMAND_TTL_MS) {
+    if (!Number.isFinite(episodeAt) || (!transportPausedOnRestore && selfHealingRecoveryBudgetAge(recovery, now) > COMMAND_TTL_MS)) {
       await failSelfHealingRecovery(
         session.id,
         session.conversationId,
@@ -9743,7 +10146,9 @@ async function restoreMissingEmergencyResumes(plan: CommandRestorePlan, now: num
         : randomBytes(8).toString('hex'),
       spec,
       createdAt: now,
+      deadlineCreatedAt: now,
       claimedAt: null,
+      deadlineClaimedAt: null,
       timer: null,
       lastError: null,
       owner: null
@@ -9771,6 +10176,7 @@ export async function restoreCommands(): Promise<void> {
     version?: number;
     commands?: unknown;
     receipts?: unknown;
+    transportPausedAt?: unknown;
   }>(COMMANDS_STATE);
   const now = Date.now();
   // A missing command file is a valid crash point: the session WAL can already say
@@ -9849,7 +10255,7 @@ export async function restoreCommands(): Promise<void> {
   // plan in memory is safe because admission is still fenced by bridgeRecovering.
   let rewriteDurable = true;
   try {
-    await writeDurableNow(COMMANDS_STATE, restoredCommandSnapshot(plan.commands, plan.receipts, now));
+    await writeDurableNow(COMMANDS_STATE, restoredCommandSnapshot(plan.commands, plan.receipts, now, plan.transportPausedAt));
     rewriteDurable = false;
   } catch (err) {
     logWarn(`bridge: could not persist reconstructed command state — ${err instanceof Error ? err.message : String(err)}`);
@@ -9859,6 +10265,7 @@ export async function restoreCommands(): Promise<void> {
   // everything below may again use ordinary live command helpers and timers.
   commands = plan.commands;
   commandReceipts = plan.receipts;
+  providerUnavailableSince = plan.transportPausedAt;
   for (const token of plan.resumeTokens) rememberToken(token.sessionId, token.token);
   rearmRetainedCommandDeadlines();
   await restoreSoftRecoveryWatches(now);
@@ -9885,6 +10292,9 @@ export function resetBridgeForTests(): void {
   commandRedeems.clear();
   bridgeRecovering = false;
   bridgeShutdownRequested = false;
+  providerUnavailableSince = null;
+  transportRecoveryInFlight = null;
+  softRecoveryTransportGrace.clear();
   clearUnattributedIncident();
   activeUntil.clear();
   awaitingReturn.clear();
@@ -9906,6 +10316,11 @@ export function resetBridgeForTests(): void {
   extensionVersion = null;
   versionWarned = false;
   requestWindow = { start: Date.now(), count: 0 };
+}
+
+/** Deterministic test seam for the current connectivity-reconciliation transaction. */
+export async function flushBridgeTransportRecoveryForTests(): Promise<void> {
+  await transportRecoveryInFlight;
 }
 
 export function bridgePort(): number | null {

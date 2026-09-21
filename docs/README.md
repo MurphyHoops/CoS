@@ -10,8 +10,10 @@ Read these first:
 2. [Setup and operation](setup.md) — installation, pairing, updates and long-running operation.
 3. [Model-facing tool surface](tool-surface.md) — Core/Desktop/Plugins contracts.
 4. [Long-Run Runtime](long-run-runtime.md) — obligations, waits, continuation and supervisor behavior.
-5. [Security](../SECURITY.md) — capability and durable-authority boundaries.
-6. [Implementation map](../AGENTS.md) — code-level invariants and owners.
+5. [Project Runtime Profile](project-runtime.md) — optional project-owned tasks and machine completion contract.
+6. [Provider Transport Suspension](transport-suspension.md) — connectivity authority, frozen budgets and reconnect semantics.
+7. [Security](../SECURITY.md) — capability and durable-authority boundaries.
+8. [Implementation map](../AGENTS.md) — code-level invariants and owners.
 
 These documents define CoS 3.x.
 

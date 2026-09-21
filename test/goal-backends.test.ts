@@ -18,6 +18,7 @@ const { initSecretsPath, setSecret } = await import('../src/main/secrets.js');
 const { initDurableStore, resetDurableForTests, flushDurable, readDurable } = await import('../src/main/durable.js');
 const { appendEvent, createSession, initSessionStore, resetSessionStoreForTests } = await import('../src/main/session/store.js');
 const goal = await import('../src/main/goal.js');
+const { resetProviderTransportForTests } = await import('../src/main/session/connectivity.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
 let directory: string;
 beforeAll(async () => {
@@ -28,6 +29,10 @@ beforeAll(async () => {
   initDurableStore(directory);
 });
 beforeEach(async () => {
+  resetProviderTransportForTests({
+    state: 'connected', detail: '', publicUrl: null, localUrl: null,
+    handshakeAt: Date.now(), lastRequestAt: null, lastToolCallAt: null, health: null, surfaces: []
+  });
   goal.resetGoalStateForTests();
   browser.request.mockReset();
   browser.authorize.mockReset();

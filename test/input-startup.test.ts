@@ -2,12 +2,55 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import type { InputArgs, InputEntry } from '../src/main/session/input.js';
 const ports = vi.hoisted(() => ({ backgroundChats: false, running: false as boolean | null, connect: vi.fn(), status: { state: 'connected', detail: '' },
   browser: { connected: false, present: false, lastSeenAt: null as number | null }, open: vi.fn(), bridge: vi.fn(), enqueue: vi.fn(), cancel: vi.fn(), note: vi.fn(), rows: [] as InputEntry[], listeners: new Set<() => void>() }));
-vi.mock('../src/main/connection.js', () => ({ connect: ports.connect, getStatus: () => ports.status, onStatusChange: (fn: () => void) => { ports.listeners.add(fn); return () => ports.listeners.delete(fn); } }));
+vi.mock('../src/main/connection.js', () => ({ connect: ports.connect }));
+vi.mock('../src/main/session/connectivity.js', () => {
+  const phase = () => ports.status.state === 'connected'
+    ? 'ready'
+    : ['starting-server', 'connecting-tunnel', 'offline'].includes(ports.status.state)
+      ? 'suspended'
+      : 'blocked';
+  const snapshot = () => ({
+    phase: phase(),
+    state: ports.status.state,
+    detail: ports.status.detail,
+    changedAt: Date.now(),
+    suspendedAt: phase() === 'ready' ? null : Date.now(),
+    generation: 1
+  });
+  return {
+    providerTransportReady: () => phase() === 'ready',
+    onProviderTransportChange: (fn: (transition: unknown) => void) => {
+      const listener = () => fn({ before: snapshot(), after: snapshot(), recoveredAfterMs: null });
+      ports.listeners.add(listener);
+      return () => ports.listeners.delete(listener);
+    },
+    waitForProviderTransport: (signal?: AbortSignal) => {
+      signal?.throwIfAborted();
+      if (phase() === 'ready') return Promise.resolve();
+      if (phase() === 'blocked') return Promise.reject(new Error(ports.status.detail || 'Provider transport is not connected.'));
+      return new Promise<void>((resolve, reject) => {
+        const listener = () => {
+          if (phase() === 'suspended') return;
+          ports.listeners.delete(listener);
+          signal?.removeEventListener('abort', abort);
+          if (phase() === 'ready') resolve();
+          else reject(new Error(ports.status.detail || 'Provider transport is not connected.'));
+        };
+        const abort = () => {
+          ports.listeners.delete(listener);
+          reject(signal?.reason instanceof Error ? signal.reason : new Error('cancelled'));
+        };
+        ports.listeners.add(listener);
+        signal?.addEventListener('abort', abort, { once: true });
+      });
+    }
+  };
+});
 vi.mock('../src/main/bridge.js', () => ({ bridgeStatus: async () => ports.browser, browserWakeConnected: () => ports.browser.connected, startBridge: ports.bridge }));
 vi.mock('../src/main/browser.js', () => ({ openInPreferredBrowser: ports.open, isPreferredBrowserRunning: async () => ports.running }));
 vi.mock('../src/main/config.js', () => ({ getConfig: () => ({ ui: { backgroundChats: ports.backgroundChats } }) }));
 vi.mock('../src/main/session/input.js', () => ({ enqueueInput: ports.enqueue, cancelInput: ports.cancel, noteInputStartupError: ports.note, listInputs: async () => ports.rows }));
-import { sendDesktopInput, cancelDesktopInput, retryQueuedInputBrowser, resetInputStartupForTests, stopInputStartup } from '../src/main/session/start-input.js';
+import { sendDesktopInput, cancelDesktopInput, retryQueuedInputBrowser, resetInputStartupForTests, startInputStartupRuntime, stopInputStartup } from '../src/main/session/start-input.js';
 const request: InputArgs = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', sessionId: null, text: 'Please start', mode: 'auto', dueAt: 0, model: null, reasoningEffort: null };
 beforeEach(() => {
   vi.resetAllMocks(); resetInputStartupForTests();
@@ -53,6 +96,27 @@ it('retries only the failed browser wake for the same queued UUID', async () => 
   ports.rows[0]!.state = 'browser'; ports.rows[0]!.error = 'Message queued. Browser startup failed: old';
   expect(await retryQueuedInputBrowser(request.id)).toBeNull();
 });
+it('automatically retries the same durable UUID when provider transport reconnects', async () => {
+  ports.open.mockRejectedValueOnce(new Error('startup refused'));
+  await sendDesktopInput(request);
+  await vi.waitFor(() => expect(ports.rows[0]?.error).toContain('Browser startup failed'));
+  expect(ports.enqueue).toHaveBeenCalledTimes(1);
+  expect(ports.open).toHaveBeenCalledTimes(1);
+
+  ports.status = { state: 'offline', detail: 'No internet' };
+  startInputStartupRuntime();
+  expect(ports.open).toHaveBeenCalledTimes(1);
+
+  ports.status = { state: 'connected', detail: '' };
+  for (const listener of [...ports.listeners]) listener();
+
+  await vi.waitFor(() => expect(ports.open).toHaveBeenCalledTimes(2));
+  await vi.waitFor(() => expect(ports.rows[0]?.error).toBeUndefined());
+  expect(ports.enqueue).toHaveBeenCalledTimes(1);
+  expect(ports.rows).toHaveLength(1);
+  expect(ports.rows[0]?.id).toBe(request.id);
+});
+
 it('publishes before connection startup and opens exactly one marked bootstrap while Chrome starts', async () => {
   let release!: () => void;
   ports.open.mockImplementationOnce(() => new Promise(resolve => { release = () => resolve('chrome.exe'); }));

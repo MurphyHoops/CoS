@@ -41,6 +41,7 @@ const { flushDurable, initDurableStore, readDurable, writeDurableSoon } = durabl
 const { getSession, initSessionStore, resetSessionStoreForTests } = await import('../src/main/session/store.js');
 const { resetRecorderForTests, sessionForConversation } = await import('../src/main/session/recorder.js');
 const { resetSwarm } = await import('../src/main/agents.js');
+const { resetProviderTransportForTests } = await import('../src/main/session/connectivity.js');
 const {
   CONTINUATIONS_STATE,
   restoreContinuations
@@ -166,6 +167,10 @@ afterAll(async () => {
 
 beforeEach(async () => {
   resetBridgeForTests();
+  resetProviderTransportForTests({
+    state: 'connected', detail: '', publicUrl: null, localUrl: null,
+    handshakeAt: Date.now(), lastRequestAt: null, lastToolCallAt: null, health: null, surfaces: []
+  });
   resetRecorderForTests();
   resetSessionStoreForTests();
   // Each case models one independent app history. Reusing CHAT_A/CHAT_B while retaining

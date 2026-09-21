@@ -226,11 +226,13 @@ Paths in this section are repository-relative. Most mechanisms have `main`, `sha
 | Terminal custody | `src/main/codex/{manager,ownership,unified-exec,unified-exec-constants,shell,command-batch,head-tail-buffer,truncate,exec-output}.ts`. |
 | Patching/images | `src/main/codex/apply-patch/*`, `codex/{filesystem,read-backend,view-image}.ts`. |
 | Projects/cwd | `src/main/projects.ts`, `workspace.ts`, `src/shared/projects.ts`: explicit local folder catalog, session binding, inherited/learned workspaces. |
+| Project runtime | `src/main/project-runtime.ts`, `src/shared/project-runtime.ts`, `src/main/mcp/project-runtime-tool.ts`: optional `.cos/project.json`, named local verification tasks, sandboxed completion predicates and safe model-facing summary. |
 | Durable history | `src/main/session/{store,recorder,correlation,retention,summarize,progress}.ts`, `src/shared/{session,chronology}.ts`: canonical messages, tool truth, chronology and indexes. |
 | Input | `src/main/session/{input,start-input,input-history,input-attachments,input-images,prompt}.ts`, `src/shared/{input,user-prompt}.ts`: outbox, native files, prompt frame and receipts. |
 | Finish/planning | `src/main/session/finish.ts`, `task-request.ts`, `goal.ts`, `src/shared/{finish,task-progress}.ts`: held turn, decision/plan invocation and cancellation. |
 | Continuation | `src/main/session/{continuation,resume-gate,handoff,handoff-prompt}.ts`: A→B transaction, send ambiguity and exact brief. |
 | Durable long-run | `src/main/session/{long-run,long-run-runtime,wait-providers}.ts`, `mcp/long-run-tool.ts`, `mcp/code-mode-{tool,runtime}.ts`: execution epochs, work debt, external waits, provider adapters, progress certificates and terminal-yield fencing. |
+| Provider transport | `src/main/connection.ts` is the connection authority; `src/main/session/connectivity.ts` is its lightweight ready/suspended/blocked projection consumed by Long-Run, Self-Healing, Goal, input and bridge orchestration. Do not infer internet health from browser wake presence. |
 | Automation | `src/main/goal.ts`, `src/shared/{goal,goal-templates}.ts`: objectives, switches, obligations, provider/helper decisions. |
 | Agents | `src/main/agents.ts`, `src/renderer/{agent-panel,agent-communication}.ts`: independent prime families, staged mutations and addressed messages. |
 | Browser orchestration | `src/main/bridge.ts`, `browser.ts`, `browser-startup.ts`, `browser-wake.ts`, `browser-window-layout.ts`, `browser-preferences.ts`; `src/shared/browser-preferences.ts`. |
@@ -255,6 +257,8 @@ Paths in this section are repository-relative. Most mechanisms have `main`, `sha
 | Input and checkpoints | `input.ts` / `state/session-input.json` | Serialized acceptance, frozen payload, exclusive claim and receipt; stages belong here. |
 | Native upload originals | `input-attachments.ts` / `input-attachments/` | Immutable bytes, opaque ids; outbox owns membership and retention. |
 | Project catalog | `projects.ts` / `state/projects.json` | Serialized catalog mutation; session metadata owns association. |
+| Project runtime contract | bound project's `.cos/project.json`; validated by `project-runtime.ts` | Project owns verification/completion declaration; CoS owns sandboxing, permission checks and machine evaluation. Status never publishes executable argv/native project path. |
+| Provider transport availability | `connection.ts` live `ConnectionStatus` projected by `session/connectivity.ts` | One semantic phase drives every provider-dependent subsystem. Suspension preserves debt and freezes failure budgets; reconnect reconciles before delivery. |
 | Browser commands/results | `bridge.ts` / `state/bridge-commands.json`; extension ACK outbox | Intent and exact lease before text; receipt durable before ACK custody is retired. |
 | Direct browser tool calls | `browser-control.ts` process epoch/pending claims; extension `storage.session.cosBrowserControl` | One claim per command; browser incarnation plus local-session tab lease. MV3 retains custody/receipt, never replays input. App restart invalidates outstanding claims. |
 | Workers and inboxes | `agents.ts` / swarm snapshot and retired-worker fences | Stage → critical durable snapshot → publish/open/report. |

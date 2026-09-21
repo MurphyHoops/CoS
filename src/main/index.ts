@@ -1,4 +1,4 @@
-import { stopInputStartup } from './session/start-input.js';
+import { startInputStartupRuntime, stopInputStartup } from './session/start-input.js';
 import { browserExtensionRequired } from '../shared/types.js';
 import { requestSessionFinishGoal, setFinishNotifier } from './session/finish.js';
 /**
@@ -456,6 +456,7 @@ void app.whenReady().then(async () => {
 
   // Recording, workers and direct browser tools share one extension transport.
   // ipc.ts uses the same eligibility rule when settings change.
+  startInputStartupRuntime();
   if (browserExtensionRequired(getConfig())) {
     void startBridge();
   }

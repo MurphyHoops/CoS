@@ -56,6 +56,7 @@ import { getSecret } from './secrets.js';
 import { findSessionByConversation, getSession, readEvents, readHandoff, readRecentEvents, turnHasMcpCall } from './session/store.js';
 import { foldProgress } from '../shared/session.js';
 import { isAstraModel, isProModel } from '../shared/chat-models.js';
+import { providerTransportDeadline, providerTransportUnavailable, waitForProviderTransport } from './session/connectivity.js';
 
 /** Pro Loop defaults to finish-only; an exact chat switch may allow browser continuation. */
 export async function astraFinishOnly(sessionId: string, conversationId: string): Promise<boolean> {
@@ -416,12 +417,19 @@ interface GoalReplyObligation {
   replyId: string;
   turnId: string;
   eventSeq: number;
-  /** When this app froze the decision. The row's whole lifetime is measured from here. */
+  /** Immutable evidence: when this app froze the decision. */
   acceptedAt: number;
+  /** Mutable provider-wait budget anchor corresponding to acceptedAt. */
+  acceptedBudgetAt: number;
   state: 'pending' | 'handled';
 }
 
 const goalReplies = new Map<string, GoalReplyObligation>();
+let goalReplyTransportPausedAt: number | null = null;
+
+function goalReplyBudgetNow(now = Date.now()): number {
+  return goalReplyTransportPausedAt === null ? now : Math.min(now, goalReplyTransportPausedAt);
+}
 
 /**
  * How long one reply may wait for its Goal decision, and how many chats may be waiting.
@@ -445,7 +453,7 @@ function boundGoalReplies(now: number): void {
     // Expiry revokes automatic pickup authority; it does not erase the exact final assistant
     // identity. A later deliberate On may re-arm that tombstone, while leaving it handled here
     // prevents a stale page or watchdog from collecting it on its own.
-    if (reply.state === 'pending' && now - reply.acceptedAt >= GOAL_REPLY_TTL_MS) reply.state = 'handled';
+    if (reply.state === 'pending' && goalReplyBudgetNow(now) - reply.acceptedBudgetAt >= GOAL_REPLY_TTL_MS) reply.state = 'handled';
   }
   if (goalReplies.size <= MAX_GOAL_REPLIES) return;
   const oldestFirst = [...goalReplies.values()].sort((a, b) => a.acceptedAt - b.acceptedAt);
@@ -455,10 +463,14 @@ function boundGoalReplies(now: number): void {
 }
 export const GOAL_REPLIES_STATE = 'goal-replies';
 
+type GoalReplyRecord = Omit<GoalReplyObligation, 'acceptedBudgetAt'> & { acceptedBudgetAt?: number };
+
 export interface GoalRepliesSnapshot {
   version: 1;
   savedAt: number;
-  replies: GoalReplyObligation[];
+  replies: GoalReplyRecord[];
+  /** Durable proof that provider-wait budgets were paused when this ledger was written. */
+  transportPausedAt?: number | null;
 }
 
 export function snapshotGoalReplies(): GoalRepliesSnapshot {
@@ -466,8 +478,28 @@ export function snapshotGoalReplies(): GoalRepliesSnapshot {
   return {
     version: 1,
     savedAt: Date.now(),
-    replies: [...goalReplies.values()].map((reply) => ({ ...reply }))
+    replies: [...goalReplies.values()].map((reply) => ({ ...reply })),
+    transportPausedAt: goalReplyTransportPausedAt
   };
+}
+
+export async function pauseGoalReplyTransportNow(now = Date.now()): Promise<void> {
+  if (goalReplyTransportPausedAt !== null) return;
+  goalReplyTransportPausedAt = now;
+  await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+}
+
+export async function resumeGoalReplyTransportNow(now = Date.now()): Promise<void> {
+  const pausedAt = goalReplyTransportPausedAt;
+  if (pausedAt === null) return;
+  goalReplyTransportPausedAt = null;
+  for (const reply of goalReplies.values()) {
+    if (reply.state !== 'pending') continue;
+    const overlap = Math.max(0, now - Math.max(pausedAt, reply.acceptedBudgetAt));
+    reply.acceptedBudgetAt += overlap;
+    if (reply.listenUntil) reply.listenUntil += overlap;
+  }
+  await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
 }
 
 /** Crash-safe A→B move for the exact durable Goal reply debt owned by this session. */
@@ -501,7 +533,13 @@ export async function moveGoalReplyNow(
 
 export function restoreGoalReplies(snapshot: GoalRepliesSnapshot | null): void {
   goalReplies.clear();
+  goalReplyTransportPausedAt = null;
   if (!snapshot || snapshot.version !== 1 || !Array.isArray(snapshot.replies)) return;
+  const now = Date.now();
+  const persistedPauseAt = typeof snapshot.transportPausedAt === 'number' && Number.isFinite(snapshot.transportPausedAt)
+    ? snapshot.transportPausedAt
+    : null;
+  goalReplyTransportPausedAt = persistedPauseAt === null ? null : now;
   for (const raw of snapshot.replies) {
     if (
       !raw ||
@@ -516,6 +554,15 @@ export function restoreGoalReplies(snapshot: GoalRepliesSnapshot | null): void {
       raw.acceptedAt <= 0 ||
       (raw.state !== 'pending' && raw.state !== 'handled')
     ) continue;
+    let acceptedBudgetAt = Number.isSafeInteger(raw.acceptedBudgetAt) && raw.acceptedBudgetAt! > 0
+      ? Number(raw.acceptedBudgetAt)
+      : raw.acceptedAt;
+    let listenUntil = Number.isSafeInteger(raw.listenUntil) && raw.listenUntil! > 0 ? Number(raw.listenUntil) : 0;
+    if (raw.state === 'pending' && persistedPauseAt !== null) {
+      const overlap = Math.max(0, now - Math.max(persistedPauseAt, acceptedBudgetAt));
+      acceptedBudgetAt += overlap;
+      if (listenUntil > 0) listenUntil += overlap;
+    }
     goalReplies.set(raw.conversationId, {
       conversationId: raw.conversationId,
       sessionId: String(raw.sessionId).slice(0, 200),
@@ -523,11 +570,12 @@ export function restoreGoalReplies(snapshot: GoalRepliesSnapshot | null): void {
       turnId: String(raw.turnId).slice(0, 200),
       ...(typeof raw.silenceSourceTurnId === 'string' && raw.silenceSourceTurnId ?
         { silenceSourceTurnId: raw.silenceSourceTurnId.slice(0, 200) } : {}),
-      ...(Number.isSafeInteger(raw.listenUntil) && raw.listenUntil! > 0 ? { listenUntil: raw.listenUntil } : {}),
+      ...(listenUntil > 0 ? { listenUntil } : {}),
       ...(raw.silencePro === true ? { silencePro: true } : {}),
       ...(raw.explicitActivation === true ? { explicitActivation: true } : {}),
       eventSeq: raw.eventSeq,
       acceptedAt: raw.acceptedAt,
+      acceptedBudgetAt,
       state: raw.state
     });
   }
@@ -570,7 +618,7 @@ export function goalPendingReplyFor(
   // Expiry is read here as well as pruned on write, because the ledger is only pruned when
   // something writes to it. A chat reopened after the window must not be offered work the
   // next prune would have thrown away.
-  if (reply && Date.now() - reply.acceptedAt >= GOAL_REPLY_TTL_MS) return null;
+  if (reply && goalReplyBudgetNow() - reply.acceptedBudgetAt >= GOAL_REPLY_TTL_MS) return null;
   return reply?.state === 'pending'
     ? { replyId: reply.replyId, turnId: reply.turnId, eventSeq: reply.eventSeq, acceptedAt: reply.acceptedAt,
       ...(reply.silenceSourceTurnId ? { silenceSourceTurnId: reply.silenceSourceTurnId } : {}),
@@ -589,15 +637,17 @@ export function goalPendingReplyFor(
  */
 export function pendingGoalReplies(
   now = Date.now()
-): Array<{ conversationId: string; sessionId: string; replyId: string; acceptedAt: number }> {
-  const owed: Array<{ conversationId: string; sessionId: string; replyId: string; acceptedAt: number }> = [];
+): Array<{ conversationId: string; sessionId: string; replyId: string; acceptedAt: number; expiresAt: number }> {
+  const owed: Array<{ conversationId: string; sessionId: string; replyId: string; acceptedAt: number; expiresAt: number }> = [];
+  const budgetNow = goalReplyBudgetNow(now);
   for (const reply of goalReplies.values()) {
-    if (reply.state !== 'pending' || now - reply.acceptedAt >= GOAL_REPLY_TTL_MS) continue;
+    if (reply.state !== 'pending' || budgetNow - reply.acceptedBudgetAt >= GOAL_REPLY_TTL_MS) continue;
     owed.push({
       conversationId: reply.conversationId,
       sessionId: reply.sessionId,
       replyId: reply.replyId,
-      acceptedAt: reply.acceptedAt
+      acceptedAt: reply.acceptedAt,
+      expiresAt: reply.acceptedBudgetAt + GOAL_REPLY_TTL_MS
     });
   }
   return owed.sort((a, b) => b.acceptedAt - a.acceptedAt);
@@ -639,6 +689,8 @@ export async function acceptGoalReplyNow(input: {
     (goalSwitchFor(input.conversationId).mode !== 'loop' ||
       await automaticLoopHasMcpWork(input.sessionId, input.conversationId, input.silenceSourceTurnId ?? input.turnId));
   if (input.current && !input.current()) return;
+  const acceptedAt = provisionalUpgrade ? current!.acceptedAt : Date.now();
+  const acceptedBudgetAt = provisionalUpgrade ? current!.acceptedBudgetAt : acceptedAt;
   goalReplies.set(input.conversationId, {
     conversationId: input.conversationId,
     sessionId: input.sessionId,
@@ -651,7 +703,8 @@ export async function acceptGoalReplyNow(input: {
     // `/goal/draft` may have had to persist the local turn before Fiber exposed ChatGPT's
     // stable assistant id. The later id strengthens that same row; it must not re-evaluate
     // policy or reopen a decision the page already acknowledged in the meantime.
-    acceptedAt: provisionalUpgrade ? current!.acceptedAt : Date.now(),
+    acceptedAt,
+    acceptedBudgetAt,
     state: provisionalUpgrade ? current!.state : active ? 'pending' : 'handled'
   });
   try {
@@ -661,7 +714,10 @@ export async function acceptGoalReplyNow(input: {
     // added and the expired rows it pruned go back together, leaving the ledger exactly as the
     // decision found it.
     goalReplies.clear();
-    for (const reply of bounded) goalReplies.set(reply.conversationId, reply);
+    for (const reply of bounded) goalReplies.set(reply.conversationId, {
+      ...reply,
+      acceptedBudgetAt: reply.acceptedBudgetAt ?? reply.acceptedAt
+    });
     if (before) goalReplies.set(input.conversationId, before);
     else goalReplies.delete(input.conversationId);
     persistGoalRepliesSoon();
@@ -1357,7 +1413,10 @@ export async function setGoalReplyActiveNow(conversationId: string, active: bool
   before.state = active ? 'pending' : 'handled';
   // A deliberate On is a new pickup episode for the same stable final reply. It gets the
   // recovery schedule from now, not from when that answer happened under an Off switch.
-  if (active) before.acceptedAt = Math.max(Date.now(), previous.acceptedAt + 1);
+  if (active) {
+    before.acceptedAt = Math.max(Date.now(), previous.acceptedAt + 1);
+    before.acceptedBudgetAt = before.acceptedAt;
+  }
   if (active) before.explicitActivation = true;
   const acceptedAt = before.acceptedAt;
   try {
@@ -1423,6 +1482,7 @@ export function resetGoalStateForTests(): void {
   for (const draft of drafts.values()) draft.abort?.abort();
   drafts.clear();
   goalReplies.clear();
+  goalReplyTransportPausedAt = null;
   goalObjectives.clear();
   goalSwitches.clear();
   goalObjectiveWrites = Promise.resolve();
@@ -1512,14 +1572,45 @@ export function startGoalDraft(input: StartGoalDraftInput): GoalDraftView {
   return view(draft);
 }
 
+function parkGoalDraftForTransport(draft: GoalDraft): void {
+  if (drafts.get(draft.conversationId) !== draft || draft.acknowledged) return;
+  draft.stage = 'sending';
+  draft.error = 'transport_suspended';
+  draft.settledAt = 0;
+  draft.abort = null;
+  draft.work = null;
+  notifyGoalChange();
+}
+
 /** Starts provider work only after the bridge has durably committed this reserved turn. */
 export function beginGoalDraft(conversationId: string, token: string): boolean {
   const draft = drafts.get(conversationId);
   if (!draft || draft.token !== token || draft.acknowledged || draft.work) return false;
+  if (providerTransportUnavailable()) {
+    parkGoalDraftForTransport(draft);
+    return false;
+  }
+  draft.error = null;
   draft.work = run(draft).catch((err: Error) => {
+    if (providerTransportUnavailable()) {
+      parkGoalDraftForTransport(draft);
+      return;
+    }
     settle(draft, 'failed', `goal_failed: ${err.message}`);
   });
   return true;
+}
+
+/** Restarts only drafts that previously crossed the durable reply boundary then lost transport. */
+export function resumeTransportParkedGoalDrafts(): number {
+  if (providerTransportUnavailable()) return 0;
+  let resumed = 0;
+  for (const draft of drafts.values()) {
+    if (draft.stage !== 'sending' || draft.error !== 'transport_suspended' ||
+        draft.acknowledged || draft.work) continue;
+    if (beginGoalDraft(draft.conversationId, draft.token)) resumed += 1;
+  }
+  return resumed;
 }
 
 /** Releases a bridge reservation whose durable commit failed, before provider work began. */
@@ -1726,6 +1817,12 @@ async function requestDrivingDecision(
   return decision;
 }
 
+async function goalProviderDeadline(parent?: AbortSignal): Promise<ReturnType<typeof providerTransportDeadline>> {
+  parent?.throwIfAborted();
+  await waitForProviderTransport(parent);
+  return providerTransportDeadline(REQUEST_TIMEOUT_MS, parent);
+}
+
 async function run(draft: GoalDraft): Promise<void> {
   if (await astraFinishOnly(draft.sessionId, draft.conversationId)) return settle(draft, 'no-reply');
   if (draft.mode === 'loop' && !await loopReplyHasAuthority(draft.sessionId, draft.conversationId, draft.turnId)) return settle(draft, 'no-reply');
@@ -1753,8 +1850,12 @@ async function run(draft: GoalDraft): Promise<void> {
 
   const abort = new AbortController();
   draft.abort = abort;
-  const timer = setTimeout(() => abort.abort(), REQUEST_TIMEOUT_MS);
+  let deadline: ReturnType<typeof providerTransportDeadline> | null = null;
   try {
+    if (draft.backend !== 'templates') {
+      await waitForProviderTransport(abort.signal);
+      deadline = providerTransportDeadline(REQUEST_TIMEOUT_MS, abort.signal);
+    }
     const decision = draft.backend === 'templates' ? templateGoalDecision(messages.filter((message) => message.role === 'assistant').at(-1)?.content ?? '', Math.floor(Math.random() * 200), Math.floor(Math.random() * 200)) : await requestDrivingDecision({
       backend: draft.backend,
       endpoint,
@@ -1781,7 +1882,7 @@ async function run(draft: GoalDraft): Promise<void> {
           : draft.objective
             ? GOAL_OBJECTIVE_TRAILER
             : GOAL_SYSTEM_TRAILER,
-      signal: abort.signal,
+      signal: deadline?.signal ?? abort.signal,
       publish: (text) => {
         draft.stage = 'answering';
         if (drafts.get(draft.conversationId) === draft) { draft.text = text; notifyGoalChange(); }
@@ -1819,8 +1920,14 @@ async function run(draft: GoalDraft): Promise<void> {
     logInfo(`goal: drafted ${decision.reply.length} characters for ${draft.conversationId} with ${draft.model}`);
     settle(draft, 'ready');
   } catch (err) {
+    if (providerTransportUnavailable() && !abort.signal.aborted && drafts.get(draft.conversationId) === draft && !draft.acknowledged) {
+      parkGoalDraftForTransport(draft);
+      return;
+    }
     const detail = (err as Error).message;
-    const failure = abort.signal.aborted
+    const timedOut = deadline?.signal.aborted && deadline.signal.reason instanceof Error &&
+      deadline.signal.reason.message === 'provider_transport_timeout';
+    const failure = abort.signal.aborted || timedOut
       ? 'timeout_or_cancelled'
       : detail === 'reply_too_long' || detail === 'stream_record_too_long' || detail.startsWith('goal_browser_')
         ? detail
@@ -1828,7 +1935,7 @@ async function run(draft: GoalDraft): Promise<void> {
     logWarn(`goal: draft for ${draft.conversationId} failed — ${failure}`);
     settle(draft, 'failed', failure);
   } finally {
-    clearTimeout(timer);
+    deadline?.dispose();
     draft.abort = null;
   }
 }
@@ -1854,8 +1961,14 @@ async function run(draft: GoalDraft): Promise<void> {
  * then continue — as a Goal.
  */
 /** Finish asks the existing Loop driver for the next instruction; its caller owns delivery. */
-export async function draftFastFollowup(sessionId: string, signal: AbortSignal = AbortSignal.timeout(180000), preparedMessages?: ChatMessage[], publish?: GoalRequest['publish'], mode: GoalMode = 'loop'): Promise<string | null> {
+export async function draftFastFollowup(sessionId: string, signal?: AbortSignal, preparedMessages?: ChatMessage[], publish?: GoalRequest['publish'], mode: GoalMode = 'loop'): Promise<string | null> {
   const backend = goalBackendFor(mode);
+  if (signal?.aborted) {
+    if (signal.reason instanceof DOMException && signal.reason.name === 'TimeoutError') {
+      throw nativeGoalFailure('timeout_or_cancelled: Goal request timed out', backend);
+    }
+    signal.throwIfAborted();
+  }
   const settings = getConfig().goal;
   const endpoint = goalEndpoint();
   const key = backend === 'api' ? await goalProviderKey(endpoint.kind) : null;
@@ -1876,24 +1989,34 @@ export async function draftFastFollowup(sessionId: string, signal: AbortSignal =
   const messages = preparedMessages ?? await conversationMessages(sessionId, appInput);
   if (!objective && !messages.some(message => message.role === 'user')) throw new Error('No recorded user request is available for Goal');
   const prompt = mode === 'loop' ? settings.loopPrompt : objective ? settings.objectivePrompt : settings.prompt;
-  const decision = backend === 'templates'
-    ? templateGoalDecision(messages.filter(message => message.role === 'assistant').at(-1)?.content ?? '', Math.floor(Math.random() * 200), Math.floor(Math.random() * 200))
-    : await requestDrivingDecision({ sourceSessionId: sessionId, backend, endpoint, reasoning: settings.reasoning, key: key ?? '', model: settings.model, mode,
-    system: objective ? [prompt, goalObjectiveMessage(objective)] : [prompt],
-    messages,
-    trailer: mode === 'loop' ? GOAL_LOOP_TRAILER : objective ? GOAL_OBJECTIVE_TRAILER : GOAL_SYSTEM_TRAILER, signal, publish })
-      .catch(error => {
-        if (signal.aborted && signal.reason?.name === 'TimeoutError') throw nativeGoalFailure('timeout_or_cancelled: Goal request timed out', backend);
-        signal.throwIfAborted();
-        throw nativeGoalFailure(`request_failed: ${error instanceof Error ? error.message : error}`, backend);
-      });
-  if (decision.action === 'stop') {
-    if (mode === 'loop') throw new Error('loop_stop_refused');
-    return null;
+  let deadline: ReturnType<typeof providerTransportDeadline> | null = null;
+  try {
+    if (backend !== 'templates') deadline = await goalProviderDeadline(signal);
+    const decision = backend === 'templates'
+      ? templateGoalDecision(messages.filter(message => message.role === 'assistant').at(-1)?.content ?? '', Math.floor(Math.random() * 200), Math.floor(Math.random() * 200))
+      : await requestDrivingDecision({ sourceSessionId: sessionId, backend, endpoint, reasoning: settings.reasoning, key: key ?? '', model: settings.model, mode,
+        system: objective ? [prompt, goalObjectiveMessage(objective)] : [prompt],
+        messages,
+        trailer: mode === 'loop' ? GOAL_LOOP_TRAILER : objective ? GOAL_OBJECTIVE_TRAILER : GOAL_SYSTEM_TRAILER,
+        signal: deadline!.signal,
+        publish })
+        .catch(error => {
+          const timedOut = deadline?.signal.aborted && deadline.signal.reason instanceof Error &&
+            deadline.signal.reason.message === 'provider_transport_timeout';
+          if (timedOut) throw nativeGoalFailure('timeout_or_cancelled: Goal request timed out', backend);
+          signal?.throwIfAborted();
+          throw nativeGoalFailure(`request_failed: ${error instanceof Error ? error.message : error}`, backend);
+        });
+    if (decision.action === 'stop') {
+      if (mode === 'loop') throw new Error('loop_stop_refused');
+      return null;
+    }
+    if (decision.action !== 'continue') throw nativeGoalFailure('error' in decision ? decision.error : 'Goal did not return a usable follow-up', backend,
+      'retryAfterMs' in decision ? decision.retryAfterMs : undefined);
+    return decision.reply;
+  } finally {
+    deadline?.dispose();
   }
-  if (decision.action !== 'continue') throw nativeGoalFailure('error' in decision ? decision.error : 'Goal did not return a usable follow-up', backend,
-    'retryAfterMs' in decision ? decision.retryAfterMs : undefined);
-  return decision.reply;
 }
 
 /** Plans use the existing bounded Goal transport, but never its prose noise transform. */
@@ -1906,10 +2029,23 @@ export async function draftTaskPlan(prompt: string, backend: 'api' | 'chatgpt', 
   // Custom endpoints may be keyless; only OpenRouter fails here without one.
   if (backend === 'api' && !key && endpoint.kind === 'openrouter') throw new Error('Configure a Goal API key or choose ChatGPT');
   onProgress?.({ phase: 'generating', text: '' });
-  const result = await requestGoalDecision({ backend, endpoint, reasoning: settings.reasoning, lifetime: 'temporary-planner', key: key ?? '', model: settings.model, mode: 'goal', publish: text => onProgress?.({ phase: 'generating', text: planProgressText(text) }),
-    system: ['You are a task planner, not the executor. Produce 2 to 12 substantial workflow stages; prefer a complete implementation stage followed by a few meaningful verification passes. The executor receives the original user request and the ENTIRE workflow in its first message. Stage 1 must state the complete objective, all implementation requirements and constraints, and the end-to-end execution approach. Never restrict Stage 1 to discovery, planning, a skeleton, or a fraction of the product. If the user requests subagents, include their concrete assignments and early delegation in Stage 1 so they can work in parallel immediately. Later stages are verification and improvement checkpoints, not withheld implementation requirements: where relevant, exercise the actual app with computer use, inspect failures, repair underlying causes, rebuild or reinstall when authorized, and repeat the failed workflows. Include independent subagent code review when requested and a final check of the whole original request. Preserve the user\'s scope, authorization limits, platform, constraints and required evidence; do not invent unrelated work or claim installation/browser checks were performed. Return action continue; its reply must be a JSON string encoding {"stages":["complete implementation workflow", "verification workflow"]}. Keep the entire plan below 12000 characters. Later checkpoints are queued to the same conversation at Session finish, or after a completed turn when the user enables that delivery.'],
-    messages: [{ role: 'user', content: prompt.trim() }], trailer: 'Produce the staged plan now. Do not execute the task.', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]) : AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
-    .catch(error => { throw nativeGoalFailure(`request_failed: ${error instanceof Error ? error.message : error}`, backend); });
+  const deadline = await goalProviderDeadline(signal);
+  let result: Awaited<ReturnType<typeof requestGoalDecision>>;
+  try {
+    result = await requestGoalDecision({ backend, endpoint, reasoning: settings.reasoning, lifetime: 'temporary-planner', key: key ?? '', model: settings.model, mode: 'goal', publish: text => onProgress?.({ phase: 'generating', text: planProgressText(text) }),
+      system: ['You are a task planner, not the executor. Produce 2 to 12 substantial workflow stages; prefer a complete implementation stage followed by a few meaningful verification passes. The executor receives the original user request and the ENTIRE workflow in its first message. Stage 1 must state the complete objective, all implementation requirements and constraints, and the end-to-end execution approach. Never restrict Stage 1 to discovery, planning, a skeleton, or a fraction of the product. If the user requests subagents, include their concrete assignments and early delegation in Stage 1 so they can work in parallel immediately. Later stages are verification and improvement checkpoints, not withheld implementation requirements: where relevant, exercise the actual app with computer use, inspect failures, repair underlying causes, rebuild or reinstall when authorized, and repeat the failed workflows. Include independent subagent code review when requested and a final check of the whole original request. Preserve the user\'s scope, authorization limits, platform, constraints and required evidence; do not invent unrelated work or claim installation/browser checks were performed. Return action continue; its reply must be a JSON string encoding {"stages":["complete implementation workflow", "verification workflow"]}. Keep the entire plan below 12000 characters. Later checkpoints are queued to the same conversation at Session finish, or after a completed turn when the user enables that delivery.'],
+      messages: [{ role: 'user', content: prompt.trim() }],
+      trailer: 'Produce the staged plan now. Do not execute the task.',
+      signal: deadline.signal });
+  } catch (error) {
+    const timedOut = deadline.signal.aborted && deadline.signal.reason instanceof Error &&
+      deadline.signal.reason.message === 'provider_transport_timeout';
+    if (timedOut) throw nativeGoalFailure('timeout_or_cancelled: Goal request timed out', backend);
+    signal?.throwIfAborted();
+    throw nativeGoalFailure(`request_failed: ${error instanceof Error ? error.message : error}`, backend);
+  } finally {
+    deadline.dispose();
+  }
   signal?.throwIfAborted();
   if (result.action !== 'continue') throw nativeGoalFailure('error' in result ? result.error : 'No plan was generated', backend, 'retryAfterMs' in result ? result.retryAfterMs : undefined);
   let data: unknown;
@@ -1938,9 +2074,9 @@ export async function draftOpeningMessage(
   // Custom endpoints may be keyless; only OpenRouter fails here without one.
   if (backend === 'api' && !key && endpoint.kind === 'openrouter') return { error: 'no_api_key' };
   const model = backend === 'chatgpt' ? settings.helperModel ?? 'gpt-5.6-sol' : settings.model;
-  const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), REQUEST_TIMEOUT_MS);
+  let deadline: ReturnType<typeof providerTransportDeadline> | null = null;
   try {
+    deadline = await goalProviderDeadline(signal);
     const mode = named ?? goalDrivingMode();
     const decision = await requestDrivingDecision({
       backend,
@@ -1955,7 +2091,7 @@ export async function draftOpeningMessage(
       ],
       messages: [{ role: 'user', content: GOAL_OBJECTIVE_OPENING_TURN }],
       trailer: mode === 'loop' ? GOAL_LOOP_TRAILER : GOAL_OBJECTIVE_TRAILER,
-      signal: signal ? AbortSignal.any([signal, abort.signal]) : abort.signal,
+      signal: deadline.signal,
       publish: text => onProgress?.({ phase: 'generating', text: text.slice(-8000) })
     });
     if (decision.action === 'http') {
@@ -1972,10 +2108,13 @@ export async function draftOpeningMessage(
     return { reply: humanReply(decision.reply), model };
   } catch (err) {
     const detail = (err as Error).message;
-    const error = abort.signal.aborted ? 'timeout_or_cancelled' : `request_failed: ${detail}`;
+    const timedOut = deadline?.signal.aborted && deadline.signal.reason instanceof Error &&
+      deadline.signal.reason.message === 'provider_transport_timeout';
+    if (!timedOut) signal?.throwIfAborted();
+    const error = timedOut ? 'timeout_or_cancelled' : `request_failed: ${detail}`;
     return { error, retryable: retryableGoalFailure(error) };
   } finally {
-    clearTimeout(timer);
+    deadline?.dispose();
   }
 }
 
