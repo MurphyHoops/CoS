@@ -254,7 +254,11 @@ describe('cross-platform packaging targets', () => {
     expect(appImageGui).toContain('xvfb-run -a "$appimage"');
     expect(appImageGui).toContain('normal_smoke_root="$(mktemp -d)"');
     expect(appImageGui).toContain('fallback_smoke_root="$(mktemp -d)"');
-    expect(appImageGui).toContain('rm -rf "$fake_bin" "$normal_smoke_root" "$fallback_smoke_root"');
+    expect(appImageGui).toContain('cleanup_path_with_retries()');
+    expect(appImageGui).toContain('rm -rf "$target" 2>/dev/null || true');
+    expect(appImageGui).toContain('cleanup_path_with_retries "$fake_bin"');
+    expect(appImageGui).toContain('cleanup_path_with_retries "$normal_smoke_root"');
+    expect(appImageGui).toContain('cleanup_path_with_retries "$fallback_smoke_root"');
     expect(appImageGui).toContain('HOME="$smoke_root/home"');
     expect(appImageGui).toContain('XDG_CONFIG_HOME="$smoke_root/config"');
     expect(appImageGui).toContain('XDG_CACHE_HOME="$smoke_root/cache"');
