@@ -132,6 +132,7 @@ coordinator 不直接调用 `restoreGoal*`、`restoreSwarm` 等，也不跨文�
 - **long-run**：缺 ledger 时 UUID-shaped orphan message 继续判 stale；corrupt 时所有自动 wait/owed continuation 停放。
 - **Goal**：objectives/switches/replies 分账本保留 owner 边界；任一 authority ledger corrupt 时该 chat 的自动 Goal/Loop 不获得新发送权。
 - **session-input / bridge-commands**：任何已 claim / attempted / dispatched uncertainty 都维持 fail closed，不把 backup 旧状态当成 resend permission。
+- **request-correlations**：永久 request-id owner proof 若损坏，不得降级成 Unattributed；仅 primary missing 的 first-run/legacy 情形允许从独立 session tool history 重建。
 
 ## 8. 实施顺序
 
@@ -154,13 +155,14 @@ coordinator 不直接调用 `restoreGoal*`、`restoreSwarm` 等，也不跨文�
 - `goal*.test.ts`：三账本任一损坏不触发自动 draft/send；stale backup 不复活 handled reply。
 - `session-input*.test.ts`：corrupt outbox 不变成空队列；ambiguous receipt 不 resend。
 - `bridge.test.ts`：corrupt command ledger 不投递旧 command；session recovery 仅重建有独立 durable proof 的 recovery command。
+- `correlation.test.ts`：corrupt/schema-invalid owner registry 不用 history 覆盖；v3/v4 明确 migration 与 primary-missing history rebuild 保持兼容。
 
 完成标准不是“所有坏文件都自动修好”，而是：**没有任何损坏能被误解释成新的执行许可或不存在的任务债。**
 
 
 ## 10. 已实现的 owner 策略
 
-当前独立分支已经接入五组 authority owner：
+当前独立分支已经接入本项目识别出的全部关键 authority owner：
 
 - **blocked-chats / blocked-tools**：primary 必须整份 schema-valid；corrupt、I/O failure、
   schema-invalid、以及 primary missing + backup surviving 都进入全域工具 recovery pause。
@@ -185,6 +187,20 @@ coordinator 不直接调用 `restoreGoal*`、`restoreSwarm` 等，也不跨文�
   read projection；不会因为第三本未知而被清成 empty。backup 只作 evidence，valid primary 会刷新坏
   checkpoint；不从 stale backup 复活旧 objective、switch 或 handled/pending reply。Goal pause 只冻结
   Goal/Loop side effects，不把普通聊天或其它 MCP 工具全局封死。
+- **session-input**：现有 Zod row schema 继续作为兼容边界，并增加整账本 topology 校验（唯一 input id、
+  companion 引用与 session 一致）。primary corrupt/I/O/schema-invalid、以及 missing primary + surviving
+  backup 都进入 `input` pause；显式 `[]` 才是 authoritative empty。browser/tool claim、delivery receipt 与
+  queued input 不会因损坏被当成不存在，MCP handler 在 prior-input ACK 与工具执行前统一 fail closed。
+- **bridge-commands**：v1–v5 的明确 migration 保留，但 snapshot 先验证 command/receipt identity、phase、
+  lease evidence 与重复 durable id。corrupt/I/O/schema-invalid 进入 `browser-command` pause；已有 carrier
+  只保留 inert custody，不 deliver/redeem/ACK/TTL-retire。primary missing 是 owner-defined crash point：
+  stale backup 不复活旧 command，只允许 session/self-healing WAL 用独立 durable proof 重建同一 recovery
+  custody；安全空计划随后写成新的 canonical primary + checkpoint。
+- **request-correlations**：v5 permanent owner rows 整份校验；v3/v4 的 `{requestId,value,conflicted}`
+  wrapper 只保留明确合法 migration，其中 `value:null` sticky conflict tombstone 可安全遗忘。primary
+  corrupt/I/O/schema-invalid 时进入 `correlation` pause，绝不拿 session history 覆盖 forensic primary；
+  只有 primary missing 才允许用已记录的 exact request-id tool history 重建。MCP handler 在 owner proof
+  registry 未知时于任何本地 side effect 之前 fail closed。
 
 Long-Run 明确保留旧字段兼容：缺失 `sourceRequestId`、`providerBudgetAt`、
 `completionCheckClaimedAt`、`providerKey/providerData` 按既有保守语义归一化。
@@ -212,5 +228,10 @@ Agents recovery pause 采用同样的 fail-closed admission，但**不把纯读�
 恢复策略本身保留在 owner 边界（例如 `agents-recovery.ts`）；启动层只负责 wiring，coordinator 只维护
 incident/pause。后续 owner 不再采用“unknown → empty → 再用更多 guard 补洞”的模式。
 
-尚未接入 owner schema/pause 的关键账本剩余为 session-input 与 bridge-commands；
-后续按同一原则逐 owner 推进，不共享 mutation authority。
+最终 nullable-read 审计后，仍使用旧 `readDurable()` 的生产调用仅剩 rebuildable/cache 或保守失效
+catalog：`chat-models`、`usage-cache`、`plugin-refresh` 可直接重建；`projects` 损坏只会使 catalog 不可用，
+且所有实际路径仍受 approved roots 再验证；`plugins` 损坏恢复为空 records，结果是不连接、不暴露任何
+插件工具。它们都不会把 corruption 转换成新的 mutation authority，因此不升级为 recovery pause。
+
+至此 P2-E 的 authority-ledger 接入范围闭合；后续工作只应是验证、文档/CI closure，除非新的故障证据
+证明存在尚未建模的 authority owner。
