@@ -12,6 +12,7 @@
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { promises as fs } from 'node:fs';
 import { recordLoopMcpProof } from './goal-mcp-proof.js';
 import * as prompts from '../src/shared/goal.js';
 
@@ -105,6 +106,198 @@ beforeEach(async () => {
 
 afterEach(() => {
   globalThis.fetch = realFetch;
+  vi.restoreAllMocks();
+});
+
+it('publishes a Goal objective only after its durable generation commits', async () => {
+  const conversationId = 'objective-commit-order';
+  await goal.setGoalObjectiveNow(conversationId, 'old objective');
+  const realRename = fs.rename.bind(fs);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let blocked = false;
+  const rename = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+    if (!blocked && String(to).endsWith('goal-objectives.json')) {
+      blocked = true;
+      await gate;
+    }
+    return realRename(from, to);
+  });
+
+  const saving = goal.setGoalObjectiveNow(conversationId, 'new objective');
+  await vi.waitFor(() => expect(blocked).toBe(true));
+  expect(goal.goalObjectiveFor(conversationId)).toBe('old objective');
+  release();
+  await saving;
+  expect(goal.goalObjectiveFor(conversationId)).toBe('new objective');
+  rename.mockRestore();
+});
+
+it('publishes a per-chat Goal switch only after its durable generation commits', async () => {
+  const conversationId = 'switch-commit-order';
+  await goal.setGoalSwitchNow(conversationId, 'loop', true);
+  await goal.setGoalSwitchNow(conversationId, 'loop', false);
+  const realRename = fs.rename.bind(fs);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let blocked = false;
+  const rename = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+    if (!blocked && String(to).endsWith('goal-switches.json')) {
+      blocked = true;
+      await gate;
+    }
+    return realRename(from, to);
+  });
+
+  const saving = goal.setGoalSwitchNow(conversationId, 'loop', true);
+  await vi.waitFor(() => expect(blocked).toBe(true));
+  try {
+    expect(goal.goalSwitchFor(conversationId)).toMatchObject({ enabled: false, mode: 'loop', own: true });
+  } finally {
+    release();
+  }
+  await saving;
+  expect(goal.goalSwitchFor(conversationId)).toMatchObject({ enabled: true, mode: 'loop', own: true });
+  rename.mockRestore();
+});
+
+it('publishes accepted Goal reply debt only after its durable generation commits', async () => {
+  const conversationId = 'reply-accept-commit-order';
+  const session = await createSession({ conversationId });
+  const target = `${dir}/state/goal-replies.json`;
+  const realRename = fs.rename.bind(fs);
+  let entered!: () => void;
+  let release!: () => void;
+  const atBarrier = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let held = false;
+  const rename = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+    if (!held && String(to) === target) {
+      held = true;
+      entered();
+      await gate;
+    }
+    return realRename(from, to);
+  });
+
+  const accepting = goal.acceptGoalReplyNow({
+    conversationId, sessionId: session.id, replyId: 'stable-final', turnId: 'turn-final', eventSeq: 1, blocked: false
+  });
+  await atBarrier;
+  try {
+    expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
+  } finally {
+    release();
+  }
+  await accepting;
+  expect(goal.goalPendingReplyFor(conversationId)).toMatchObject({ replyId: 'stable-final', turnId: 'turn-final' });
+  rename.mockRestore();
+});
+
+it('keeps rejected Goal reply acceptance out of live and later durable state', async () => {
+  const { flushDurable, readDurable } = await import('../src/main/durable.js');
+  const conversationId = 'reply-accept-failure';
+  const session = await createSession({ conversationId });
+  const target = `${dir}/state/goal-replies.json`;
+  const realRename = fs.rename.bind(fs);
+  let failed = false;
+  const rename = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+    if (!failed && String(to) === target) {
+      failed = true;
+      throw new Error('reply ledger write failed');
+    }
+    return realRename(from, to);
+  });
+  await expect(goal.acceptGoalReplyNow({
+    conversationId, sessionId: session.id, replyId: 'rejected-final', turnId: 'turn-rejected', eventSeq: 1, blocked: false
+  })).rejects.toThrow('reply ledger write failed');
+  expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
+  rename.mockRestore();
+  await flushDurable();
+  const stored = await readDurable<{ replies: Array<{ conversationId: string }> }>(goal.GOAL_REPLIES_STATE);
+  expect(stored?.replies.some((reply) => reply.conversationId === conversationId)).toBe(false);
+});
+
+it('moves Goal reply debt to a replacement chat only after its durable generation commits', async () => {
+  const from = 'reply-move-source';
+  const to = 'reply-move-target';
+  const session = await createSession({ conversationId: from });
+  await goal.acceptGoalReplyNow({
+    conversationId: from, sessionId: session.id, replyId: 'move-final', turnId: 'move-turn', eventSeq: 1, blocked: false
+  });
+  const target = `${dir}/state/goal-replies.json`;
+  const realRename = fs.rename.bind(fs);
+  let entered!: () => void;
+  let release!: () => void;
+  const atBarrier = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let held = false;
+  const rename = vi.spyOn(fs, 'rename').mockImplementation(async (fromPath, toPath) => {
+    if (!held && String(toPath) === target) {
+      held = true;
+      entered();
+      await gate;
+    }
+    return realRename(fromPath, toPath);
+  });
+  const moving = goal.moveGoalReplyNow(from, to, session.id);
+  await atBarrier;
+  try {
+    expect(goal.goalPendingReplyFor(from)).toMatchObject({ replyId: 'move-final' });
+    expect(goal.goalPendingReplyFor(to)).toBeNull();
+  } finally {
+    release();
+  }
+  await expect(moving).resolves.toBe(true);
+  expect(goal.goalPendingReplyFor(from)).toBeNull();
+  expect(goal.goalPendingReplyFor(to)).toMatchObject({ replyId: 'move-final' });
+  rename.mockRestore();
+});
+
+it('serializes provider-pause durability behind an in-flight Goal reply acceptance', async () => {
+  const { readDurable } = await import('../src/main/durable.js');
+  const conversationId = 'reply-pause-serialized';
+  const session = await createSession({ conversationId });
+  const target = `${dir}/state/goal-replies.json`;
+  const realRename = fs.rename.bind(fs);
+  let entered!: () => void;
+  let release!: () => void;
+  const atBarrier = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let held = false;
+  const rename = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+    if (!held && String(to) === target) {
+      held = true;
+      entered();
+      await gate;
+    }
+    return realRename(from, to);
+  });
+
+  const accepting = goal.acceptGoalReplyNow({
+    conversationId,
+    sessionId: session.id,
+    replyId: 'accepted-before-pause',
+    turnId: 'turn-before-pause',
+    eventSeq: 1,
+    blocked: false,
+    handledOnly: true
+  });
+  await atBarrier;
+  let pauseSettled = false;
+  const pausing = goal.pauseGoalReplyTransportNow(123_456).finally(() => { pauseSettled = true; });
+  await Promise.resolve();
+  expect(pauseSettled).toBe(false);
+  release();
+  await accepting;
+  await pausing;
+  rename.mockRestore();
+
+  const stored = await readDurable<{ transportPausedAt?: number | null; replies: Array<{ conversationId: string; replyId: string }> }>(goal.GOAL_REPLIES_STATE);
+  expect(stored?.transportPausedAt).toBe(123_456);
+  expect(stored?.replies).toEqual(expect.arrayContaining([
+    expect.objectContaining({ conversationId, replyId: 'accepted-before-pause' })
+  ]));
 });
 
 it('persists Pro Loop delivery across toggles and restart without granting Goal browser continuation', async () => {

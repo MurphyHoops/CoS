@@ -760,7 +760,7 @@ describe('active agent tab discard projection', () => {
         expect(quiet.closableConversations).toEqual([]);
         expect(quiet.retiredConversations).toEqual([]);
         expect(quiet.reusableConversations).toEqual(chats.slice(0, 2));
-        setChatBlocked(chats[2]!, true);
+        await setChatBlocked(chats[2]!, true);
         const newlyBlocked = (await request('POST', '/status', { body: { openConversations: chats } })).body;
         expect(newlyBlocked.blockedConversations).toContain(chats[2]);
         expect(newlyBlocked.closableConversations).not.toContain(chats[2]);
@@ -768,7 +768,7 @@ describe('active agent tab discard projection', () => {
         noteAgentAlive(chats[2], 'page');
         const blockedIdle = (await request('POST', '/status', { body: { openConversations: chats } })).body;
         expect(blockedIdle.closableConversations).toContain(chats[2]);
-        setChatBlocked(chats[2]!, false);
+        await setChatBlocked(chats[2]!, false);
         clock.mockReturnValue(now + 301_000);
         noteAgentAlive(chats[0], 'page');
         const expired = (await request('POST', '/status', { body: { openConversations: chats } })).body;
@@ -2009,7 +2009,7 @@ describe('automatic compaction', () => {
     const conversationId = 'b10cced0-0000-4000-8000-00000000ac05';
     await request('POST', '/goal/objective', { body: { conversationId, text: 'finish the level editor' } });
     await request('POST', '/settings', { body: { conversationId, loop: true } });
-    setChatBlocked(conversationId, true);
+    await setChatBlocked(conversationId, true);
     try {
       await withThreshold(10_000, async () => {
         await request('POST', '/events', {
@@ -2050,7 +2050,7 @@ describe('automatic compaction', () => {
       });
 
       // Released: the stored goal is still there and the loop is back on the chat's own terms.
-      setChatBlocked(conversationId, false);
+      await setChatBlocked(conversationId, false);
       const released = await request('GET', `/activity?conversationId=${conversationId}`);
       expect(released.body.goal).toMatchObject({ blocked: '', objective: 'finish the level editor' });
       expect(released.body.context).toMatchObject({ auto: true });
@@ -4865,8 +4865,8 @@ describe('delivering a bootstrap', () => {
     expect(stateOf('worker-1')).toBe('active');
     expect(stateOf('worker-2')).toBe('detached');
     try {
-      setChatBlocked('blocked-attached-worker', true);
-      setChatBlocked('blocked-detached-worker', true);
+      await setChatBlocked('blocked-attached-worker', true);
+      await setChatBlocked('blocked-detached-worker', true);
       // Straight away: no grant to expire, no detached silence to wait out.
       await sweepStaleSwarm(Date.now());
       const log = getLog().map((entry) => entry.message);
@@ -7802,7 +7802,7 @@ describe('unattributed activity recovery', () => {
     try {
       await pair();
       await events(OTHER, [openTurn('turn-blocked')]);
-      setChatBlocked(OTHER, true);
+      await setChatBlocked(OTHER, true);
 
       await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS);
       await sweepStaleSwarm(Date.now());
@@ -7836,7 +7836,7 @@ describe('unattributed activity recovery', () => {
         recoverable: true
       }
     ]);
-    setChatBlocked(OTHER, true);
+    await setChatBlocked(OTHER, true);
     try {
       expect(await maintenance()).toBeNull();
       expect(reopened(OTHER)).toEqual([]);
@@ -8700,12 +8700,12 @@ describe('unattributed activity recovery', () => {
       const sessionId = (await request('GET', `/activity?conversationId=${timingChat}`)).body.sessionId;
       const { sessionActivityExpiresAt, stopSessionTurn } = await import('../src/main/bridge.js');
       if (fence === 'stop') await stopSessionTurn(sessionId, 'pro-stopped');
-      else setChatBlocked(timingChat, true);
+      else await setChatBlocked(timingChat, true);
       await events(timingChat, [endTurn('pro-stopped', 'stopped')]);
       await vi.advanceTimersByTimeAsync(1_000);
       await attributed(timingChat, false, Date.now());
       expect(sessionActivityExpiresAt((await getSession(sessionId))!)).toBeNull();
-    } finally { setChatBlocked(timingChat, false); vi.useRealTimers(); }
+    } finally { await setChatBlocked(timingChat, false); vi.useRealTimers(); }
   });
 
   it('retires an old synthetic Pro obligation before later model changes can resurrect it', async () => {

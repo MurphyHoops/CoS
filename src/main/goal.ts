@@ -426,6 +426,12 @@ interface GoalReplyObligation {
 
 const goalReplies = new Map<string, GoalReplyObligation>();
 let goalReplyTransportPausedAt: number | null = null;
+let goalReplyWrites: Promise<unknown> = Promise.resolve();
+function serialGoalReply<T>(work: () => Promise<T>): Promise<T> {
+  const result = goalReplyWrites.then(work, work);
+  goalReplyWrites = result.catch(() => undefined);
+  return result;
+}
 
 function goalReplyBudgetNow(now = Date.now()): number {
   return goalReplyTransportPausedAt === null ? now : Math.min(now, goalReplyTransportPausedAt);
@@ -447,18 +453,19 @@ function goalReplyBudgetNow(now = Date.now()): number {
 const GOAL_REPLY_TTL_MS = 12 * 60 * 60_000;
 const MAX_GOAL_REPLIES = 200;
 
-/** Retires expired pickups and caps the stable-final ledger to its newest conversations. */
-function boundGoalReplies(now: number): void {
-  for (const reply of goalReplies.values()) {
+/** Retires expired pickups and caps one candidate ledger to its newest conversations. */
+function boundGoalReplyMap(target: Map<string, GoalReplyObligation>, now: number): void {
+  const budgetNow = goalReplyBudgetNow(now);
+  for (const reply of target.values()) {
     // Expiry revokes automatic pickup authority; it does not erase the exact final assistant
     // identity. A later deliberate On may re-arm that tombstone, while leaving it handled here
     // prevents a stale page or watchdog from collecting it on its own.
-    if (reply.state === 'pending' && goalReplyBudgetNow(now) - reply.acceptedBudgetAt >= GOAL_REPLY_TTL_MS) reply.state = 'handled';
+    if (reply.state === 'pending' && budgetNow - reply.acceptedBudgetAt >= GOAL_REPLY_TTL_MS) reply.state = 'handled';
   }
-  if (goalReplies.size <= MAX_GOAL_REPLIES) return;
-  const oldestFirst = [...goalReplies.values()].sort((a, b) => a.acceptedAt - b.acceptedAt);
-  for (const reply of oldestFirst.slice(0, goalReplies.size - MAX_GOAL_REPLIES)) {
-    goalReplies.delete(reply.conversationId);
+  if (target.size <= MAX_GOAL_REPLIES) return;
+  const oldestFirst = [...target.values()].sort((a, b) => a.acceptedAt - b.acceptedAt);
+  for (const reply of oldestFirst.slice(0, target.size - MAX_GOAL_REPLIES)) {
+    target.delete(reply.conversationId);
   }
 }
 export const GOAL_REPLIES_STATE = 'goal-replies';
@@ -473,33 +480,67 @@ export interface GoalRepliesSnapshot {
   transportPausedAt?: number | null;
 }
 
-export function snapshotGoalReplies(): GoalRepliesSnapshot {
-  boundGoalReplies(Date.now());
+function snapshotGoalRepliesFrom(
+  source: ReadonlyMap<string, GoalReplyObligation>,
+  transportPausedAt: number | null = goalReplyTransportPausedAt
+): GoalRepliesSnapshot {
   return {
     version: 1,
     savedAt: Date.now(),
-    replies: [...goalReplies.values()].map((reply) => ({ ...reply })),
-    transportPausedAt: goalReplyTransportPausedAt
+    replies: [...source.values()].map((reply) => ({ ...reply })),
+    transportPausedAt
   };
 }
 
+export function snapshotGoalReplies(): GoalRepliesSnapshot {
+  boundGoalReplyMap(goalReplies, Date.now());
+  return snapshotGoalRepliesFrom(goalReplies);
+}
+
+function candidateGoalReplies(): Map<string, GoalReplyObligation> {
+  return new Map([...goalReplies].map(([conversationId, reply]) => [conversationId, { ...reply }]));
+}
+
+function publishGoalReplies(next: ReadonlyMap<string, GoalReplyObligation>): void {
+  goalReplies.clear();
+  for (const [conversationId, reply] of next) goalReplies.set(conversationId, reply);
+}
+
 export async function pauseGoalReplyTransportNow(now = Date.now()): Promise<void> {
-  if (goalReplyTransportPausedAt !== null) return;
-  goalReplyTransportPausedAt = now;
-  await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+  await serialGoalReply(async () => {
+    if (goalReplyTransportPausedAt !== null) return;
+    // Pausing is a revocation of timeout budget. Publish the conservative state immediately,
+    // then keep that same snapshot queued if persistence fails.
+    goalReplyTransportPausedAt = now;
+    try {
+      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+    } catch (error) {
+      persistGoalRepliesSoon();
+      throw error;
+    }
+  });
 }
 
 export async function resumeGoalReplyTransportNow(now = Date.now()): Promise<void> {
-  const pausedAt = goalReplyTransportPausedAt;
-  if (pausedAt === null) return;
-  goalReplyTransportPausedAt = null;
-  for (const reply of goalReplies.values()) {
-    if (reply.state !== 'pending') continue;
-    const overlap = Math.max(0, now - Math.max(pausedAt, reply.acceptedBudgetAt));
-    reply.acceptedBudgetAt += overlap;
-    if (reply.listenUntil) reply.listenUntil += overlap;
-  }
-  await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+  await serialGoalReply(async () => {
+    const pausedAt = goalReplyTransportPausedAt;
+    if (pausedAt === null) return;
+    const candidate = candidateGoalReplies();
+    for (const reply of candidate.values()) {
+      if (reply.state !== 'pending') continue;
+      const overlap = Math.max(0, now - Math.max(pausedAt, reply.acceptedBudgetAt));
+      reply.acceptedBudgetAt += overlap;
+      if (reply.listenUntil) reply.listenUntil += overlap;
+    }
+    try {
+      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate, null));
+      publishGoalReplies(candidate);
+      goalReplyTransportPausedAt = null;
+    } catch (error) {
+      persistGoalRepliesSoon();
+      throw error;
+    }
+  });
 }
 
 /** Crash-safe A→B move for the exact durable Goal reply debt owned by this session. */
@@ -509,26 +550,26 @@ export async function moveGoalReplyNow(
   sessionId: string
 ): Promise<boolean> {
   if (!fromConversationId || !toConversationId || fromConversationId === toConversationId || !sessionId) return false;
-  const source = goalReplies.get(fromConversationId);
-  if (!source) {
-    const already = goalReplies.get(toConversationId);
-    return !already || already.sessionId === sessionId;
-  }
-  if (source.sessionId !== sessionId) return false;
-  const beforeTarget = goalReplies.get(toConversationId);
-  const moved: GoalReplyObligation = { ...source, conversationId: toConversationId };
-  goalReplies.delete(fromConversationId);
-  goalReplies.set(toConversationId, moved);
-  try {
-    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
-    return true;
-  } catch (error) {
-    goalReplies.delete(toConversationId);
-    goalReplies.set(fromConversationId, source);
-    if (beforeTarget) goalReplies.set(toConversationId, beforeTarget);
-    persistGoalRepliesSoon();
-    throw error;
-  }
+  return serialGoalReply(async () => {
+    const source = goalReplies.get(fromConversationId);
+    if (!source) {
+      const already = goalReplies.get(toConversationId);
+      return !already || already.sessionId === sessionId;
+    }
+    if (source.sessionId !== sessionId) return false;
+    const candidate = candidateGoalReplies();
+    candidate.delete(fromConversationId);
+    candidate.set(toConversationId, { ...source, conversationId: toConversationId });
+    boundGoalReplyMap(candidate, Date.now());
+    try {
+      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate));
+      publishGoalReplies(candidate);
+      return true;
+    } catch (error) {
+      persistGoalRepliesSoon();
+      throw error;
+    }
+  });
 }
 
 export function restoreGoalReplies(snapshot: GoalRepliesSnapshot | null): void {
@@ -579,7 +620,7 @@ export function restoreGoalReplies(snapshot: GoalRepliesSnapshot | null): void {
       state: raw.state
     });
   }
-  boundGoalReplies(Date.now());
+  boundGoalReplyMap(goalReplies, Date.now());
 }
 
 function persistGoalRepliesSoon(): void {
@@ -628,6 +669,17 @@ export function goalPendingReplyFor(
 }
 
 /**
+ * Whether this chat still has a reply-ledger row, pending or tombstoned.
+ *
+ * Recovery uses the broader question rather than {@link goalPendingReplyFor}: after a failed
+ * durable retirement the live row is already `handled`, but retry still owes the exact ledger
+ * barrier before an old source chat can be declared fully converged.
+ */
+export function goalReplyRecordedFor(conversationId: string): boolean {
+  return goalReplies.has(conversationId);
+}
+
+/**
  * Every chat that still owes one Goal decision, newest acceptance first.
  *
  * `goalPendingReplyFor` answers for a page that has come to ask. This answers for the app,
@@ -653,8 +705,7 @@ export function pendingGoalReplies(
   return owed.sort((a, b) => b.acceptedAt - a.acceptedAt);
 }
 
-/** Freezes Goal eligibility at the durable recorder boundary. */
-export async function acceptGoalReplyNow(input: {
+type AcceptGoalReplyInput = {
   silenceSourceTurnId?: string;
   silencePro?: boolean;
   listenUntil?: number;
@@ -667,69 +718,70 @@ export async function acceptGoalReplyNow(input: {
   /** Retain proved exhausted silence while Off without creating active debt. */
   handledOnly?: true;
   current?: () => boolean;
-}): Promise<void> {
-  if (!input.handledOnly && await astraFinishOnly(input.sessionId, input.conversationId)) return;
-  if (input.silenceSourceTurnId &&
-      !await turnHasMcpCall(input.sessionId, input.conversationId, input.silenceSourceTurnId)) return;
-  const current = goalReplies.get(input.conversationId);
-  if (current?.replyId === input.replyId || (current && current.eventSeq > input.eventSeq)) return;
-  const provisionalUpgrade = Boolean(
-    current &&
-      current.eventSeq === 0 &&
-      current.turnId === input.turnId &&
-      current.replyId === `turn:${input.turnId}`.slice(0, 200)
-  );
-  const before = current ? { ...current } : null;
-  const bounded = snapshotGoalReplies().replies;
-  const active =
-    !input.handledOnly && !input.blocked &&
-    getConfig().sessions.record &&
-    goalArmedFor(input.conversationId) &&
-    await goalKeyPresent(goalSwitchFor(input.conversationId).mode) &&
-    (goalSwitchFor(input.conversationId).mode !== 'loop' ||
-      await automaticLoopHasMcpWork(input.sessionId, input.conversationId, input.silenceSourceTurnId ?? input.turnId));
-  if (input.current && !input.current()) return;
-  const acceptedAt = provisionalUpgrade ? current!.acceptedAt : Date.now();
-  const acceptedBudgetAt = provisionalUpgrade ? current!.acceptedBudgetAt : acceptedAt;
-  goalReplies.set(input.conversationId, {
-    conversationId: input.conversationId,
-    sessionId: input.sessionId,
-    replyId: input.replyId.slice(0, 200),
-    turnId: input.turnId.slice(0, 200),
-    ...(input.silenceSourceTurnId ? { silenceSourceTurnId: input.silenceSourceTurnId.slice(0, 200) } : {}),
-    ...(input.silencePro ? { silencePro: true } : {}),
-    ...(input.listenUntil ? { listenUntil: input.listenUntil } : {}),
-    eventSeq: input.eventSeq,
-    // `/goal/draft` may have had to persist the local turn before Fiber exposed ChatGPT's
-    // stable assistant id. The later id strengthens that same row; it must not re-evaluate
-    // policy or reopen a decision the page already acknowledged in the meantime.
-    acceptedAt,
-    acceptedBudgetAt,
-    state: provisionalUpgrade ? current!.state : active ? 'pending' : 'handled'
-  });
-  try {
-    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
-  } catch (error) {
-    // The rejected write is one whole revision, so the rollback is too: the row this accept
-    // added and the expired rows it pruned go back together, leaving the ledger exactly as the
-    // decision found it.
-    goalReplies.clear();
-    for (const reply of bounded) goalReplies.set(reply.conversationId, {
-      ...reply,
-      acceptedBudgetAt: reply.acceptedBudgetAt ?? reply.acceptedAt
+};
+
+async function acceptGoalReplyLocked(input: AcceptGoalReplyInput): Promise<void> {
+    if (!input.handledOnly && await astraFinishOnly(input.sessionId, input.conversationId)) return;
+    if (input.silenceSourceTurnId &&
+        !await turnHasMcpCall(input.sessionId, input.conversationId, input.silenceSourceTurnId)) return;
+    const current = goalReplies.get(input.conversationId);
+    if (current?.replyId === input.replyId || (current && current.eventSeq > input.eventSeq)) return;
+    const provisionalUpgrade = Boolean(
+      current &&
+        current.eventSeq === 0 &&
+        current.turnId === input.turnId &&
+        current.replyId === `turn:${input.turnId}`.slice(0, 200)
+    );
+    const active =
+      !input.handledOnly && !input.blocked &&
+      getConfig().sessions.record &&
+      goalArmedFor(input.conversationId) &&
+      await goalKeyPresent(goalSwitchFor(input.conversationId).mode) &&
+      (goalSwitchFor(input.conversationId).mode !== 'loop' ||
+        await automaticLoopHasMcpWork(input.sessionId, input.conversationId, input.silenceSourceTurnId ?? input.turnId));
+    if (input.current && !input.current()) return;
+    const acceptedAt = provisionalUpgrade ? current!.acceptedAt : Date.now();
+    const acceptedBudgetAt = provisionalUpgrade ? current!.acceptedBudgetAt : acceptedAt;
+    const candidate = candidateGoalReplies();
+    boundGoalReplyMap(candidate, Date.now());
+    candidate.set(input.conversationId, {
+      conversationId: input.conversationId,
+      sessionId: input.sessionId,
+      replyId: input.replyId.slice(0, 200),
+      turnId: input.turnId.slice(0, 200),
+      ...(input.silenceSourceTurnId ? { silenceSourceTurnId: input.silenceSourceTurnId.slice(0, 200) } : {}),
+      ...(input.silencePro ? { silencePro: true } : {}),
+      ...(input.listenUntil ? { listenUntil: input.listenUntil } : {}),
+      eventSeq: input.eventSeq,
+      // `/goal/draft` may have had to persist the local turn before Fiber exposed ChatGPT's
+      // stable assistant id. The later id strengthens that same row; it must not re-evaluate
+      // policy or reopen a decision the page already acknowledged in the meantime.
+      acceptedAt,
+      acceptedBudgetAt,
+      state: provisionalUpgrade ? current!.state : active ? 'pending' : 'handled'
     });
-    if (before) goalReplies.set(input.conversationId, before);
-    else goalReplies.delete(input.conversationId);
-    persistGoalRepliesSoon();
-    throw error;
-  }
+    boundGoalReplyMap(candidate, Date.now());
+    try {
+      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate));
+      publishGoalReplies(candidate);
+    } catch (error) {
+      // A failed generation may retry inside durable.ts. Supersede it with the still-published
+      // ledger so a rejected acceptance cannot appear after the route has reported failure.
+      persistGoalRepliesSoon();
+      throw error;
+    }
 }
 
-function handleGoalReply(conversationId: string, turnId?: string): void {
+/** Freezes Goal eligibility at the durable recorder boundary. */
+export async function acceptGoalReplyNow(input: AcceptGoalReplyInput): Promise<void> {
+  return serialGoalReply(() => acceptGoalReplyLocked(input));
+}
+
+function handleGoalReply(conversationId: string, turnId?: string, persist = true): void {
   const reply = goalReplies.get(conversationId);
   if (!reply || reply.state !== 'pending' || (turnId && reply.turnId !== turnId)) return;
   reply.state = 'handled';
-  persistGoalRepliesSoon();
+  if (persist) persistGoalRepliesSoon();
 }
 
 /** A queued user message spends the same completed/silence source as Goal.
@@ -795,12 +847,21 @@ function serialGoalObjective<T>(work: () => Promise<T>): Promise<T> {
   return result;
 }
 
-export function snapshotGoalObjectives(): GoalObjectivesSnapshot {
+function snapshotGoalObjectivesFrom(source: ReadonlyMap<string, string>): GoalObjectivesSnapshot {
   return {
     version: 1,
     savedAt: Date.now(),
-    objectives: [...goalObjectives.entries()].map(([conversationId, objective]) => ({ conversationId, objective }))
+    objectives: [...source.entries()].map(([conversationId, objective]) => ({ conversationId, objective }))
   };
+}
+
+export function snapshotGoalObjectives(): GoalObjectivesSnapshot {
+  return snapshotGoalObjectivesFrom(goalObjectives);
+}
+
+function publishGoalObjectives(next: ReadonlyMap<string, string>): void {
+  goalObjectives.clear();
+  for (const [conversationId, objective] of next) goalObjectives.set(conversationId, objective);
 }
 
 function persistGoalObjectives(): void {
@@ -843,22 +904,23 @@ export function setGoalObjective(conversationId: string, text: string): string {
  *
  * `/goal/objective` tells the page the value was saved, so returning before the ordinary
  * 300 ms durable debounce leaves a real crash window where a successfully acknowledged goal
- * disappears on restart. Stage the in-memory value, make that exact snapshot durable, and only
- * then let the bridge publish success. If the write fails, restore the previous live value and
- * supersede durable.ts's retained failed generation with the still-authoritative snapshot.
+ * disappears on restart. Build an unpublished candidate, make that exact snapshot durable, and
+ * only then publish it to synchronous readers. If the write fails, the previous live value never
+ * changed; supersede durable.ts's retained failed generation with that authoritative snapshot.
  */
 export async function setGoalObjectiveNow(conversationId: string, text: string): Promise<string> {
   return serialGoalObjective(async () => {
-    const before = goalObjectives.get(conversationId);
     const goal = text.trim();
-    goalObjectives.delete(conversationId);
-    if (goal) goalObjectives.set(conversationId, goal);
+    const candidate = new Map(goalObjectives);
+    candidate.delete(conversationId);
+    if (goal) candidate.set(conversationId, goal);
     try {
-      await writeDurableNow(GOAL_OBJECTIVES_STATE, snapshotGoalObjectives());
+      await writeDurableNow(GOAL_OBJECTIVES_STATE, snapshotGoalObjectivesFrom(candidate));
+      publishGoalObjectives(candidate);
       return goal;
     } catch (error) {
-      goalObjectives.delete(conversationId);
-      if (before) goalObjectives.set(conversationId, before);
+      // writeDurableNow retains a failed generation for retry. Supersede it with the
+      // still-authoritative published snapshot so a rejected save cannot land later.
       writeDurableSoon(GOAL_OBJECTIVES_STATE, snapshotGoalObjectives());
       throw error;
     }
@@ -872,16 +934,57 @@ export async function moveGoalObjectiveNow(fromConversationId: string, toConvers
   return serialGoalObjective(async () => {
     const source = goalObjectives.get(fromConversationId);
     if (!source) return true;
-    const beforeTarget = goalObjectives.get(toConversationId);
-    goalObjectives.delete(fromConversationId);
-    goalObjectives.set(toConversationId, source);
+    const candidate = new Map(goalObjectives);
+    candidate.delete(fromConversationId);
+    candidate.set(toConversationId, source);
     try {
-      await writeDurableNow(GOAL_OBJECTIVES_STATE, snapshotGoalObjectives());
+      await writeDurableNow(GOAL_OBJECTIVES_STATE, snapshotGoalObjectivesFrom(candidate));
+      publishGoalObjectives(candidate);
       return true;
     } catch (error) {
-      goalObjectives.delete(toConversationId);
-      goalObjectives.set(fromConversationId, source);
-      if (beforeTarget) goalObjectives.set(toConversationId, beforeTarget);
+      writeDurableSoon(GOAL_OBJECTIVES_STATE, snapshotGoalObjectives());
+      throw error;
+    }
+  });
+}
+
+/** Crash-safe clear used by recovery/rebind paths that already own a durable transaction. */
+export async function clearGoalObjectiveNow(conversationId: string): Promise<boolean> {
+  return serialGoalObjective(async () => {
+    if (!goalObjectives.has(conversationId)) return false;
+    const candidate = new Map(goalObjectives);
+    candidate.delete(conversationId);
+    try {
+      await writeDurableNow(GOAL_OBJECTIVES_STATE, snapshotGoalObjectivesFrom(candidate));
+      publishGoalObjectives(candidate);
+      return true;
+    } catch (error) {
+      writeDurableSoon(GOAL_OBJECTIVES_STATE, snapshotGoalObjectives());
+      throw error;
+    }
+  });
+}
+
+/**
+ * Durable legacy-resume repair. A target value learned after the old broken handoff wins; in
+ * that case recovery only retires the stale source projection instead of overwriting B.
+ */
+export async function repairGoalObjectiveProjectionNow(
+  fromConversationId: string,
+  toConversationId: string
+): Promise<boolean> {
+  if (!fromConversationId || !toConversationId || fromConversationId === toConversationId) return false;
+  return serialGoalObjective(async () => {
+    const source = goalObjectives.get(fromConversationId);
+    if (!source) return false;
+    const candidate = new Map(goalObjectives);
+    candidate.delete(fromConversationId);
+    if (!candidate.has(toConversationId)) candidate.set(toConversationId, source);
+    try {
+      await writeDurableNow(GOAL_OBJECTIVES_STATE, snapshotGoalObjectivesFrom(candidate));
+      publishGoalObjectives(candidate);
+      return true;
+    } catch (error) {
       writeDurableSoon(GOAL_OBJECTIVES_STATE, snapshotGoalObjectives());
       throw error;
     }
@@ -968,21 +1071,30 @@ function serialGoalSwitch<T>(work: () => Promise<T>): Promise<T> {
  */
 const MAX_GOAL_SWITCHES = 400;
 
-function boundGoalSwitches(): void {
-  if (goalSwitches.size <= MAX_GOAL_SWITCHES) return;
-  const oldestFirst = [...goalSwitches.entries()].filter(([, row]) => row.role !== 'decision').sort((a, b) => a[1].at - b[1].at);
-  for (const [conversationId] of oldestFirst.slice(0, goalSwitches.size - MAX_GOAL_SWITCHES)) {
-    goalSwitches.delete(conversationId);
+function boundGoalSwitchMap(target: Map<string, GoalSwitchRow>): void {
+  if (target.size <= MAX_GOAL_SWITCHES) return;
+  const oldestFirst = [...target.entries()].filter(([, row]) => row.role !== 'decision').sort((a, b) => a[1].at - b[1].at);
+  for (const [conversationId] of oldestFirst.slice(0, target.size - MAX_GOAL_SWITCHES)) {
+    target.delete(conversationId);
   }
 }
 
-export function snapshotGoalSwitches(): GoalSwitchesSnapshot {
-  boundGoalSwitches();
+function snapshotGoalSwitchesFrom(source: ReadonlyMap<string, GoalSwitchRow>): GoalSwitchesSnapshot {
   return {
     version: 1,
     savedAt: Date.now(),
-    switches: [...goalSwitches.entries()].map(([conversationId, row]) => ({ conversationId, ...row }))
+    switches: [...source.entries()].map(([conversationId, row]) => ({ conversationId, ...row }))
   };
+}
+
+export function snapshotGoalSwitches(): GoalSwitchesSnapshot {
+  boundGoalSwitchMap(goalSwitches);
+  return snapshotGoalSwitchesFrom(goalSwitches);
+}
+
+function publishGoalSwitches(next: ReadonlyMap<string, GoalSwitchRow>): void {
+  goalSwitches.clear();
+  for (const [conversationId, row] of next) goalSwitches.set(conversationId, row);
 }
 
 export function restoreGoalSwitches(snapshot: GoalSwitchesSnapshot | null): void {
@@ -1000,7 +1112,7 @@ export function restoreGoalSwitches(snapshot: GoalSwitchesSnapshot | null): void
       ...(raw.afterTurn === true && raw.role !== 'decision' ? { afterTurn: true } : {}),
       ...(raw.role === 'decision' ? { role: 'decision' as const, sourceSessionId, context } : {}) });
   }
-  boundGoalSwitches();
+  boundGoalSwitchMap(goalSwitches);
 }
 
 function persistGoalSwitches(): void {
@@ -1039,21 +1151,14 @@ export function registerGoalDecisionChat(conversationId: string, sourceSessionId
     if (before?.role !== 'decision' && [...goalSwitches.values()].filter(row => row.role === 'decision').length >= MAX_GOAL_SWITCHES) {
       throw new Error('goal_helper_capacity');
     }
-    const previous = new Map(goalSwitches);
     const row: GoalSwitchRow = { enabled: false, mode: before?.mode ?? 'goal', at: Date.now(), role: 'decision', sourceSessionId };
-    goalSwitches.set(conversationId, row);
-    const snapshot = snapshotGoalSwitches();
-    const staged = new Map(goalSwitches);
+    const candidate = new Map(goalSwitches);
+    candidate.set(conversationId, row);
+    boundGoalSwitchMap(candidate);
     try {
-      await writeDurableNow(GOAL_SWITCHES_STATE, snapshot);
+      await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
+      publishGoalSwitches(candidate);
     } catch (error) {
-      if (goalSwitches.size === staged.size && [...staged].every(([id, value]) => goalSwitches.get(id) === value)) {
-        goalSwitches.clear();
-        for (const [id, value] of previous) goalSwitches.set(id, value);
-      } else if (goalSwitches.get(conversationId) === row) {
-        goalSwitches.delete(conversationId);
-        if (before) goalSwitches.set(conversationId, before);
-      }
       writeDurableSoon(GOAL_SWITCHES_STATE, snapshotGoalSwitches());
       throw error;
     }
@@ -1100,13 +1205,14 @@ export async function setGoalSwitchNow(
       throw new Error('goal_switch_capacity');
     }
     const next = applyGoalSwitch(goalSwitchFor(conversationId), which, on);
-    goalSwitches.set(conversationId, { enabled: next.enabled, mode: next.mode,
+    const candidate = new Map(goalSwitches);
+    candidate.set(conversationId, { enabled: next.enabled, mode: next.mode,
       afterTurn: afterTurn ?? before?.afterTurn ?? false, at: Date.now() });
+    boundGoalSwitchMap(candidate);
     try {
-      await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitches());
+      await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
+      publishGoalSwitches(candidate);
     } catch (error) {
-      goalSwitches.delete(conversationId);
-      if (before) goalSwitches.set(conversationId, before);
       writeDurableSoon(GOAL_SWITCHES_STATE, snapshotGoalSwitches());
       throw error;
     }
@@ -1129,6 +1235,26 @@ export function clearAllGoalSwitches(): void {
   persistGoalSwitches();
 }
 
+/** Durable master-Off boundary. Existing helper identities are retained. */
+export async function clearAllGoalSwitchesNow(): Promise<void> {
+  await serialGoalSwitch(async () => {
+    const candidate = new Map(goalSwitches);
+    for (const [id, row] of candidate) if (row.role !== 'decision') candidate.delete(id);
+    // Master Off is a revocation. Publish the stricter live state before touching disk so
+    // concurrent bridge checks cannot keep using an override while the durable cleanup waits.
+    // A later On calls this same function as a durability barrier before it can be published.
+    publishGoalSwitches(candidate);
+    notifyGoalChange();
+    try {
+      await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
+    } catch (error) {
+      // Keep the conservative live revocation and retain the same safe snapshot for retry.
+      writeDurableSoon(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
+      throw error;
+    }
+  });
+}
+
 /** Drops one chat's override, putting it back under the app-wide setting. */
 export function clearGoalSwitch(conversationId: string): void {
   if (isGoalDecisionChat(conversationId)) return;
@@ -1144,16 +1270,60 @@ export async function moveGoalSwitchNow(fromConversationId: string, toConversati
     if (isGoalDecisionChat(fromConversationId) || isGoalDecisionChat(toConversationId)) return false;
     const source = goalSwitches.get(fromConversationId);
     if (!source) return true;
-    const beforeTarget = goalSwitches.get(toConversationId);
-    goalSwitches.delete(fromConversationId);
-    goalSwitches.set(toConversationId, source);
+    const candidate = new Map(goalSwitches);
+    candidate.delete(fromConversationId);
+    candidate.set(toConversationId, source);
+    boundGoalSwitchMap(candidate);
     try {
-      await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitches());
+      await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
+      publishGoalSwitches(candidate);
       return true;
     } catch (error) {
-      goalSwitches.delete(toConversationId);
-      goalSwitches.set(fromConversationId, source);
-      if (beforeTarget) goalSwitches.set(toConversationId, beforeTarget);
+      writeDurableSoon(GOAL_SWITCHES_STATE, snapshotGoalSwitches());
+      throw error;
+    }
+  });
+}
+
+/** Durable clear used by recovery/rebind paths. Helper identities remain immutable. */
+export async function clearGoalSwitchNow(conversationId: string): Promise<boolean> {
+  return serialGoalSwitch(async () => {
+    if (isGoalDecisionChat(conversationId) || !goalSwitches.has(conversationId)) return false;
+    const candidate = new Map(goalSwitches);
+    candidate.delete(conversationId);
+    try {
+      await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
+      publishGoalSwitches(candidate);
+      notifyGoalChange();
+      return true;
+    } catch (error) {
+      writeDurableSoon(GOAL_SWITCHES_STATE, snapshotGoalSwitches());
+      throw error;
+    }
+  });
+}
+
+/** Durable target-wins counterpart used only by positively proved legacy resume repair. */
+export async function repairGoalSwitchProjectionNow(
+  fromConversationId: string,
+  toConversationId: string
+): Promise<boolean> {
+  if (!fromConversationId || !toConversationId || fromConversationId === toConversationId) return false;
+  return serialGoalSwitch(async () => {
+    if (isGoalDecisionChat(fromConversationId)) return false;
+    const source = goalSwitches.get(fromConversationId);
+    if (!source) return false;
+    const candidate = new Map(goalSwitches);
+    candidate.delete(fromConversationId);
+    // Any target-owned row, including a decision helper identity, is newer authority and wins.
+    if (!candidate.has(toConversationId)) candidate.set(toConversationId, source);
+    boundGoalSwitchMap(candidate);
+    try {
+      await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
+      publishGoalSwitches(candidate);
+      notifyGoalChange();
+      return true;
+    } catch (error) {
       writeDurableSoon(GOAL_SWITCHES_STATE, snapshotGoalSwitches());
       throw error;
     }
@@ -1273,7 +1443,7 @@ export async function retryGoalBrowserHelper(sourceSessionId: string, inputId: s
  * The page acknowledges after it has typed and sent — or after it has decided it cannot —
  * and both are the same fact here: this draft is spent.
  */
-export function ackGoalDraft(conversationId: string, token: string, clientId?: string): boolean {
+export function ackGoalDraft(conversationId: string, token: string, clientId?: string, persistReply = true): boolean {
   const draft = drafts.get(conversationId);
   if (!draft || draft.token !== token) return false;
   if (clientId !== undefined && draft.clientId !== clientId) return false;
@@ -1290,7 +1460,7 @@ export function ackGoalDraft(conversationId: string, token: string, clientId?: s
   // stream, a rejected key, an exhausted balance, an abort — and a failure to answer may not
   // be recorded as an answer. Retiring the row on `auth_rejected` meant the user fixing their
   // key found the turn it was owed for silently gone.
-  if (draft.stage === 'ready' || draft.stage === 'no-reply') handleGoalReply(conversationId, draft.turnId);
+  if (draft.stage === 'ready' || draft.stage === 'no-reply') handleGoalReply(conversationId, draft.turnId, persistReply);
   notifyGoalChange();
   return true;
 }
@@ -1301,16 +1471,24 @@ export async function ackGoalDraftNow(
   token: string,
   clientId?: string
 ): Promise<boolean> {
-  const acknowledged = ackGoalDraft(conversationId, token, clientId);
-  if (acknowledged) await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
-  return acknowledged;
+  return serialGoalReply(async () => {
+    const acknowledged = ackGoalDraft(conversationId, token, clientId, false);
+    if (!acknowledged) return false;
+    try {
+      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+    } catch (error) {
+      persistGoalRepliesSoon();
+      throw error;
+    }
+    return true;
+  });
 }
 
 /**
  * Revoke attempts made under replaced settings; pending source work survives.
  * Only an explicit master Off also discharges all automatic reply obligations.
  */
-export function retireGoalDrafts(retireReplies = false): number {
+function retireGoalDraftsCore(retireReplies: boolean, persistReplies: boolean): number {
   let retired = 0;
   for (const draft of drafts.values()) {
     if (draft.acknowledged) continue;
@@ -1326,9 +1504,30 @@ export function retireGoalDrafts(retireReplies = false): number {
   drafts.clear();
   if (retireReplies) {
     for (const reply of goalReplies.values()) reply.state = 'handled';
-    if (goalReplies.size > 0) persistGoalRepliesSoon();
+    if (persistReplies && goalReplies.size > 0) persistGoalRepliesSoon();
   }
   return retired;
+}
+
+export function retireGoalDrafts(retireReplies = false): number {
+  return retireGoalDraftsCore(retireReplies, true);
+}
+
+/** Durable settings/master-Off counterpart for reply-authority retirement. */
+export async function retireGoalDraftsNow(retireReplies = false): Promise<number> {
+  if (!retireReplies) return retireGoalDrafts(false);
+  return serialGoalReply(async () => {
+    const retired = retireGoalDraftsCore(true, false);
+    if (goalReplies.size === 0) return retired;
+    try {
+      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+    } catch (error) {
+      // Revocation is already live. Keep the same conservative state queued for recovery.
+      persistGoalRepliesSoon();
+      throw error;
+    }
+    return retired;
+  });
 }
 
 /**
@@ -1338,11 +1537,11 @@ export function retireGoalDrafts(retireReplies = false): number {
  * chat's goal therefore has to reach the request already running, or the last thing typed
  * into the conversation would be a message written against the goal the user just replaced.
  */
-export function retireGoalDraftsFor(conversationId: string, preserveReply = false): boolean {
+function retireGoalDraftsForCore(conversationId: string, preserveReply: boolean, persistReply: boolean): boolean {
   const draft = drafts.get(conversationId);
   const pending = goalReplies.get(conversationId)?.state === 'pending';
   if (!draft || draft.acknowledged) {
-    if (pending && !preserveReply) handleGoalReply(conversationId);
+    if (pending && !preserveReply) handleGoalReply(conversationId, undefined, persistReply);
     return pending;
   }
   draft.acknowledged = true;
@@ -1350,9 +1549,61 @@ export function retireGoalDraftsFor(conversationId: string, preserveReply = fals
   if (draft.settledAt === 0) draft.settledAt = Date.now();
   draft.text = '';
   draft.reply = '';
-  if (!preserveReply) handleGoalReply(conversationId);
+  if (!preserveReply) handleGoalReply(conversationId, undefined, persistReply);
   notifyGoalChange();
   return true;
+}
+
+export function retireGoalDraftsFor(conversationId: string, preserveReply = false): boolean {
+  return retireGoalDraftsForCore(conversationId, preserveReply, true);
+}
+
+/** Durable rebind/recovery boundary for retiring A's exact reply debt. */
+export async function retireGoalDraftsForNow(conversationId: string, preserveReply = false): Promise<boolean> {
+  return serialGoalReply(async () => {
+    const hadReply = goalReplies.has(conversationId);
+    const changed = retireGoalDraftsForCore(conversationId, preserveReply, false);
+    if (preserveReply || (!changed && !hadReply)) return changed;
+    try {
+      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+    } catch (error) {
+      // Retirement is a revocation. Keep it live and queue the same authoritative snapshot.
+      persistGoalRepliesSoon();
+      throw error;
+    }
+    // A retry after a failed retirement can have no new live mutation while still owing the
+    // exact fsync barrier. Report success once that existing tombstone is durable.
+    return changed || hadReply;
+  });
+}
+
+/**
+ * Permanently removes reply authority from a legacy source chat that will never own this mission
+ * again. Unlike an ordinary rebind tombstone, successful recovery deletes the row so later
+ * activity polls can prove the source has fully converged and become true no-ops.
+ */
+export async function discardGoalReplyForRecoveryNow(conversationId: string): Promise<boolean> {
+  return serialGoalReply(async () => {
+    const hadReply = goalReplies.has(conversationId);
+    const changed = retireGoalDraftsForCore(conversationId, false, false);
+    if (!hadReply) return changed;
+
+    // Revoke live authority before the disk write. If persistence fails, retain a handled row in
+    // memory and queue that conservative tombstone; retry will still see the row and attempt the
+    // permanent deletion again.
+    const live = goalReplies.get(conversationId);
+    if (live) live.state = 'handled';
+    const candidate = candidateGoalReplies();
+    candidate.delete(conversationId);
+    try {
+      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate));
+      publishGoalReplies(candidate);
+      return true;
+    } catch (error) {
+      persistGoalRepliesSoon();
+      throw error;
+    }
+  });
 }
 
 /**
@@ -1367,10 +1618,20 @@ export function retireGoalDraftsFor(conversationId: string, preserveReply = fals
  * old row leaves the reply safely retryable but can never let the now-revoked text reach the
  * composer. A later page simply drafts it again from the same durable reply identity.
  */
-export async function setGoalReplyActiveNow(conversationId: string, active: boolean, current: (silenceSourceTurnId?: string) => boolean = () => true): Promise<boolean> {
+async function setGoalReplyActiveLocked(
+  conversationId: string,
+  active: boolean,
+  current: (silenceSourceTurnId?: string) => boolean = () => true
+): Promise<boolean> {
   const activationReply = goalReplies.get(conversationId);
   const silenceSource = (activationReply?.listenUntil ?? 0) <= Date.now() ? activationReply?.silenceSourceTurnId : undefined;
-  const stillCurrent = () => (!silenceSource || goalReplies.get(conversationId) === activationReply) && current(silenceSource);
+  const sameActivation = () => {
+    if (!silenceSource) return true;
+    const live = goalReplies.get(conversationId);
+    return Boolean(live && activationReply && live.replyId === activationReply.replyId &&
+      live.turnId === activationReply.turnId && live.eventSeq === activationReply.eventSeq);
+  };
+  const stillCurrent = () => sameActivation() && current(silenceSource);
   // Deliberate On is also meaningful after an unsuccessful answer. No automatic
   // observer may mint this activation: retain the exact ended source in the same
   // reply ledger, without pretending a failure was a final or a refresh receipt.
@@ -1391,7 +1652,7 @@ export async function setGoalReplyActiveNow(conversationId: string, active: bool
     if (session && end?.kind === 'turn_end' && end.turnId &&
         (end.outcome === 'stopped' || (end.outcome === 'failed' && end.reason === 'thinking_failed')) &&
         (!held || held.eventSeq < end.seq)) {
-      await acceptGoalReplyNow({ conversationId, sessionId: session.id, turnId: end.turnId,
+      await acceptGoalReplyLocked({ conversationId, sessionId: session.id, turnId: end.turnId,
         replyId: `activation:${end.turnId}`.slice(0, 200), eventSeq: end.seq, blocked: false,
         current: () => stillCurrent() && control === goalSwitches.get(conversationId) && goalArmedFor(conversationId) && !session.activeTurnId });
       if (!stillCurrent() || control !== goalSwitches.get(conversationId) || !goalArmedFor(conversationId)) return false;
@@ -1409,73 +1670,102 @@ export async function setGoalReplyActiveNow(conversationId: string, active: bool
   }
   if (!before) return Boolean(draft);
 
-  const previous = { ...before };
-  before.state = active ? 'pending' : 'handled';
+  const candidate = candidateGoalReplies();
+  const next = candidate.get(conversationId)!;
+  next.state = active ? 'pending' : 'handled';
   // A deliberate On is a new pickup episode for the same stable final reply. It gets the
   // recovery schedule from now, not from when that answer happened under an Off switch.
   if (active) {
-    before.acceptedAt = Math.max(Date.now(), previous.acceptedAt + 1);
-    before.acceptedBudgetAt = before.acceptedAt;
+    next.acceptedAt = Math.max(Date.now(), before.acceptedAt + 1);
+    next.acceptedBudgetAt = next.acceptedAt;
   }
-  if (active) before.explicitActivation = true;
-  const acceptedAt = before.acceptedAt;
+  if (active) next.explicitActivation = true;
   try {
-    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate));
+    publishGoalReplies(candidate);
   } catch (error) {
-    if (goalReplies.get(conversationId) === before && before.acceptedAt === acceptedAt) goalReplies.set(conversationId, previous);
     persistGoalRepliesSoon();
     throw error;
   }
-  if (active && !stillCurrent() && goalReplies.get(conversationId) === before && before.acceptedAt === acceptedAt) {
-    before.state = 'handled';
-    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+  if (active && !stillCurrent()) {
+    const published = goalReplies.get(conversationId);
+    if (published?.replyId !== next.replyId || published.eventSeq !== next.eventSeq || published.turnId !== next.turnId) return false;
+    // Currentness was lost after the activation write. Revoke live authority immediately and
+    // keep that stricter state queued if its durable retirement fails.
+    published.state = 'handled';
+    try {
+      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+    } catch (error) {
+      persistGoalRepliesSoon();
+      throw error;
+    }
     return false;
   }
   return true;
 }
 
+export async function setGoalReplyActiveNow(
+  conversationId: string,
+  active: boolean,
+  current: (silenceSourceTurnId?: string) => boolean = () => true
+): Promise<boolean> {
+  return serialGoalReply(() => setGoalReplyActiveLocked(conversationId, active, current));
+}
+
 /** A fabricated silence reply is not a final answer that a later On may re-arm. */
 export async function withdrawSilenceGoalReplyNow(conversationId: string, replyId: string): Promise<void> {
-  const reply = goalReplies.get(conversationId);
-  if (!reply || reply.replyId !== replyId ||
-      !(reply.replyId.startsWith('silence:') || reply.turnId.startsWith('g-silence-'))) return;
-  await setGoalReplyActiveNow(conversationId, false);
-  if (goalReplies.get(conversationId) !== reply) return;
-  goalReplies.delete(conversationId);
-  try {
-    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
-  } catch (error) {
-    // This is revocation of fabricated authority, not a retryable final obligation.
-    // Keep it absent in memory; a restart also rejects legacy rows without source proof.
-    persistGoalRepliesSoon();
-    throw error;
-  }
+  await serialGoalReply(async () => {
+    const reply = goalReplies.get(conversationId);
+    if (!reply || reply.replyId !== replyId ||
+        !(reply.replyId.startsWith('silence:') || reply.turnId.startsWith('g-silence-'))) return;
+    await setGoalReplyActiveLocked(conversationId, false);
+    const currentReply = goalReplies.get(conversationId);
+    if (!currentReply || currentReply.replyId !== replyId) return;
+    const candidate = candidateGoalReplies();
+    candidate.delete(conversationId);
+    // This is revocation of fabricated authority: publish absence before the durable write.
+    publishGoalReplies(candidate);
+    try {
+      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+    } catch (error) {
+      persistGoalRepliesSoon();
+      throw error;
+    }
+  });
 }
 
 /** Native busy or a confirmed failure defers this exact ticket, never a new one. */
 export async function deferSilenceGoalReplyNow(conversationId: string, turnId: string, listenUntil?: number,
   prepared?: { token: string; clientId: string }): Promise<boolean> {
-  const reply = goalReplies.get(conversationId);
-  if (!reply || reply.state !== 'pending' || reply.turnId !== turnId || (!reply.silenceSourceTurnId && !prepared)) return false;
-  if (prepared) {
-    const draft = drafts.get(conversationId);
-    if (!draft || draft.token !== prepared.token || draft.clientId !== prepared.clientId ||
-        draft.turnId !== turnId || draft.acknowledged || draft.stage !== 'ready') return false;
-    // Renewed native work retires only this prepared text, never its obligation.
-    // Remove authority before yielding; old-token duplicates cannot move the clock.
-    draft.acknowledged = true;
-    draft.abort?.abort();
-    drafts.delete(conversationId);
-    notifyGoalChange();
-  }
-  if (listenUntil === undefined && (reply.listenUntil ?? 0) > Date.now()) return true;
-  const deadline = listenUntil ?? Date.now() + 5 * 60_000;
-  if ((reply.listenUntil ?? 0) >= deadline) return true;
-  reply.listenUntil = deadline;
-  notifyGoalChange();
-  try { await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies()); }
-  catch (error) { persistGoalRepliesSoon(); throw error; }
-  return goalReplies.get(conversationId) === reply;
+  return serialGoalReply(async () => {
+    const reply = goalReplies.get(conversationId);
+    if (!reply || reply.state !== 'pending' || reply.turnId !== turnId || (!reply.silenceSourceTurnId && !prepared)) return false;
+    if (prepared) {
+      const draft = drafts.get(conversationId);
+      if (!draft || draft.token !== prepared.token || draft.clientId !== prepared.clientId ||
+          draft.turnId !== turnId || draft.acknowledged || draft.stage !== 'ready') return false;
+      draft.acknowledged = true;
+      draft.abort?.abort();
+      drafts.delete(conversationId);
+      notifyGoalChange();
+    }
+    if (listenUntil === undefined && (reply.listenUntil ?? 0) > Date.now()) return true;
+    const deadline = listenUntil ?? Date.now() + 5 * 60_000;
+    if ((reply.listenUntil ?? 0) >= deadline) return true;
+    const candidate = candidateGoalReplies();
+    const next = candidate.get(conversationId);
+    if (!next || next.replyId !== reply.replyId) return false;
+    next.listenUntil = deadline;
+    try {
+      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate));
+      publishGoalReplies(candidate);
+      notifyGoalChange();
+      return true;
+    } catch (error) {
+      persistGoalRepliesSoon();
+      throw error;
+    }
+  });
 }
 
 export function resetGoalStateForTests(): void {
@@ -1485,6 +1775,7 @@ export function resetGoalStateForTests(): void {
   goalReplyTransportPausedAt = null;
   goalObjectives.clear();
   goalSwitches.clear();
+  goalReplyWrites = Promise.resolve();
   goalObjectiveWrites = Promise.resolve();
   goalSwitchWrites = Promise.resolve();
   legacyCommittedResumeCache.clear();

@@ -68,7 +68,7 @@ describe('native window activation', () => {
     ready();
     expect(showWindow).toHaveBeenCalledTimes(2);
   });
-  it('discovers on first visible use only when there is no saved catalog, never on repeat show or quit', async () => {
+  it('passively discovers on first visible use without browser-opening authority, never on repeat show or quit', async () => {
     const source = readFileSync(new URL('../src/main/index.ts', import.meta.url), 'utf8');
     const listener = source.slice(source.indexOf("  window.on('show'"), source.indexOf("  window.once('ready-to-show'"));
     let show!: () => void;
@@ -83,7 +83,7 @@ describe('native window activation', () => {
     show(); await Promise.resolve();
     show(); await Promise.resolve();
     expect(start).toHaveBeenCalledTimes(1);
-    expect(start).toHaveBeenCalledWith(true);
+    expect(start).toHaveBeenCalledWith(false);
     state = 'unavailable';
     show(); await Promise.resolve();
     expect(start).toHaveBeenCalledTimes(1);

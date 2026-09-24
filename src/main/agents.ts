@@ -452,6 +452,11 @@ export async function persistCriticalSwarmNow(): Promise<boolean> {
   return criticalPersistFlight;
 }
 
+/** Cheap recovery gate: true only while some critical broker revision still lacks its fsync ACK. */
+export function criticalSwarmPersistencePending(): boolean {
+  return persistedCriticalRevision < criticalMutationRevision;
+}
+
 export function onRetiredWorkersPersist(handler: (() => void) | null): void {
   retiredPersist = handler;
 }
@@ -3510,6 +3515,22 @@ export function commitPrimeTransfer(fromConversationId: string, toConversationId
   return true;
 }
 
+/**
+ * Durable owner boundary for the broker side of Compact & Resume.
+ *
+ * The in-memory move deliberately happens before the fsync: once the canonical session says B,
+ * keeping B as the live fence is the conservative direction if disk fails. A retry then enters
+ * recovery, where the exact same run already naming B is accepted idempotently and its pending
+ * critical revision is flushed before the continuation WAL may finish.
+ */
+export async function commitPrimeTransferNow(fromConversationId: string, toConversationId: string): Promise<boolean> {
+  if (!commitPrimeTransfer(fromConversationId, toConversationId)) return false;
+  if (!(await persistCriticalSwarmNow())) {
+    throw new Error('Prime transfer has no immediate durable swarm persistence sink.');
+  }
+  return true;
+}
+
 /** No prime transfer may land on a worker conversation or another prime owner's history. */
 function conversationOwnedOutside(ownerAgents: Map<string, Agent>, fromConversationId: string, toConversationId: string): boolean {
   if (toConversationId === fromConversationId) return false;
@@ -3670,6 +3691,25 @@ export function repairPrimeConversationAfterRecovery(
     `multi-agent: recovery repaired dormant worker ownership from conversation ${fromConversationId} to ${toConversationId}`
   );
   changed();
+  return true;
+}
+
+/**
+ * Recovery counterpart to {@link repairPrimeConversationAfterRecovery} with a durable ACK.
+ *
+ * Replaying an already-published A→B repair still crosses the barrier. That is required after a
+ * prior fsync failure: live memory may already name B while the last durable swarm snapshot still
+ * names A, and "no new mutation" must never be mistaken for "nothing left to persist".
+ */
+export async function repairPrimeConversationAfterRecoveryNow(
+  fromConversationId: string,
+  toConversationId: string,
+  lineage?: SelfHealingAgentLineage
+): Promise<boolean> {
+  if (!repairPrimeConversationAfterRecovery(fromConversationId, toConversationId, lineage)) return false;
+  if (!(await persistCriticalSwarmNow())) {
+    throw new Error('Prime recovery repair has no immediate durable swarm persistence sink.');
+  }
   return true;
 }
 

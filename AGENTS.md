@@ -193,7 +193,7 @@ define the tool/config/wire contract. README and worklogs are secondary and can 
 | --- | --- | --- |
 | Roots | None. | Root-requiring capabilities cannot be published usefully until a root is approved. |
 | Tool capabilities | Current `defaultConfig()` starts all Core capability flags on; read-only off. | Omitted legacy flags use conservative `DEFAULT_CAPABILITIES`. Malformed existing config is conservative recovery, not fresh consent. |
-| Recording | On, 30-day retention. | Explicit Off stays Off; retention still applies to old history. |
+| Recording | Always on; age expiry is disabled (`retainDays = 0`). | Legacy `record` / `retainDays` fields still parse for wire compatibility, then normalize to `true` / `0`. Explicit session delete and image cleanup remain separate user actions. |
 | Context / compaction | Advisory 400,000; limit rounded from advisory × 4/3; auto-compaction on at advisory. | Estimated local units. Automatic execution additionally requires live work, current ownership and eligible model/role. |
 | Multi-agent | On, 2 simultaneous slot-holding workers **per family**, configured hard max 8. | Legacy absent enabled/allow-unattributed fields remain false. Existing choices stay exact. |
 | Unattributed allowance | True on first launch. | Relaxes ambiguity fences only; known blocked/retired/superseded ownership stays enforced. |
@@ -227,7 +227,7 @@ Paths in this section are repository-relative. Most mechanisms have `main`, `sha
 | Patching/images | `src/main/codex/apply-patch/*`, `codex/{filesystem,read-backend,view-image}.ts`. |
 | Projects/cwd | `src/main/projects.ts`, `workspace.ts`, `src/shared/projects.ts`: explicit local folder catalog, session binding, inherited/learned workspaces. |
 | Project runtime | `src/main/project-runtime.ts`, `src/shared/project-runtime.ts`, `src/main/mcp/project-runtime-tool.ts`: optional `.cos/project.json`, named local verification tasks, sandboxed completion predicates and safe model-facing summary. |
-| Durable history | `src/main/session/{store,recorder,correlation,retention,summarize,progress}.ts`, `src/shared/{session,chronology}.ts`: canonical messages, tool truth, chronology and indexes. |
+| Durable history | `src/main/session/{store,recorder,correlation,summarize,progress}.ts`, `src/shared/{session,chronology}.ts`: canonical messages, tool truth, chronology and indexes. Age-based session pruning is intentionally absent; `store.ts::pruneSessions` is a compatibility no-op. |
 | Input | `src/main/session/{input,start-input,input-history,input-attachments,input-images,prompt}.ts`, `src/shared/{input,user-prompt}.ts`: outbox, native files, prompt frame and receipts. |
 | Finish/planning | `src/main/session/finish.ts`, `task-request.ts`, `goal.ts`, `src/shared/{finish,task-progress}.ts`: held turn, decision/plan invocation and cancellation. |
 | Continuation | `src/main/session/{continuation,resume-gate,handoff,handoff-prompt}.ts`: A→B transaction, send ambiguity and exact brief. |
@@ -1135,8 +1135,9 @@ manual Stop cannot be used as that proof. This reopen evidence is process-local.
 
 Large text has distinct inline/overflow/asset/read/render limits. Do not silently shorten
 authored history to fix the UI. Asset quotas and explicit overflow ceilings remain enforced;
-if earlier recording already lost content, expose that loss. Retention runs once on startup
-and every six hours using current settings, even when new recording is Off.
+if earlier recording already lost content, expose that loss. Age-based session retention is
+disabled; history is removed only by explicit session deletion or the separate confirmed image
+storage cleanup paths.
 Image asset admission failures preserve the original MCP response and tool outcome. The recorder
 adds a bounded, path-free warning to the existing activity summary, including quota exhaustion;
 older successful `view_image` rows without assets explicitly show that no preview was retained.
@@ -1427,8 +1428,8 @@ opens another history, scans disk or resolves overflow assets. The bridge return
 redacted argument/result previews with binary payloads omitted and truthful process outcomes.
 Document, route and navigation epoch are checked around transport; a late response can only
 populate the currently connected disclosure for that same call/revision. A bounded document cache
-preserves open details across repaint and invalidates revised calls. Recording Off retains access
-to previously recorded previews without creating new content.
+preserves open details across repaint and invalidates revised calls. Recording is a product
+invariant, so this path has no runtime Recording-Off mode.
 
 ## 14. Bridge, durable browser commands and recovery
 
@@ -2346,23 +2347,23 @@ These are source-level discrepancies checked for this map, not new live reproduc
 permission for an unsolicited rewrite. Recheck current code/tests before acting; another
 shared-tree change may already have addressed them.
 
-- **Startup opening:** `index.ts` still calls `startChatModelDiscovery(true)` on window show
-  when the catalog is unknown. Desired policy requires a concrete operation to own any new
-  browser document; app opening alone must not become a fallback opener.
-- **Repair handout vs action:** attribution and assistant-error repairs claim their exact attempt after the
-  extension's tab scan. Other repair reasons still mark handout before the tab query/action
-  without that final claim. Intent requires browser actions to retain current authority
-  through that boundary.
-- **Goal publication:** explicit switch writes serialize, but mutate shared memory before
-  the awaited durable write; synchronous clear/move paths and objective/reply mutations do not
-  all share the same semantic transaction. Intent is durable commit before visible state, with
-  rollback unable to overwrite a newer accepted change.
-- **Goal cross-ledger controls:** master/config/secret changes still cross separate ledgers.
-  Recording Off lacks a uniform runtime gate for retained per-chat overrides. Attempt
-  invalidation now preserves debt, but these remaining controls still need one durable
-  semantic transaction and effective current-setting enforcement.
+- **Corrupt control ledgers:** generic `readDurable()` still degrades unreadable or malformed
+  JSON to `null`. That is acceptable for rebuildable caches, but authority-bearing ledgers need
+  an explicit recovery policy that cannot reinterpret a stale backup as permission to replay a
+  mutation. Until that policy exists, do not describe a corrupt control file as an empty
+  authoritative state.
+- **Goal cross-ledger recovery:** user-visible Goal objective/switch/reply acceptance now commits
+  unpublished candidates before live publication, master Off is durably serialized with settings,
+  and continuation A→B keeps its WAL at `committing` until secondary durable projections converge.
+  Config, secrets and automation ledgers are still separate files, so new cross-owner changes
+  must retain an explicit forward-recovery transaction rather than assuming a global database commit.
 
-Do not restore obsolete claims while investigating: two MCP surfaces, one global prime run,
+Startup window model discovery is passive (`allowOpen=false`); explicit Refresh and real browser
+delivery retain opening authority. Repair handouts currently require an exact extension claim
+before the tab action. Recording is always on at the config boundary, so a Recording-Off Goal
+gate is not a live product state.
+
+Do not restore obsolete claims while investigating: three MCP surfaces, one global prime run,
 three browser command kinds, fixed 60s Unattributed repair, tab-query
 failure as “no tabs”, missing all-repair handout, or no maintenance single-flight. The checked
 tree has changed those contracts. Comments/worklogs can lag even when nearby code is current.

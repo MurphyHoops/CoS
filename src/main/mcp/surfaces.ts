@@ -18,7 +18,7 @@
  * the user already thinks in, plus enough schema weight that folding it into Core
  * would meaningfully raise Core's no-query cost.
  *
- * Two surfaces pass that test today.
+ * Three surfaces pass that test today: Core, Desktop and Plugins.
  */
 
 import type { Capabilities } from '../../shared/types.js';

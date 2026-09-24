@@ -32,7 +32,7 @@
  * turn its tools back; the turn can outlive the app.
  */
 
-import { readDurable, writeDurableSoon } from '../durable.js';
+import { readDurable, writeDurableNow, writeDurableSoon } from '../durable.js';
 
 /**
  * A hand-curated list, so the ceiling only exists to keep a corrupt or hostile state file from
@@ -46,6 +46,7 @@ const BLOCKED_STATE_VERSION = 1;
 /** Conversation id -> when the user blocked it. */
 const blocked = new Map<string, number>();
 let restored = false;
+let mutations: Promise<unknown> = Promise.resolve();
 
 interface PersistedBlocks {
   version: number;
@@ -69,6 +70,15 @@ function snapshot(): PersistedBlocks {
   return {
     version: BLOCKED_STATE_VERSION,
     entries: [...blocked].map(([conversationId, blockedAt]) => ({ conversationId, blockedAt }))
+  };
+}
+
+function snapshotWithout(conversationId: string): PersistedBlocks {
+  return {
+    version: BLOCKED_STATE_VERSION,
+    entries: [...blocked]
+      .filter(([id]) => id !== conversationId)
+      .map(([id, blockedAt]) => ({ conversationId: id, blockedAt }))
   };
 }
 
@@ -122,24 +132,50 @@ export function chatBlockedAt(conversationId: string): number | null {
 }
 
 /**
- * Blocks or releases one conversation. Idempotent in both directions: the user pressing the
- * button twice must not move a block's timestamp or resurrect a released one.
+ * Blocks or releases one conversation. The returned promise is the acknowledgement boundary:
+ * callers may report success only after this exact state is durable.
+ *
+ * Blocking is deliberately conservative. The live fence is installed before its durable write;
+ * if that write fails, the caller sees failure but the conversation stays blocked and the
+ * durable writer keeps retrying that same safe state. Releasing is the inverse: the durable
+ * removal lands before the live fence is removed, so a failed release can never briefly hand a
+ * rogue turn its tools back. Mutations serialize here because this map is the authoritative
+ * owner; an older failed generation must not race a newer accepted user action.
  */
-export function setChatBlocked(conversationId: string, next: boolean): void {
+export function setChatBlocked(conversationId: string, next: boolean): Promise<void> {
   if (!validConversationId(conversationId)) throw new Error('Not a ChatGPT conversation id');
-  if (next === blocked.has(conversationId)) return;
-  if (next) {
-    if (blocked.size >= MAX_BLOCKED_CHATS) {
-      throw new Error(`Too many blocked chats (${MAX_BLOCKED_CHATS}). Release one before blocking another.`);
+  const operation = mutations.then(async () => {
+    const alreadyBlocked = blocked.has(conversationId);
+    if (next) {
+      if (!alreadyBlocked) {
+        if (blocked.size >= MAX_BLOCKED_CHATS) {
+          throw new Error(`Too many blocked chats (${MAX_BLOCKED_CHATS}). Release one before blocking another.`);
+        }
+        blocked.set(conversationId, Date.now());
+      }
+      // Even an idempotent retry crosses the barrier again: the previous Block attempt may have
+      // left the safe live fence installed after its durable write rejected.
+      await writeDurableNow(BLOCKED_STATE, snapshot());
+      return;
     }
-    blocked.set(conversationId, Date.now());
-  } else {
+
+    if (!alreadyBlocked) return;
+    try {
+      await writeDurableNow(BLOCKED_STATE, snapshotWithout(conversationId));
+    } catch (error) {
+      // writeDurableNow retains a failed generation for retry. Supersede a rejected Release with
+      // the still-authoritative blocked snapshot so a background retry cannot later unblock it.
+      writeDurableSoon(BLOCKED_STATE, snapshot());
+      throw error;
+    }
     blocked.delete(conversationId);
-  }
-  writeDurableSoon(BLOCKED_STATE, snapshot());
+  });
+  mutations = operation.catch(() => undefined);
+  return operation;
 }
 
 export function resetBlockedChatsForTests(): void {
   blocked.clear();
   restored = false;
+  mutations = Promise.resolve();
 }
