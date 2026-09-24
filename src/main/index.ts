@@ -41,21 +41,11 @@ import {
   SWARM_STATE
 } from './agents.js';
 import { checkpointAgentLedger, restoreAgentAuthorityState } from './agents-recovery.js';
-import { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
+import { flushDurable, initDurableStore, writeDurableNow, writeDurableSoon } from './durable.js';
 import { restoreRequestCorrelations } from './session/correlation.js';
 import { restoreBlockedChats } from './session/blocked-chats.js';
 import { stopComputerHelper } from './computer/index.js';
-import {
-  GOAL_OBJECTIVES_STATE,
-  GOAL_REPLIES_STATE,
-  GOAL_SWITCHES_STATE,
-  restoreGoalObjectives,
-  restoreGoalReplies,
-  restoreGoalSwitches,
-  type GoalObjectivesSnapshot,
-  type GoalRepliesSnapshot,
-  type GoalSwitchesSnapshot
-} from './goal.js';
+import { restoreGoalAuthorityState } from './goal-recovery.js';
 import {
   continuationRecoveryPaused,
   restoreContinuationsDurableState,
@@ -317,15 +307,8 @@ void app.whenReady().then(async () => {
   // user choice instead of Electron's default `system` theme. On macOS this controls the window
   // frame, application menus and OS dialogs; on Linux/Windows it covers Electron-native UI.
   nativeTheme.themeSource = getConfig().ui.theme;
-  const savedGoalObjectives = await readDurable<GoalObjectivesSnapshot>(GOAL_OBJECTIVES_STATE);
+  await restoreGoalAuthorityState();
   if (windowActivation.isDisabled()) return;
-  restoreGoalObjectives(savedGoalObjectives);
-  const savedGoalSwitches = await readDurable<GoalSwitchesSnapshot>(GOAL_SWITCHES_STATE);
-  if (windowActivation.isDisabled()) return;
-  restoreGoalSwitches(savedGoalSwitches);
-  const savedGoalReplies = await readDurable<GoalRepliesSnapshot>(GOAL_REPLIES_STATE);
-  if (windowActivation.isDisabled()) return;
-  restoreGoalReplies(savedGoalReplies);
   await restoreLongRunDurableState();
   if (windowActivation.isDisabled()) return;
   // Request ownership must exist before either side of the bridge can race in. A request id

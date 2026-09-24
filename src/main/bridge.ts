@@ -69,6 +69,7 @@ import {
   goalProgressFor,
   goalDraftBusy,
   goalArmedFor,
+  goalRecoveryPaused,
   goalObjectiveFor,
   goalPendingReplyFor,
   goalReplySourceTurn,
@@ -1721,7 +1722,7 @@ export async function cancelSessionCompaction(sessionId: string): Promise<Sessio
 
 /** A chat the loop may not drive — by role, or by the user's block. */
 function goalFencedChat(id: string): boolean {
-  return continuationRecoveryPaused() || agentsRecoveryPaused() || goalBlockReason(id) !== '';
+  return goalRecoveryPaused() || continuationRecoveryPaused() || agentsRecoveryPaused() || goalBlockReason(id) !== '';
 }
 
 function goalEnabledFor(id: string): boolean {
@@ -3539,6 +3540,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const id = conversationId(body['conversationId']);
     const turnId = typeof body['turnId'] === 'string' ? body['turnId'].slice(0, 200) : '';
     const terminalRequired = body['terminalRequired'] === true;
+    if (goalRecoveryPaused()) {
+      return goalJson(res, 503, { error: 'goal_recovery_required', retryable: true }, origin);
+    }
     // The page asking is the pickup the owed-reply watchdog is waiting for, whatever the
     // provider then says. On 2026-09-02 OpenRouter answered ten drafts in a row with 429 and the
     // page retried every fifteen seconds, alive the whole time; the watchdog only saw a reply
@@ -3714,6 +3718,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     const id = conversationId(body['conversationId']);
     if (!id) return goalJson(res, 400, { error: 'bad_conversation_id' }, origin);
+    if (goalRecoveryPaused()) return goalJson(res, 503, { error: 'goal_recovery_required', retryable: true }, origin);
     const token = typeof body['token'] === 'string' ? body['token'] : '';
     const clientId = typeof body['clientId'] === 'string' ? body['clientId'].slice(0, 100) : '';
     try {
@@ -4786,6 +4791,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
 /** Final action-boundary fence shared by every browser-mutating repair reason. */
 async function repairReasonCurrent(conversationId: string, repair: Repair): Promise<boolean> {
   if (repair.reason === 'goal') {
+    if (goalRecoveryPaused()) return false;
     const pickup = (await owedPickups(Date.now())).get(conversationId);
     const watch = goalWatch.get(conversationId);
     return !!pickup && !!watch && pickup.replyId === watch.replyId && Date.now() >= pickup.listenUntil &&
@@ -8112,7 +8118,7 @@ async function owedPickups(now: number): Promise<Map<string, { conversationId: s
 }
 
 async function inspectOwedGoals(now: number): Promise<boolean> {
-  if (continuationRecoveryPaused() || agentsRecoveryPaused() || providerTransportUnavailable()) return false;
+  if (goalRecoveryPaused() || continuationRecoveryPaused() || agentsRecoveryPaused() || providerTransportUnavailable()) return false;
   const floor = goalWatchFloor;
   if (floor === null) return false;
   const owed = await owedPickups(now);
@@ -8627,10 +8633,11 @@ async function takePendingRepairs(
 ): Promise<Array<{ conversationId: string; token: string; reason: Repair['reason']; focus: boolean }>> {
   if (continuationRecoveryPaused() || agentsRecoveryPaused()) return [];
   retireSpentRepairs();
-  const pickupFloor = goalWatchFloor;
-  const owed = await owedPickups(now);
+  const goalPaused = goalRecoveryPaused();
+  const pickupFloor = goalPaused ? null : goalWatchFloor;
+  const owed: Awaited<ReturnType<typeof owedPickups>> = goalPaused ? new Map() : await owedPickups(now);
   for (const [conversationId, repair] of repairsInFlight) {
-    if (repair.reason !== 'goal') continue;
+    if (repair.reason !== 'goal' || goalPaused) continue;
     const pickup = owed.get(conversationId);
     const watch = goalWatch.get(conversationId);
     // A handler/claim/listening transition can temporarily hide the owed head. Preserve
@@ -8703,6 +8710,7 @@ async function takePendingRepairs(
     requiresClaim?: boolean;
   }> = [];
   for (const [conversationId, repair] of repairsInFlight) {
+    if (goalPaused && repair.reason === 'goal') continue;
     const unclaimedError = repair.reason === 'assistant-error' && repair.state === 'handed' && !repair.claimed;
     if (repair.state !== 'queued' && !unclaimedError) continue;
     if (now < repair.notBefore) continue;
@@ -8718,6 +8726,7 @@ async function takePendingRepairs(
     // A missed pre-action claim may retry the same offer. Once claimed, ambiguous
     // acknowledgement keeps custody and cannot authorize a second browser action.
     if (repair.reason === 'goal') {
+      if (goalPaused) continue;
       const current = (await owedPickups(Date.now())).get(conversationId);
       if (goalWatchFloor !== pickupFloor || !current || current.replyId !== goalWatch.get(conversationId)?.replyId || Date.now() < current.listenUntil ||
           continuationForSession(current.sessionId) || (!current.queued && goalDraftBusy(conversationId))) {

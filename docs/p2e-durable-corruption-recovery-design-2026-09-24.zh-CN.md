@@ -160,7 +160,7 @@ coordinator 不直接调用 `restoreGoal*`、`restoreSwarm` 等，也不跨文�
 
 ## 10. 已实现的 owner 策略
 
-当前独立分支已经接入四组 authority owner：
+当前独立分支已经接入五组 authority owner：
 
 - **blocked-chats / blocked-tools**：primary 必须整份 schema-valid；corrupt、I/O failure、
   schema-invalid、以及 primary missing + backup surviving 都进入全域工具 recovery pause。
@@ -179,6 +179,12 @@ coordinator 不直接调用 `restoreGoal*`、`restoreSwarm` 等，也不跨文�
   `retired-workers` 的 missing + surviving backup 进入 pause；`swarm` 则有 owner-specific 例外：
   Clear swarm 的规范表示就是 primary 不存在，因此 missing primary 是 authoritative empty，旧 backup
   必须删除而不是复活历史 swarm。
+- **Goal / objectives + switches + replies**：三本 ledger 各自完整校验、各自恢复可信 primary，
+  任一本出现 corrupt、I/O failure、schema-invalid 或 missing primary + surviving backup 都进入共享
+  `goal` recovery pause，禁止新的自动 draft/send/ACK/watchdog repair。另两本若独立有效，仍保留真实
+  read projection；不会因为第三本未知而被清成 empty。backup 只作 evidence，valid primary 会刷新坏
+  checkpoint；不从 stale backup 复活旧 objective、switch 或 handled/pending reply。Goal pause 只冻结
+  Goal/Loop side effects，不把普通聊天或其它 MCP 工具全局封死。
 
 Long-Run 明确保留旧字段兼容：缺失 `sourceRequestId`、`providerBudgetAt`、
 `completionCheckClaimedAt`、`providerKey/providerData` 按既有保守语义归一化。
@@ -206,5 +212,5 @@ Agents recovery pause 采用同样的 fail-closed admission，但**不把纯读�
 恢复策略本身保留在 owner 边界（例如 `agents-recovery.ts`）；启动层只负责 wiring，coordinator 只维护
 incident/pause。后续 owner 不再采用“unknown → empty → 再用更多 guard 补洞”的模式。
 
-尚未接入 owner schema/pause 的关键账本仍包括 Goal 三账本、session-input 与 bridge-commands；
+尚未接入 owner schema/pause 的关键账本剩余为 session-input 与 bridge-commands；
 后续按同一原则逐 owner 推进，不共享 mutation authority。

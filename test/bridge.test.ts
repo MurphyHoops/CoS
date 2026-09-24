@@ -10179,6 +10179,31 @@ describe('the goal loop over the bridge', () => {
     resetGoalStateForTests();
   });
 
+  it('fails Goal draft and ACK side effects closed during Goal ledger recovery without blocking ordinary bridge status', async () => {
+    await pair();
+    noteDurableRecoveryIncident({
+      domain: 'goal',
+      ledger: 'goal-replies',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    const conversationId = 'cafe0080-0000-4000-8000-000000000080';
+    const drafted = await request('POST', '/goal/draft', {
+      body: { conversationId, turnId: 'goal-recovery-turn', clientId: 'goal-recovery-page' }
+    });
+    expect(drafted.status).toBe(503);
+    expect(drafted.body).toMatchObject({ error: 'goal_recovery_required', retryable: true });
+
+    const acked = await request('POST', '/goal/ack', {
+      body: { conversationId, token: 'goal-recovery-token', clientId: 'goal-recovery-page' }
+    });
+    expect(acked.status).toBe(503);
+    expect(acked.body).toMatchObject({ error: 'goal_recovery_required', retryable: true });
+
+    expect((await request('GET', '/status')).status).toBe(200);
+  });
+
   it('advertises the configured Loop helper rather than the inactive API model', async () => {
     await pair();
     const config = defaultConfig();

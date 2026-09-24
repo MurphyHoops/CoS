@@ -50,7 +50,12 @@ import { GOAL_MARKER_INSTRUCTION, templateGoalDecision } from '../shared/goal-te
 import type { GoalBackend } from '../shared/types.js';
 import { createHash } from 'node:crypto';
 import { getConfig } from './config.js';
-import { writeDurableNow, writeDurableSoon } from './durable.js';
+import { writeDurableCheckpointNow, writeDurableNow, writeDurableSoon } from './durable.js';
+import {
+  durableRecoveryPaused,
+  noteDurableRecoveryIncident,
+  resolveDurableRecoveryIncident
+} from './durable-recovery.js';
 import { logInfo, logWarn } from './logger.js';
 import { getSecret } from './secrets.js';
 import { findSessionByConversation, getSession, readEvents, readHandoff, readRecentEvents, turnHasMcpCall } from './session/store.js';
@@ -87,6 +92,40 @@ export type { GoalModel } from '../shared/goal-reasoning.js';
 
 /** Where OpenRouter lives. One host, both routes. */
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
+
+export const GOAL_RECOVERY_REFUSAL =
+  'GOAL_DURABLE_RECOVERY_PAUSED: Goal/Loop durable state could not be read safely, so automatic Goal/Loop ' +
+  'driving is paused until its authority ledgers are recovered.';
+
+export function goalRecoveryPaused(): boolean {
+  return durableRecoveryPaused('goal');
+}
+
+function assertGoalWritable(): void {
+  if (goalRecoveryPaused()) throw new Error('goal_durable_recovery_required');
+}
+
+export async function checkpointGoalLedger(ledger: string, snapshot: unknown): Promise<void> {
+  try {
+    await writeDurableCheckpointNow(ledger, snapshot);
+    resolveDurableRecoveryIncident('goal', ledger, 'backup');
+  } catch (error) {
+    noteDurableRecoveryIncident({
+      domain: 'goal',
+      ledger,
+      copy: 'backup',
+      failure: 'checkpoint_degraded',
+      disposition: 'degraded',
+      detail: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+async function writeGoalLedgerNow(ledger: string, snapshot: unknown): Promise<void> {
+  assertGoalWritable();
+  await writeDurableNow(ledger, snapshot);
+  await checkpointGoalLedger(ledger, snapshot);
+}
 
 /**
  * Sent so a key's owner can see which application spent it, which OpenRouter asks for and
@@ -428,6 +467,7 @@ const goalReplies = new Map<string, GoalReplyObligation>();
 let goalReplyTransportPausedAt: number | null = null;
 let goalReplyWrites: Promise<unknown> = Promise.resolve();
 function serialGoalReply<T>(work: () => Promise<T>): Promise<T> {
+  assertGoalWritable();
   const result = goalReplyWrites.then(work, work);
   goalReplyWrites = result.catch(() => undefined);
   return result;
@@ -480,6 +520,45 @@ export interface GoalRepliesSnapshot {
   transportPausedAt?: number | null;
 }
 
+function validGoalConversationId(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-z-]{8,256}$/i.test(value);
+}
+
+function validGoalIdentity(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 200;
+}
+
+export function validateGoalRepliesSnapshot(value: unknown): value is GoalRepliesSnapshot {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Partial<GoalRepliesSnapshot>;
+  if (raw.version !== 1 || typeof raw.savedAt !== 'number' || !Number.isFinite(raw.savedAt) ||
+      !Array.isArray(raw.replies)) return false;
+  if (!(raw.transportPausedAt === undefined || raw.transportPausedAt === null ||
+        (typeof raw.transportPausedAt === 'number' && Number.isFinite(raw.transportPausedAt)))) return false;
+
+  const conversations = new Set<string>();
+  for (const row of raw.replies) {
+    if (!row || !validGoalConversationId(row.conversationId) ||
+        !validGoalIdentity(row.sessionId) || !validGoalIdentity(row.replyId) ||
+        !validGoalIdentity(row.turnId) ||
+        !Number.isSafeInteger(row.eventSeq) || row.eventSeq < 0 ||
+        (row.eventSeq === 0 && row.replyId !== `turn:${row.turnId}`.slice(0, 200)) ||
+        !Number.isSafeInteger(row.acceptedAt) || row.acceptedAt <= 0 ||
+        (row.state !== 'pending' && row.state !== 'handled') ||
+        conversations.has(row.conversationId)) return false;
+    conversations.add(row.conversationId);
+
+    if (!(row.acceptedBudgetAt === undefined ||
+          (Number.isSafeInteger(row.acceptedBudgetAt) && Number(row.acceptedBudgetAt) > 0))) return false;
+    if (!(row.listenUntil === undefined ||
+          (Number.isSafeInteger(row.listenUntil) && Number(row.listenUntil) >= 0))) return false;
+    if (!(row.silenceSourceTurnId === undefined || validGoalIdentity(row.silenceSourceTurnId))) return false;
+    if (!(row.silencePro === undefined || typeof row.silencePro === 'boolean')) return false;
+    if (!(row.explicitActivation === undefined || typeof row.explicitActivation === 'boolean')) return false;
+  }
+  return true;
+}
+
 function snapshotGoalRepliesFrom(
   source: ReadonlyMap<string, GoalReplyObligation>,
   transportPausedAt: number | null = goalReplyTransportPausedAt
@@ -513,7 +592,7 @@ export async function pauseGoalReplyTransportNow(now = Date.now()): Promise<void
     // then keep that same snapshot queued if persistence fails.
     goalReplyTransportPausedAt = now;
     try {
-      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+      await writeGoalLedgerNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
     } catch (error) {
       persistGoalRepliesSoon();
       throw error;
@@ -533,7 +612,7 @@ export async function resumeGoalReplyTransportNow(now = Date.now()): Promise<voi
       if (reply.listenUntil) reply.listenUntil += overlap;
     }
     try {
-      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate, null));
+      await writeGoalLedgerNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate, null));
       publishGoalReplies(candidate);
       goalReplyTransportPausedAt = null;
     } catch (error) {
@@ -562,7 +641,7 @@ export async function moveGoalReplyNow(
     candidate.set(toConversationId, { ...source, conversationId: toConversationId });
     boundGoalReplyMap(candidate, Date.now());
     try {
-      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate));
+      await writeGoalLedgerNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate));
       publishGoalReplies(candidate);
       return true;
     } catch (error) {
@@ -572,10 +651,11 @@ export async function moveGoalReplyNow(
   });
 }
 
-export function restoreGoalReplies(snapshot: GoalRepliesSnapshot | null): void {
+export function restoreGoalReplies(snapshot: GoalRepliesSnapshot | null): boolean {
   goalReplies.clear();
   goalReplyTransportPausedAt = null;
-  if (!snapshot || snapshot.version !== 1 || !Array.isArray(snapshot.replies)) return;
+  if (!snapshot) return true;
+  if (!validateGoalRepliesSnapshot(snapshot)) return false;
   const now = Date.now();
   const persistedPauseAt = typeof snapshot.transportPausedAt === 'number' && Number.isFinite(snapshot.transportPausedAt)
     ? snapshot.transportPausedAt
@@ -621,9 +701,11 @@ export function restoreGoalReplies(snapshot: GoalRepliesSnapshot | null): void {
     });
   }
   boundGoalReplyMap(goalReplies, Date.now());
+  return true;
 }
 
 function persistGoalRepliesSoon(): void {
+  if (goalRecoveryPaused()) return;
   writeDurableSoon(GOAL_REPLIES_STATE, snapshotGoalReplies());
 }
 
@@ -762,7 +844,7 @@ async function acceptGoalReplyLocked(input: AcceptGoalReplyInput): Promise<void>
     });
     boundGoalReplyMap(candidate, Date.now());
     try {
-      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate));
+      await writeGoalLedgerNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate));
       publishGoalReplies(candidate);
     } catch (error) {
       // A failed generation may retry inside durable.ts. Supersede it with the still-published
@@ -826,6 +908,21 @@ export interface GoalObjectivesSnapshot {
   objectives: Array<{ conversationId: string; objective: string }>;
 }
 
+export function validateGoalObjectivesSnapshot(value: unknown): value is GoalObjectivesSnapshot {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Partial<GoalObjectivesSnapshot>;
+  if (raw.version !== 1 || typeof raw.savedAt !== 'number' || !Number.isFinite(raw.savedAt) ||
+      !Array.isArray(raw.objectives)) return false;
+  const conversations = new Set<string>();
+  for (const row of raw.objectives) {
+    if (!row || !validGoalConversationId(row.conversationId) ||
+        typeof row.objective !== 'string' || row.objective.trim() === '' ||
+        conversations.has(row.conversationId)) return false;
+    conversations.add(row.conversationId);
+  }
+  return true;
+}
+
 /**
  * The specific goal a chat is being driven towards, keyed by conversation.
  *
@@ -842,6 +939,7 @@ export interface GoalObjectivesSnapshot {
 const goalObjectives = new Map<string, string>();
 let goalObjectiveWrites: Promise<unknown> = Promise.resolve();
 function serialGoalObjective<T>(work: () => Promise<T>): Promise<T> {
+  assertGoalWritable();
   const result = goalObjectiveWrites.then(work, work);
   goalObjectiveWrites = result.catch(() => undefined);
   return result;
@@ -865,12 +963,14 @@ function publishGoalObjectives(next: ReadonlyMap<string, string>): void {
 }
 
 function persistGoalObjectives(): void {
+  if (goalRecoveryPaused()) return;
   writeDurableSoon(GOAL_OBJECTIVES_STATE, snapshotGoalObjectives());
 }
 
-export function restoreGoalObjectives(snapshot: GoalObjectivesSnapshot | null): void {
+export function restoreGoalObjectives(snapshot: GoalObjectivesSnapshot | null): boolean {
   goalObjectives.clear();
-  if (!snapshot || snapshot.version !== 1 || !Array.isArray(snapshot.objectives)) return;
+  if (!snapshot) return true;
+  if (!validateGoalObjectivesSnapshot(snapshot)) return false;
   for (const raw of snapshot.objectives) {
     if (!raw || typeof raw.conversationId !== 'string' || !/^[0-9a-z-]{8,256}$/i.test(raw.conversationId)) continue;
     if (typeof raw.objective !== 'string') continue;
@@ -878,6 +978,7 @@ export function restoreGoalObjectives(snapshot: GoalObjectivesSnapshot | null): 
     if (!objective) continue;
     goalObjectives.set(raw.conversationId, objective);
   }
+  return true;
 }
 
 /** This chat's specific goal, or '' when it has none. */
@@ -892,6 +993,7 @@ export function goalObjectiveFor(conversationId: string): string {
  * than the one it sent — the two differ whenever the text had whitespace around it.
  */
 export function setGoalObjective(conversationId: string, text: string): string {
+  assertGoalWritable();
   const goal = text.trim();
   goalObjectives.delete(conversationId);
   if (goal) goalObjectives.set(conversationId, goal);
@@ -915,7 +1017,7 @@ export async function setGoalObjectiveNow(conversationId: string, text: string):
     candidate.delete(conversationId);
     if (goal) candidate.set(conversationId, goal);
     try {
-      await writeDurableNow(GOAL_OBJECTIVES_STATE, snapshotGoalObjectivesFrom(candidate));
+      await writeGoalLedgerNow(GOAL_OBJECTIVES_STATE, snapshotGoalObjectivesFrom(candidate));
       publishGoalObjectives(candidate);
       return goal;
     } catch (error) {
@@ -938,7 +1040,7 @@ export async function moveGoalObjectiveNow(fromConversationId: string, toConvers
     candidate.delete(fromConversationId);
     candidate.set(toConversationId, source);
     try {
-      await writeDurableNow(GOAL_OBJECTIVES_STATE, snapshotGoalObjectivesFrom(candidate));
+      await writeGoalLedgerNow(GOAL_OBJECTIVES_STATE, snapshotGoalObjectivesFrom(candidate));
       publishGoalObjectives(candidate);
       return true;
     } catch (error) {
@@ -955,7 +1057,7 @@ export async function clearGoalObjectiveNow(conversationId: string): Promise<boo
     const candidate = new Map(goalObjectives);
     candidate.delete(conversationId);
     try {
-      await writeDurableNow(GOAL_OBJECTIVES_STATE, snapshotGoalObjectivesFrom(candidate));
+      await writeGoalLedgerNow(GOAL_OBJECTIVES_STATE, snapshotGoalObjectivesFrom(candidate));
       publishGoalObjectives(candidate);
       return true;
     } catch (error) {
@@ -981,7 +1083,7 @@ export async function repairGoalObjectiveProjectionNow(
     candidate.delete(fromConversationId);
     if (!candidate.has(toConversationId)) candidate.set(toConversationId, source);
     try {
-      await writeDurableNow(GOAL_OBJECTIVES_STATE, snapshotGoalObjectivesFrom(candidate));
+      await writeGoalLedgerNow(GOAL_OBJECTIVES_STATE, snapshotGoalObjectivesFrom(candidate));
       publishGoalObjectives(candidate);
       return true;
     } catch (error) {
@@ -992,11 +1094,13 @@ export async function repairGoalObjectiveProjectionNow(
 }
 
 export function clearGoalObjective(conversationId: string): void {
+  assertGoalWritable();
   if (goalObjectives.delete(conversationId)) persistGoalObjectives();
 }
 
 /** Moves one chat-owned objective to the replacement conversation used by Compact & Resume. */
 export function moveGoalObjective(fromConversationId: string, toConversationId: string): boolean {
+  assertGoalWritable();
   if (!fromConversationId || !toConversationId || fromConversationId === toConversationId) return false;
   const objective = goalObjectives.get(fromConversationId);
   if (!objective) return false;
@@ -1053,9 +1157,37 @@ export interface GoalSwitchesSnapshot {
  */
 type GoalSwitchRow = { enabled: boolean; mode: GoalMode; afterTurn?: boolean; at: number; role?: 'decision'; sourceSessionId?: string;
   context?: { count: number; hash: string; instructions: string } };
+
+export function validateGoalSwitchesSnapshot(value: unknown): value is GoalSwitchesSnapshot {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Partial<GoalSwitchesSnapshot>;
+  if (raw.version !== 1 || typeof raw.savedAt !== 'number' || !Number.isFinite(raw.savedAt) ||
+      !Array.isArray(raw.switches)) return false;
+
+  const conversations = new Set<string>();
+  const sources = new Set<string>();
+  for (const row of raw.switches) {
+    if (!row || !validGoalConversationId(row.conversationId) ||
+        typeof row.enabled !== 'boolean' ||
+        (row.mode !== 'goal' && row.mode !== 'loop') ||
+        !(row.role === undefined || row.role === 'decision') ||
+        !(row.afterTurn === undefined || typeof row.afterTurn === 'boolean') ||
+        conversations.has(row.conversationId)) return false;
+    conversations.add(row.conversationId);
+
+    if (row.role === 'decision' && row.sourceSessionId !== undefined) {
+      if (typeof row.sourceSessionId !== 'string' || !/^[\w-]{8,64}$/.test(row.sourceSessionId) ||
+          sources.has(row.sourceSessionId)) return false;
+      sources.add(row.sourceSessionId);
+    }
+  }
+  return true;
+}
+
 const goalSwitches = new Map<string, GoalSwitchRow>();
 let goalSwitchWrites: Promise<unknown> = Promise.resolve();
 function serialGoalSwitch<T>(work: () => Promise<T>): Promise<T> {
+  assertGoalWritable();
   const result = goalSwitchWrites.then(work, work);
   goalSwitchWrites = result.catch(() => undefined);
   return result;
@@ -1097,9 +1229,10 @@ function publishGoalSwitches(next: ReadonlyMap<string, GoalSwitchRow>): void {
   for (const [conversationId, row] of next) goalSwitches.set(conversationId, row);
 }
 
-export function restoreGoalSwitches(snapshot: GoalSwitchesSnapshot | null): void {
+export function restoreGoalSwitches(snapshot: GoalSwitchesSnapshot | null): boolean {
   goalSwitches.clear();
-  if (!snapshot || snapshot.version !== 1 || !Array.isArray(snapshot.switches)) return;
+  if (!snapshot) return true;
+  if (!validateGoalSwitchesSnapshot(snapshot)) return false;
   for (const raw of snapshot.switches) {
     if (!raw || typeof raw.conversationId !== 'string' || !/^[0-9a-z-]{8,256}$/i.test(raw.conversationId)) continue;
     if (typeof raw.enabled !== 'boolean' || (raw.mode !== 'goal' && raw.mode !== 'loop')) continue;
@@ -1113,9 +1246,11 @@ export function restoreGoalSwitches(snapshot: GoalSwitchesSnapshot | null): void
       ...(raw.role === 'decision' ? { role: 'decision' as const, sourceSessionId, context } : {}) });
   }
   boundGoalSwitchMap(goalSwitches);
+  return true;
 }
 
 function persistGoalSwitches(): void {
+  if (goalRecoveryPaused()) return;
   writeDurableSoon(GOAL_SWITCHES_STATE, snapshotGoalSwitches());
 }
 
@@ -1129,6 +1264,7 @@ export function goalSwitchFor(conversationId: string): { enabled: boolean; mode:
 
 /** One authority for finish generation and the lifetime of its queued instruction. */
 export function automaticFinishEnabled(conversationId: string): boolean {
+  if (goalRecoveryPaused()) return false;
   // Finish is another boundary of this chat's Goal/Loop, not a separate grant.
   // A legacy global finish action must never arm a chat whose effective mode is Off.
   return goalSwitchFor(conversationId).enabled;
@@ -1156,7 +1292,7 @@ export function registerGoalDecisionChat(conversationId: string, sourceSessionId
     candidate.set(conversationId, row);
     boundGoalSwitchMap(candidate);
     try {
-      await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
+      await writeGoalLedgerNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
       publishGoalSwitches(candidate);
     } catch (error) {
       writeDurableSoon(GOAL_SWITCHES_STATE, snapshotGoalSwitches());
@@ -1167,7 +1303,7 @@ export function registerGoalDecisionChat(conversationId: string, sourceSessionId
 
 /** Is the loop switched on for this chat — ignoring worker identity, which the bridge owns. */
 export function goalSwitchEnabledFor(conversationId: string): boolean {
-  return goalSwitchFor(conversationId).enabled;
+  return !goalRecoveryPaused() && goalSwitchFor(conversationId).enabled;
 }
 
 /**
@@ -1179,6 +1315,7 @@ export function goalSwitchEnabledFor(conversationId: string): boolean {
  * places that ask — the route and the ticket below — must never drift apart.
  */
 export function goalArmedFor(conversationId: string): boolean {
+  if (goalRecoveryPaused()) return false;
   const held = goalSwitchFor(conversationId);
   if (held.own) return held.enabled;
   return held.enabled || goalObjectiveFor(conversationId) !== '';
@@ -1210,7 +1347,7 @@ export async function setGoalSwitchNow(
       afterTurn: afterTurn ?? before?.afterTurn ?? false, at: Date.now() });
     boundGoalSwitchMap(candidate);
     try {
-      await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
+      await writeGoalLedgerNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
       publishGoalSwitches(candidate);
     } catch (error) {
       writeDurableSoon(GOAL_SWITCHES_STATE, snapshotGoalSwitches());
@@ -1230,6 +1367,7 @@ export async function setGoalSwitchNow(
  * "stop everything".
  */
 export function clearAllGoalSwitches(): void {
+  assertGoalWritable();
   if (goalSwitches.size === 0) return;
   for (const [id, row] of goalSwitches) if (row.role !== 'decision') goalSwitches.delete(id);
   persistGoalSwitches();
@@ -1246,7 +1384,7 @@ export async function clearAllGoalSwitchesNow(): Promise<void> {
     publishGoalSwitches(candidate);
     notifyGoalChange();
     try {
-      await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
+      await writeGoalLedgerNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
     } catch (error) {
       // Keep the conservative live revocation and retain the same safe snapshot for retry.
       writeDurableSoon(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
@@ -1257,6 +1395,7 @@ export async function clearAllGoalSwitchesNow(): Promise<void> {
 
 /** Drops one chat's override, putting it back under the app-wide setting. */
 export function clearGoalSwitch(conversationId: string): void {
+  assertGoalWritable();
   if (isGoalDecisionChat(conversationId)) return;
   if (goalSwitches.delete(conversationId)) persistGoalSwitches();
 }
@@ -1275,7 +1414,7 @@ export async function moveGoalSwitchNow(fromConversationId: string, toConversati
     candidate.set(toConversationId, source);
     boundGoalSwitchMap(candidate);
     try {
-      await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
+      await writeGoalLedgerNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
       publishGoalSwitches(candidate);
       return true;
     } catch (error) {
@@ -1292,7 +1431,7 @@ export async function clearGoalSwitchNow(conversationId: string): Promise<boolea
     const candidate = new Map(goalSwitches);
     candidate.delete(conversationId);
     try {
-      await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
+      await writeGoalLedgerNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
       publishGoalSwitches(candidate);
       notifyGoalChange();
       return true;
@@ -1319,7 +1458,7 @@ export async function repairGoalSwitchProjectionNow(
     if (!candidate.has(toConversationId)) candidate.set(toConversationId, source);
     boundGoalSwitchMap(candidate);
     try {
-      await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
+      await writeGoalLedgerNow(GOAL_SWITCHES_STATE, snapshotGoalSwitchesFrom(candidate));
       publishGoalSwitches(candidate);
       notifyGoalChange();
       return true;
@@ -1331,6 +1470,7 @@ export async function repairGoalSwitchProjectionNow(
 }
 
 export function moveGoalSwitch(fromConversationId: string, toConversationId: string): boolean {
+  assertGoalWritable();
   if (!fromConversationId || !toConversationId || fromConversationId === toConversationId) return false;
   if (isGoalDecisionChat(fromConversationId) || isGoalDecisionChat(toConversationId)) return false;
   const row = goalSwitches.get(fromConversationId);
@@ -1444,6 +1584,7 @@ export async function retryGoalBrowserHelper(sourceSessionId: string, inputId: s
  * and both are the same fact here: this draft is spent.
  */
 export function ackGoalDraft(conversationId: string, token: string, clientId?: string, persistReply = true): boolean {
+  if (goalRecoveryPaused()) return false;
   const draft = drafts.get(conversationId);
   if (!draft || draft.token !== token) return false;
   if (clientId !== undefined && draft.clientId !== clientId) return false;
@@ -1475,7 +1616,7 @@ export async function ackGoalDraftNow(
     const acknowledged = ackGoalDraft(conversationId, token, clientId, false);
     if (!acknowledged) return false;
     try {
-      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+      await writeGoalLedgerNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
     } catch (error) {
       persistGoalRepliesSoon();
       throw error;
@@ -1520,7 +1661,7 @@ export async function retireGoalDraftsNow(retireReplies = false): Promise<number
     const retired = retireGoalDraftsCore(true, false);
     if (goalReplies.size === 0) return retired;
     try {
-      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+      await writeGoalLedgerNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
     } catch (error) {
       // Revocation is already live. Keep the same conservative state queued for recovery.
       persistGoalRepliesSoon();
@@ -1565,7 +1706,7 @@ export async function retireGoalDraftsForNow(conversationId: string, preserveRep
     const changed = retireGoalDraftsForCore(conversationId, preserveReply, false);
     if (preserveReply || (!changed && !hadReply)) return changed;
     try {
-      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+      await writeGoalLedgerNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
     } catch (error) {
       // Retirement is a revocation. Keep it live and queue the same authoritative snapshot.
       persistGoalRepliesSoon();
@@ -1596,7 +1737,7 @@ export async function discardGoalReplyForRecoveryNow(conversationId: string): Pr
     const candidate = candidateGoalReplies();
     candidate.delete(conversationId);
     try {
-      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate));
+      await writeGoalLedgerNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate));
       publishGoalReplies(candidate);
       return true;
     } catch (error) {
@@ -1681,7 +1822,7 @@ async function setGoalReplyActiveLocked(
   }
   if (active) next.explicitActivation = true;
   try {
-    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate));
+    await writeGoalLedgerNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate));
     publishGoalReplies(candidate);
   } catch (error) {
     persistGoalRepliesSoon();
@@ -1694,7 +1835,7 @@ async function setGoalReplyActiveLocked(
     // keep that stricter state queued if its durable retirement fails.
     published.state = 'handled';
     try {
-      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+      await writeGoalLedgerNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
     } catch (error) {
       persistGoalRepliesSoon();
       throw error;
@@ -1726,7 +1867,7 @@ export async function withdrawSilenceGoalReplyNow(conversationId: string, replyI
     // This is revocation of fabricated authority: publish absence before the durable write.
     publishGoalReplies(candidate);
     try {
-      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+      await writeGoalLedgerNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
     } catch (error) {
       persistGoalRepliesSoon();
       throw error;
@@ -1757,7 +1898,7 @@ export async function deferSilenceGoalReplyNow(conversationId: string, turnId: s
     if (!next || next.replyId !== reply.replyId) return false;
     next.listenUntil = deadline;
     try {
-      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate));
+      await writeGoalLedgerNow(GOAL_REPLIES_STATE, snapshotGoalRepliesFrom(candidate));
       publishGoalReplies(candidate);
       notifyGoalChange();
       return true;
@@ -1801,6 +1942,7 @@ export interface StartGoalDraftInput {
  * service-worker restart would drop.
  */
 export function startGoalDraft(input: StartGoalDraftInput): GoalDraftView {
+  assertGoalWritable();
   const existing = drafts.get(input.conversationId);
   const clientId = input.clientId ?? '';
   if (existing) expireDraftPayload(existing);
@@ -1875,6 +2017,7 @@ function parkGoalDraftForTransport(draft: GoalDraft): void {
 
 /** Starts provider work only after the bridge has durably committed this reserved turn. */
 export function beginGoalDraft(conversationId: string, token: string): boolean {
+  if (goalRecoveryPaused()) return false;
   const draft = drafts.get(conversationId);
   if (!draft || draft.token !== token || draft.acknowledged || draft.work) return false;
   if (providerTransportUnavailable()) {
@@ -1894,7 +2037,7 @@ export function beginGoalDraft(conversationId: string, token: string): boolean {
 
 /** Restarts only drafts that previously crossed the durable reply boundary then lost transport. */
 export function resumeTransportParkedGoalDrafts(): number {
-  if (providerTransportUnavailable()) return 0;
+  if (goalRecoveryPaused() || providerTransportUnavailable()) return 0;
   let resumed = 0;
   for (const draft of drafts.values()) {
     if (draft.stage !== 'sending' || draft.error !== 'transport_suspended' ||
