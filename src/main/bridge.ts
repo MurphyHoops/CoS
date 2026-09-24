@@ -77,8 +77,9 @@ import {
   goalViewFor,
   pendingGoalReplies,
   retireGoalDrafts,
+  retireGoalDraftsNow,
   goalDraftNeedsIntervention,
-  retireGoalDraftsFor,
+  retireGoalDraftsForNow,
   setGoalReplyActiveNow,
   withdrawSilenceGoalReplyNow,
   setGoalObjectiveNow,
@@ -3898,13 +3899,23 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           return held.enabled ? held.mode : null;
         })()
       : null;
-    const next = await updateConfig((config) => {
+    const globalGoalOffRequest = !scoped && which !== null && (goal ?? loop) === false;
+    const next = await updateConfig(async (config) => {
       driving = config.goal.enabled ? config.goal.mode : null;
-      return {
+      const proposed = {
         ...config,
         compaction: auto === null ? config.compaction : { ...config.compaction, auto },
         goal: scoped ? config.goal : applyGoalSwitch(config.goal, which, goal ?? loop)
       };
+      // A failed earlier Off may have published config before its durable cancellation landed.
+      // Never publish On until the old authority owner has converged to the conservative state.
+      if (auto === true && !config.compaction.auto) await cancelAutomaticResumesNow();
+      if (!scoped && !config.goal.enabled && proposed.goal.enabled) await retireGoalDraftsNow(true);
+      return proposed;
+    }, async () => {
+      // Explicit Off is idempotent recovery: retrying the same request still has to cross the
+      // reply ledger barrier even when config.json already says Off from an earlier failed try.
+      if (globalGoalOffRequest) await retireGoalDraftsNow(true);
     });
     const chatSwitch = scoped
       ? await setGoalSwitchNow(settingsConversation as string, which as 'goal' | 'loop', (goal ?? loop) as boolean)
@@ -3941,8 +3952,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           return json(res, 503, { error: 'goal_ticket_not_durable', retryable: true }, origin);
         }
       }
-    } else if (driving !== (next.goal.enabled ? next.goal.mode : null)) {
-      retireGoalDrafts(!next.goal.enabled);
+    } else if (driving !== (next.goal.enabled ? next.goal.mode : null) && next.goal.enabled) {
+      retireGoalDrafts(false);
     }
     // The app's own settings screen is showing these two switches as well.
     changed();
@@ -8307,7 +8318,7 @@ function retireSpentRepairs(): void {
  * out is kept until exactly this line runs, so that a reload which did not help is not repeated
  * — see `retireSpentRepairs`. This call is the proof that it did help.
  */
-function noteCallAttribution(
+async function noteCallAttribution(
   conversationId: string | null,
   sessionId: string,
   currentConversation: boolean,
@@ -8317,7 +8328,7 @@ function noteCallAttribution(
   requestId: string | null = null,
   reopenedTurnId: string | null = null,
   filedSession: SessionSummary | null = null
-): void {
+): Promise<void> {
   if (conversationId) {
     // MCP truth can grow while a Pro page emits no new observation. The just-filed
     // canonical summary, not a later browser poll, owns the worker's context meter.
@@ -8333,7 +8344,7 @@ function noteCallAttribution(
     // went on calling tools. Whatever Goal was drafting for that end — or had filed as owed —
     // was a reply to an answer that has not been given. The real end, when the page sees it,
     // files its own obligation.
-    if (reopenedTurnId && retireGoalDraftsFor(conversationId)) {
+    if (reopenedTurnId && await retireGoalDraftsForNow(conversationId)) {
       forgetGoalWatch(conversationId);
       logInfo(`goal: withdrew the decision owed for turn ${reopenedTurnId} of ${conversationId} — the turn is still running`);
     }

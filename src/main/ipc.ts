@@ -47,7 +47,7 @@ import {
 import { MAX_GOAL_SYSTEM_PROMPT_CHARS } from '../shared/goal.js';
 import { applySettings, connect, disconnect, getStatus, onStatusChange } from './connection.js';
 import { effectiveCapabilities, getConfig, updateConfig, MAX_MCP_INSTRUCTIONS_CHARS } from './config.js';
-import { clearAllGoalSwitches, draftTaskPlan, listGoalModels, MODEL_PAGE_SIZE, retireGoalDrafts, goalBackendFor, goalSwitchFor, setGoalSwitchNow, setGoalReplyActiveNow, setGoalObjectiveNow } from './goal.js';
+import { clearAllGoalSwitchesNow, draftTaskPlan, listGoalModels, MODEL_PAGE_SIZE, retireGoalDrafts, retireGoalDraftsNow, goalBackendFor, goalSwitchFor, setGoalSwitchNow, setGoalReplyActiveNow, setGoalObjectiveNow } from './goal.js';
 import { forgetExposedSurface } from './mcp/server.js';
 import { runDiagnostics } from './diagnostics.js';
 import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, onLog } from './logger.js';
@@ -432,99 +432,81 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
 
   handle('settings:save', async (payload) => {
     const request = settingsSave.parse(payload);
-    const before = getConfig();
-    const next = await updateConfig(async config => {
+    await updateConfig(async config => {
       const proposed = { ...config, ...mergeSettings(config, request.base, request.patch) };
       // If an earlier Off retirement failed, On must retry it before admission.
       if (!config.ui.finishTool && proposed.ui.finishTool) await cancelFinishInputs(false);
       else if (!config.goal.impulseMinutes && (proposed.goal.impulseMinutes ?? 0) > 0) await cancelFinishInputs(true);
+      if (!config.goal.enabled && proposed.goal.enabled) {
+        await clearAllGoalSwitchesNow();
+        await retireGoalDraftsNow(true);
+      }
+      if (!config.multiAgent.enabled && proposed.multiAgent.enabled) {
+        if (!(await persistAgentAuthorityNow())) {
+          throw new Error('Multi-agent re-enable has no immediate durable authority persistence sink.');
+        }
+      }
       return proposed;
     }, async (published, previous) => {
       if (previous.ui.finishTool && !published.ui.finishTool) await cancelFinishInputs(false);
       else if ((previous.goal.impulseMinutes ?? 0) > 0 && !published.goal.impulseMinutes) await cancelFinishInputs(true);
-    });
-    // Renderer palette changes are immediate, so keep OS/Electron-owned chrome in lock-step too.
-    // Without this, selecting Dark on macOS left the title bar, menus and file picker in the
-    // system theme until restart (and startup still defaulted to system before index.ts applies it).
-    nativeTheme.themeSource = next.ui.theme;
-    if (process.platform === 'win32') getWindow()?.setTitleBarOverlay(titleBarOverlayForTheme(next.ui.theme));
-    // BrowserWindow's native backing color is fixed at construction unless updated explicitly.
-    // Keep it in lock-step too: the default macOS application menu exposes Reload, and after a
-    // live theme switch an old opposite background otherwise flashes behind the renderer while it
-    // paints again. This is also the color Electron shows during any later renderer reload/failure.
-    getWindow()?.setBackgroundColor(next.ui.theme === 'dark' ? '#0e0e11' : '#ffffff');
-    if (
-      before.goal.enabled !== next.goal.enabled ||
-      // The mode is authority too: a draft started as a gate must not be typed after the user
-      // asked for a loop, and a loop draft must not be typed after they asked for a gate.
-      before.goal.mode !== next.goal.mode ||
-      before.goal.model !== next.goal.model ||
-      before.goal.backend !== next.goal.backend ||
-      before.goal.loopBackend !== next.goal.loopBackend ||
-      before.goal.helperModel !== next.goal.helperModel || before.goal.helperReasoning !== next.goal.helperReasoning ||
-      before.goal.provider.kind !== next.goal.provider.kind ||
-      before.goal.provider.baseUrl !== next.goal.provider.baseUrl ||
-      before.goal.reasoning !== next.goal.reasoning ||
-      before.goal.prompt !== next.goal.prompt ||
-      before.goal.objectivePrompt !== next.goal.objectivePrompt ||
-      before.goal.loopPrompt !== next.goal.loopPrompt
-    ) {
-      retireGoalDrafts(before.goal.enabled && !next.goal.enabled);
-    }
-    // The app-wide switch going off is the master stop, and has to actually stop things. Chats
-    // carry their own Goal/Loop answer now, so without this the one control that looks like it
-    // governs everything would govern only the chats that never disagreed with it — and a loop
-    // somebody wanted stopped would go on running with nowhere obvious to switch it off.
-    // Turning it *on* deliberately does not reach into a chat that has said no.
-    if (before.goal.enabled && !next.goal.enabled) clearAllGoalSwitches();
-    // Explicit settings changes replace discovery's monotonic snapshot. Otherwise
-    // disabled permissions/finish/session tools remain published and no schema change
-    // reaches automatic plugin refresh. Cosmetic saves must not invalidate discovery.
-    if (before.multiAgent.enabled !== next.multiAgent.enabled || before.sessions.record !== next.sessions.record ||
-        before.ui.finishTool !== next.ui.finishTool ||
-        JSON.stringify(effectiveCapabilities(before)) !== JSON.stringify(effectiveCapabilities(next))) forgetExposedSurface();
-    // Order matters, and it used to be wrong. Pausing the run and withdrawing worker browser
-    // commands has to happen while the bridge can still cancel those transports; stopping the
-    // bridge first left queued worker/revival commands behind for a later restart to deliver.
-    let authorityPersistError: Error | null = null;
-    if (!next.multiAgent.enabled) {
-      // Off pauses execution; it is not the destructive Clear swarm action. Preserve every
-      // prime-owned worker history so re-enable/restart can still show and revive exact chats.
-      pauseSwarmForDisable();
-      cancelWorkerCommands('multi-agent mode was turned off');
-      try {
-        if (!(await persistAgentAuthorityNow())) {
-          throw new Error('Multi-agent teardown has no immediate durable persistence sink.');
-        }
-      } catch (error) {
-        authorityPersistError = error instanceof Error ? error : new Error(String(error));
+      // Every transition-sensitive side effect belongs to the same serialized config operation
+      // as the write that established its exact previous state. A second save cannot observe the
+      // new config and overtake cleanup that still belongs to the first save.
+      // Renderer palette changes are immediate, so keep OS/Electron-owned chrome in lock-step too.
+      nativeTheme.themeSource = published.ui.theme;
+      if (process.platform === 'win32') getWindow()?.setTitleBarOverlay(titleBarOverlayForTheme(published.ui.theme));
+      getWindow()?.setBackgroundColor(published.ui.theme === 'dark' ? '#0e0e11' : '#ffffff');
+      if (
+        previous.goal.enabled !== published.goal.enabled ||
+        previous.goal.mode !== published.goal.mode ||
+        previous.goal.model !== published.goal.model ||
+        previous.goal.backend !== published.goal.backend ||
+        previous.goal.loopBackend !== published.goal.loopBackend ||
+        previous.goal.helperModel !== published.goal.helperModel || previous.goal.helperReasoning !== published.goal.helperReasoning ||
+        previous.goal.provider.kind !== published.goal.provider.kind ||
+        previous.goal.provider.baseUrl !== published.goal.provider.baseUrl ||
+        previous.goal.reasoning !== published.goal.reasoning ||
+        previous.goal.prompt !== published.goal.prompt ||
+        previous.goal.objectivePrompt !== published.goal.objectivePrompt ||
+        previous.goal.loopPrompt !== published.goal.loopPrompt
+      ) {
+        if (previous.goal.enabled && !published.goal.enabled) await retireGoalDraftsNow(true);
+        else retireGoalDrafts(false);
       }
-    }
-    // Recording, workers and direct browser tools share the same extension transport.
-    // Startup and settings saves use one eligibility rule.
-    if (browserExtensionRequired(next)) await startBridge();
-    else await stopBridge();
-    if (before.capabilities.screen !== next.capabilities.screen || before.capabilities.control !== next.capabilities.control || before.readOnly !== next.readOnly) wakeBrowserWork('browser-control');
-    // Permissions and the second tunnel id both decide whether the optional Desktop
-    // connector should be published. Without this, enabling desktop access or pasting its
-    // tunnel id left the connector unpublished until the user happened to reconnect, with
-    // the card still saying "not published" and nothing explaining why.
-    await applySettings();
-    if (before.ui.autoRefreshPlugins !== next.ui.autoRefreshPlugins) wakeBrowserWork();
-    logInfo('settings updated');
-    // The config and runtime side effects above still complete so the app does not stay half-on,
-    // but the UI must not be told the pause was safely accepted when its retained authority
-    // snapshot failed to cross disk. Startup with the feature off restores and canonicalizes
-    // that same history instead of deleting it.
-    // Login registration is an independent OS preference. Cosmetic saves do not rewrite
-    // it, and its failure cannot interrupt permission publication or Goal/worker teardown.
-    let loginStartupError: unknown;
-    if ((before.ui.startAtLogin === true) !== (next.ui.startAtLogin === true)) {
-      try { applyLoginStartup(app, next.ui.startAtLogin === true); }
-      catch (error) { loginStartupError = error; }
-    }
-    if (authorityPersistError) throw authorityPersistError;
-    if (loginStartupError) throw loginStartupError;
+      if (previous.goal.enabled && !published.goal.enabled) await clearAllGoalSwitchesNow();
+      if (previous.multiAgent.enabled !== published.multiAgent.enabled || previous.sessions.record !== published.sessions.record ||
+          previous.ui.finishTool !== published.ui.finishTool ||
+          JSON.stringify(effectiveCapabilities(previous)) !== JSON.stringify(effectiveCapabilities(published))) forgetExposedSurface();
+
+      let authorityPersistError: Error | null = null;
+      if (!published.multiAgent.enabled) {
+        pauseSwarmForDisable();
+        cancelWorkerCommands('multi-agent mode was turned off');
+        try {
+          if (!(await persistAgentAuthorityNow())) {
+            throw new Error('Multi-agent teardown has no immediate durable persistence sink.');
+          }
+        } catch (error) {
+          authorityPersistError = error instanceof Error ? error : new Error(String(error));
+        }
+      }
+      if (browserExtensionRequired(published)) await startBridge();
+      else await stopBridge();
+      if (previous.capabilities.screen !== published.capabilities.screen || previous.capabilities.control !== published.capabilities.control ||
+          previous.readOnly !== published.readOnly) wakeBrowserWork('browser-control');
+      await applySettings();
+      if (previous.ui.autoRefreshPlugins !== published.ui.autoRefreshPlugins) wakeBrowserWork();
+
+      let loginStartupError: unknown;
+      if ((previous.ui.startAtLogin === true) !== (published.ui.startAtLogin === true)) {
+        try { applyLoginStartup(app, published.ui.startAtLogin === true); }
+        catch (error) { loginStartupError = error; }
+      }
+      logInfo('settings updated');
+      if (authorityPersistError) throw authorityPersistError;
+      if (loginStartupError) throw loginStartupError;
+    });
     return buildState();
   });
 
@@ -936,7 +918,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     if (!conversationId || !/^[0-9a-z-]{8,64}$/i.test(conversationId)) {
       throw new Error('This session has no valid ChatGPT conversation');
     }
-    setChatBlocked(conversationId, blocked);
+    await setChatBlocked(conversationId, blocked);
     logInfo(
       blocked
         ? `conversation ${conversationId} blocked; its tool calls are refused until it is released`
@@ -950,16 +932,15 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
 
   handle('sessions:delete', async (payload) => {
     const { id } = sessionIdArg.parse(payload);
-    // Detach first. The recorder maps live ChatGPT conversations to session ids, so
-    // deleting the folder underneath a live one left it appending to a session that no
-    // longer existed — the events went to a resurrected half-session with no summary.
-    // Forgetting the mapping makes the next observation open a fresh session instead.
-    const detached = forgetSession(id);
-    // Release first. The block button lives on this row, so a block left behind by the row's
-    // deletion would refuse that conversation's tools with nothing left in the app that could
-    // ever release it.
+    // Release before removing either owner of the recovery path. The block button lives on this
+    // row, and the recorder still points the live conversation at it; if the durable Release
+    // fails, the handler must leave both intact so the user can retry instead of acknowledging a
+    // deletion that stranded a block or detached a session that still exists.
     const summary = await getSession(id);
-    if (summary?.conversationId) setChatBlocked(summary.conversationId, false);
+    if (summary?.conversationId) await setChatBlocked(summary.conversationId, false);
+    // Once Release is durable, detach before deleting the folder. Otherwise a live page could
+    // append into a session directory while it is being removed and resurrect a half-session.
+    const detached = forgetSession(id);
     await deleteSession(id);
     logInfo(
       detached.length > 0

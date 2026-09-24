@@ -527,6 +527,49 @@ describe('turning multi-agent mode off', () => {
     ]);
   });
 
+  it('does not publish Off→On until a failed disable authority snapshot has been durably retried', async () => {
+    const prime = '26262626-3333-4444-8555-666666666666';
+    const worker = 'bcbcbcbc-cccc-4ddd-8eee-ffffffffffff';
+    spawn({ workers: [{ task: 'must not resurrect active after failed disable persistence' }], caller: { conversationId: prime } });
+    expect(bindConversation('worker-1', worker)).toBe(true);
+    expect(await persistAgentAuthorityNow()).toBe(true);
+
+    const target = path.join(dir, 'state', 'ipc-swarm.json');
+    const realRename = fs.rename.bind(fs);
+    let failed = false;
+    const rename = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (!failed && String(to) === target) {
+        failed = true;
+        throw Object.assign(new Error('injected swarm disable persistence failure'), { code: 'EBUSY' });
+      }
+      return realRename(from, to);
+    });
+    const disabled = await save(settings({ record: false, multiAgent: false }));
+    expect(disabled).toMatchObject({ ok: false, error: 'injected swarm disable persistence failure' });
+    expect(getConfig().multiAgent.enabled).toBe(false);
+    rename.mockRestore();
+
+    // Re-enable must first drain the conservative parked authority state left by the failed Off.
+    const enabled = await save(settings({ record: false, multiAgent: true }));
+    expect(enabled.ok, enabled.error).toBe(true);
+    const saved = await readDurable<any>('ipc-swarm');
+    expect(saved?.runId).toBeNull();
+    expect(saved?.dormantRuns).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        primeConversationId: prime,
+        agents: expect.arrayContaining([
+          expect.objectContaining({ info: expect.objectContaining({ id: 'worker-1', conversationId: worker, state: 'sleeping' }) })
+        ])
+      })
+    ]));
+
+    // Model restart with config already On: stale pre-disable authority must not return.
+    restoreSwarm(saved);
+    expect(swarmStateForCaller({ conversationId: prime }).agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+      state: 'sleeping', conversationId: worker
+    });
+  });
+
   it('preserves every parked owner when disabling a different prime that is still active', async () => {
     const primeA = '33333333-4444-4555-8666-777777777777';
     const workerA = 'cccccccc-dddd-4eee-8fff-000000000001';
@@ -633,6 +676,53 @@ describe('ChatGPT browser settings', () => {
 });
 
 describe('settings writes from more than one UI', () => {
+  it('serializes a rapid Goal Off→On behind the Off durable cleanup', async () => {
+    const goal = await import('../src/main/goal.js');
+    const conversationId = 'settings-goal-ordering-test';
+    const base = defaultConfig();
+    await saveConfig({ ...base, goal: { ...base.goal, enabled: true } });
+    await goal.setGoalSwitchNow(conversationId, 'loop', true);
+    expect(goal.goalSwitchFor(conversationId)).toMatchObject({ enabled: true, own: true, mode: 'loop' });
+
+    const target = path.join(dir, 'state', 'goal-switches.json');
+    const realRename = fs.rename.bind(fs);
+    let entered!: () => void;
+    let release!: () => void;
+    const atBarrier = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let held = false;
+    const rename = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (!held && String(to) === target) {
+        held = true;
+        entered();
+        await gate;
+      }
+      return realRename(from, to);
+    });
+
+    const beforeOff = getConfig();
+    const off = save({ ...beforeOff, goal: { ...beforeOff.goal, enabled: false } }, beforeOff);
+    await atBarrier;
+    let onSettled = false;
+    const beforeOn = { ...getConfig(), goal: { ...getConfig().goal, enabled: false } };
+    const on = save({ ...beforeOn, goal: { ...beforeOn.goal, enabled: true } }, beforeOn)
+      .finally(() => { onSettled = true; });
+    try {
+      expect(getConfig().goal.enabled).toBe(false);
+      expect(goal.goalSwitchFor(conversationId).own).toBe(false);
+      await Promise.resolve();
+      expect(onSettled).toBe(false);
+    } finally {
+      release();
+    }
+
+    expect((await off).ok).toBe(true);
+    expect((await on).ok).toBe(true);
+    expect(getConfig().goal.enabled).toBe(true);
+    expect(goal.goalSwitchFor(conversationId).own).toBe(false);
+    rename.mockRestore();
+  });
+
   it('validates and persists the Plugins tunnel id through Settings, including explicit clearing', async () => {
     const base = defaultConfig(); await saveConfig(base);
     const tunnelId = `tunnel_${'a'.repeat(32)}`;
@@ -1154,6 +1244,43 @@ describe('session IPC contracts', () => {
     resetBlockedChatsForTests();
   });
 
+  it('reports failed durable Block and Release writes instead of acknowledging them through IPC', async () => {
+    const blockedChats = await import('../src/main/session/blocked-chats.js');
+    blockedChats.resetBlockedChatsForTests();
+    const conversationId = 'eeeeeeee-1111-2222-3333-444444444444';
+    const session = await createSession({ title: 'durable block acknowledgement', conversationId });
+    const target = path.join(dir, 'state', 'blocked-chats.json');
+    const realRename = fs.rename.bind(fs);
+
+    const failNextBlockedWrite = (message: string) => {
+      let failed = false;
+      const rename = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+        if (!failed && String(to) === target) {
+          failed = true;
+          throw Object.assign(new Error(message), { code: 'EBUSY' });
+        }
+        return realRename(from, to);
+      });
+      return rename;
+    };
+
+    let rename = failNextBlockedWrite('block persistence failed');
+    const rejectedBlock = (await handlers.get('sessions:block')!(null, { id: session.id, blocked: true })) as any;
+    expect(rejectedBlock).toMatchObject({ ok: false, error: 'block persistence failed' });
+    expect(blockedChats.isChatBlocked(conversationId)).toBe(true);
+    rename.mockRestore();
+    expect(await handlers.get('sessions:block')!(null, { id: session.id, blocked: true })).toMatchObject({ ok: true });
+
+    rename = failNextBlockedWrite('release persistence failed');
+    const rejectedRelease = (await handlers.get('sessions:block')!(null, { id: session.id, blocked: false })) as any;
+    expect(rejectedRelease).toMatchObject({ ok: false, error: 'release persistence failed' });
+    expect(blockedChats.isChatBlocked(conversationId)).toBe(true);
+    rename.mockRestore();
+    expect(await handlers.get('sessions:block')!(null, { id: session.id, blocked: false })).toMatchObject({ ok: true, data: [] });
+    expect(blockedChats.isChatBlocked(conversationId)).toBe(false);
+    blockedChats.resetBlockedChatsForTests();
+  });
+
   it('releases a block when the row that carries its button is deleted', async () => {
     const { isChatBlocked, resetBlockedChatsForTests } = await import('../src/main/session/blocked-chats.js');
     resetBlockedChatsForTests();
@@ -1166,6 +1293,46 @@ describe('session IPC contracts', () => {
     expect(deleted.ok, deleted.error).toBe(true);
     // Otherwise the conversation stays refused with nothing left in the app to release it.
     expect(isChatBlocked(conversationId)).toBe(false);
+  });
+
+  it('keeps the blocked row and live recorder binding when deletion cannot durably release it', async () => {
+    const blockedChats = await import('../src/main/session/blocked-chats.js');
+    const recorder = await import('../src/main/session/recorder.js');
+    const store = await import('../src/main/session/store.js');
+    blockedChats.resetBlockedChatsForTests();
+    const conversationId = 'dddddddd-1111-2222-3333-444444444444';
+    const sessionId = await recorder.sessionForConversation(conversationId, 'blocked delete failure');
+    expect(sessionId).not.toBeNull();
+    await handlers.get('sessions:block')!(null, { id: sessionId, blocked: true });
+    expect(blockedChats.isChatBlocked(conversationId)).toBe(true);
+    expect(recorder.sessionIdForConversation(conversationId)).toBe(sessionId);
+
+    const target = path.join(dir, 'state', 'blocked-chats.json');
+    const realRename = fs.rename.bind(fs);
+    const failure = Object.assign(new Error('injected blocked release failure'), { code: 'EBUSY' });
+    let failed = false;
+    const rename = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (!failed && String(to) === target) {
+        failed = true;
+        throw failure;
+      }
+      return realRename(from, to);
+    });
+    try {
+      const deleted = (await handlers.get('sessions:delete')!(null, { id: sessionId })) as any;
+      expect(deleted).toMatchObject({ ok: false, error: 'injected blocked release failure' });
+      expect(blockedChats.isChatBlocked(conversationId)).toBe(true);
+      expect(await store.getSession(sessionId!)).not.toBeNull();
+      expect(recorder.sessionIdForConversation(conversationId)).toBe(sessionId);
+    } finally {
+      rename.mockRestore();
+    }
+
+    const retried = (await handlers.get('sessions:delete')!(null, { id: sessionId })) as any;
+    expect(retried.ok, retried.error).toBe(true);
+    expect(blockedChats.isChatBlocked(conversationId)).toBe(false);
+    expect(recorder.sessionIdForConversation(conversationId)).toBeNull();
+    blockedChats.resetBlockedChatsForTests();
   });
 
   it('reports the blocked set with every session list, so one paint marks every row', async () => {

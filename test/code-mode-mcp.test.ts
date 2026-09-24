@@ -440,7 +440,7 @@ it('rechecks a block or superseded chat before the next nested action', async ()
     vi.spyOn(backend, 'readTextFile').mockImplementationOnce(async (...args) => {
       const result = await original(...args);
       if (superseded) expect(await rebindSession(who.session.id, who.conversationId, randomUUID())).toBe(true);
-      else setChatBlocked(who.conversationId, true);
+      else await setChatBlocked(who.conversationId, true);
       return result;
     });
     const response = await call(who.requestId, 'await tools.read({paths:["/workspace/alpha.txt"]}); text(await tools.read({paths:["/workspace/beta.txt"]}));');

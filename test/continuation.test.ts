@@ -2,9 +2,9 @@
  * The Compact & Resume transaction: moving one durable local session from chat A to chat B.
  *
  * Every test here is about the failure half of that move rather than the happy path. The
- * invariant the whole design exists to protect is that a commit either lands completely or
- * leaves the session attached to chat A — never a session on disk in B with its swarm, its
- * workspace or its recorded history still in A. So these drive the races directly: two
+ * invariant the whole design exists to protect is monotonic ownership: before the session
+ * metadata commit, A remains authoritative; after that commit, recovery only converges forward
+ * to B while the continuation WAL stays fenced at `committing`. So these drive the races directly: two
  * claimants, a claim arriving mid-commit, a sweep firing mid-commit, an abort mid-commit, a
  * durable write that fails, and a handover deadline crossed while the write is in flight.
  */
@@ -33,11 +33,12 @@ const {
   finishAgent,
   freezePrimeTransfer,
   noteAgentContextTokens,
+  onSwarmPersistNow,
   pendingWorkerRevivals,
   primeConversation,
   primeConversationGone,
   releaseQuiescentRun,
-  repairPrimeConversationAfterRecovery,
+  repairPrimeConversationAfterRecoveryNow,
   resetAgentsForTests,
   sendMessage,
   snapshotSwarm,
@@ -81,13 +82,22 @@ const { createSession, getSession, initSessionStore, resetSessionStoreForTests, 
   '../src/main/session/store.js'
 );
 const store = await import('../src/main/session/store.js');
+const { initDurableStore, readDurable, resetDurableForTests, writeDurableNow } = await import('../src/main/durable.js');
+const {
+  armLongRunWaitNow,
+  executionEpochFor,
+  resetLongRunStateForTests
+} = await import('../src/main/session/long-run.js');
 const { recordChatObservations, resetRecorderForTests, sessionForConversation } = await import('../src/main/session/recorder.js');
 const { resetWorkspaces, setWorkspaceFor, workspaceEntries } = await import('../src/main/workspace.js');
 const {
   goalObjectiveFor,
   goalPendingReplyFor,
   goalSwitchFor,
+  restoreGoalObjectives,
   restoreGoalReplies,
+  restoreGoalSwitches,
+  setGoalObjectiveNow,
   setGoalSwitchNow,
   resetGoalStateForTests,
   setGoalObjective
@@ -118,6 +128,7 @@ beforeAll(async () => {
   dir = await makeTempDir('clf-continuation-');
   initConfigPath(dir);
   initSessionStore(dir);
+  initDurableStore(dir);
   const config = defaultConfig();
   await saveConfig({ ...config, multiAgent: { ...config.multiAgent, enabled: true, maxWorkers: 3 } });
 });
@@ -127,8 +138,13 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
+  resetDurableForTests();
+  initDurableStore(dir);
   resetContinuationsForTests();
   resetAgentsForTests();
+  resetLongRunStateForTests();
+  onSwarmPersistNow(async (snapshot) => writeDurableNow('continuation-swarm', snapshot));
+  setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecoveryNow });
   resetRecorderForTests();
   resetWorkspaces();
   resetGoalStateForTests();
@@ -409,17 +425,20 @@ describe('claiming', () => {
 
     // Hold the durable write open, so the commit is provably mid-flight.
     let release = (): void => undefined;
+    let entered!: () => void;
     const held = new Promise<void>((resolve) => {
       release = resolve;
     });
+    const atWrite = new Promise<void>((resolve) => { entered = resolve; });
     const real = store.rebindSession;
     const spy = vi.spyOn(store, 'rebindSession').mockImplementation(async (...args) => {
+      entered();
       await held;
       return real(...args);
     });
 
     const commit = commitContinuation(token, CHAT_B);
-    await Promise.resolve();
+    await atWrite;
     expect(continuationForSession(sessionId)?.state).toBe('committing');
 
     // The retrying claimant wants its brief; what it must not get is the state put back to
@@ -466,8 +485,105 @@ describe('committing', () => {
     expect(goalSwitchFor(CHAT_A).own).toBe(false);
     expect(goalPendingReplyFor(CHAT_A)).toBeNull();
     expect(goalPendingReplyFor(CHAT_B)).toBeNull();
+
+    // The continuation is not committed until A's old reply debt is durably retired too.
+    const savedObjectives = await readDurable<any>('goal-objectives');
+    const savedSwitches = await readDurable<any>('goal-switches');
+    expect(savedObjectives?.objectives).toEqual(expect.arrayContaining([
+      expect.objectContaining({ conversationId: CHAT_B, objective: 'finish the overnight release' })
+    ]));
+    expect(savedObjectives?.objectives.some((row: any) => row.conversationId === CHAT_A)).toBe(false);
+    expect(savedSwitches?.switches).toEqual(expect.arrayContaining([
+      expect.objectContaining({ conversationId: CHAT_B, enabled: true, mode: 'loop', afterTurn: true })
+    ]));
+    expect(savedSwitches?.switches.some((row: any) => row.conversationId === CHAT_A)).toBe(false);
     await restoreContinuations(snapshotContinuations());
     expect(goalSwitchFor(CHAT_B)).toMatchObject({ enabled: true, mode: 'loop', afterTurn: true });
+  });
+
+  it('does not commit a valid A→B continuation until A reply debt is durably retired', async () => {
+    const from = '11111111-aaaa-bbbb-cccc-111111111111';
+    const to = '22222222-aaaa-bbbb-cccc-222222222222';
+    const source = await createSession({ title: 'reply retirement source', conversationId: from });
+    const opened = await openContinuationNow(source.id, from);
+    await attachSummary(opened.token, SAMPLE_BRIEF);
+    restoreGoalReplies({
+      version: 1,
+      savedAt: Date.now(),
+      replies: [{
+        conversationId: from,
+        sessionId: source.id,
+        replyId: 'source-final',
+        turnId: 'source-turn',
+        eventSeq: 1,
+        acceptedAt: Date.now(),
+        state: 'pending'
+      }]
+    });
+    expect(goalPendingReplyFor(from)).toMatchObject({ replyId: 'source-final' });
+    await claimContinuationNow(opened.token, 'reply-retirement-owner');
+
+    expect(await commitContinuation(opened.token, to)).toBe(true);
+    const savedReplies = await readDurable<any>('goal-replies');
+    expect(savedReplies?.replies).toEqual(expect.arrayContaining([
+      expect.objectContaining({ conversationId: from, replyId: 'source-final', state: 'handled' })
+    ]));
+
+    resetGoalStateForTests();
+    restoreGoalReplies(savedReplies);
+    expect(goalPendingReplyFor(from)).toBeNull();
+    expect(goalPendingReplyFor(to)).toBeNull();
+  });
+
+  it('keeps the WAL committing when durable A reply retirement fails, then converges forward', async () => {
+    const from = '33333333-aaaa-bbbb-cccc-333333333333';
+    const to = '44444444-aaaa-bbbb-cccc-444444444444';
+    const source = await createSession({ title: 'reply retirement retry source', conversationId: from });
+    const opened = await openContinuationNow(source.id, from);
+    await attachSummary(opened.token, SAMPLE_BRIEF);
+    const pendingReplies = {
+      version: 1 as const,
+      savedAt: Date.now(),
+      replies: [{
+        conversationId: from,
+        sessionId: source.id,
+        replyId: 'retry-final',
+        turnId: 'retry-turn',
+        eventSeq: 1,
+        acceptedAt: Date.now(),
+        state: 'pending' as const
+      }]
+    };
+    restoreGoalReplies(pendingReplies);
+    await writeDurableNow('goal-replies', pendingReplies);
+    await claimContinuationNow(opened.token, 'reply-retirement-retry-owner');
+
+    const realRename = fs.rename.bind(fs);
+    let failed = false;
+    const rename = vi.spyOn(fs, 'rename').mockImplementation(async (fromPath, toPath) => {
+      if (!failed && String(toPath).endsWith('goal-replies.json')) {
+        failed = true;
+        throw new Error('injected reply retirement failure');
+      }
+      return realRename(fromPath, toPath);
+    });
+    try {
+      expect(await commitContinuation(opened.token, to)).toBe(false);
+    } finally {
+      rename.mockRestore();
+    }
+    expect(await attachedChat(source.id)).toBe(to);
+    expect(continuationForSession(source.id)).toMatchObject({ state: 'committing', to });
+    expect(goalPendingReplyFor(from)).toBeNull();
+    expect((await readDurable<any>('goal-replies'))?.replies).toEqual(expect.arrayContaining([
+      expect.objectContaining({ conversationId: from, replyId: 'retry-final', state: 'pending' })
+    ]));
+
+    expect(await commitContinuation(opened.token, to)).toBe(true);
+    expect(continuationByToken(opened.token)?.state).toBe('committed');
+    expect((await readDurable<any>('goal-replies'))?.replies).toEqual(expect.arrayContaining([
+      expect.objectContaining({ conversationId: from, replyId: 'retry-final', state: 'handled' })
+    ]));
   });
 
   it('refuses a chat B that is not a distinct conversation', async () => {
@@ -495,6 +611,42 @@ describe('committing', () => {
     expect(await commitContinuation(token, CHAT_B)).toBe(true);
     expect(await attachedChat(sessionId)).toBe(CHAT_B);
     expect((await getSession(sessionId))?.lastCommittedResumeHandoffId).toBe(committedHandoffId);
+  });
+
+  it('keeps a committed A→B move fenced and retryable until Goal projection is durable', async () => {
+    const { sessionId, token } = await readyContinuation();
+    await setGoalObjectiveNow(CHAT_A, 'projection must converge forward');
+    await setGoalSwitchNow(CHAT_A, 'loop', true);
+    await claimContinuationNow(token, 'tab-1');
+
+    const realRename = fs.rename.bind(fs);
+    let failed = false;
+    const rename = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (!failed && String(to).endsWith('goal-objectives.json')) {
+        failed = true;
+        throw new Error('injected Goal projection failure');
+      }
+      return realRename(from, to);
+    });
+    try {
+      expect(await commitContinuation(token, CHAT_B)).toBe(false);
+    } finally {
+      rename.mockRestore();
+    }
+
+    // Session metadata is the A→B commit. The failed secondary ledger stays on A and the WAL
+    // remains committing, so old A cannot be treated as a fresh independent continuation.
+    expect(await attachedChat(sessionId)).toBe(CHAT_B);
+    expect(continuationForSession(sessionId)).toMatchObject({ state: 'committing', to: CHAT_B });
+    expect(goalObjectiveFor(CHAT_A)).toBe('projection must converge forward');
+    expect(goalObjectiveFor(CHAT_B)).toBe('');
+
+    expect(await commitContinuation(token, CHAT_B)).toBe(true);
+    expect(continuationByToken(token)?.state).toBe('committed');
+    expect(goalObjectiveFor(CHAT_A)).toBe('');
+    expect(goalObjectiveFor(CHAT_B)).toBe('projection must converge forward');
+    expect(goalSwitchFor(CHAT_A).own).toBe(false);
+    expect(goalSwitchFor(CHAT_B)).toMatchObject({ enabled: true, mode: 'loop' });
   });
 
   it('treats a repeated ack as the commit that already landed', async () => {
@@ -587,16 +739,19 @@ describe('the commit lock', () => {
     body: () => void | Promise<void>
   ): Promise<boolean> {
     let release = (): void => undefined;
+    let entered!: () => void;
     const held = new Promise<void>((resolve) => {
       release = resolve;
     });
+    const atWrite = new Promise<void>((resolve) => { entered = resolve; });
     const real = store.rebindSession;
     vi.spyOn(store, 'rebindSession').mockImplementation(async (...args) => {
+      entered();
       await held;
       return real(...args);
     });
     const commit = commitContinuation(token, to);
-    await Promise.resolve();
+    await atWrite;
     await body();
     release();
     return commit;
@@ -751,6 +906,7 @@ describe('the swarm handover', () => {
     )).toBe(true);
     expect((await getSession(summary.id))?.lastCommittedResumeHandoffId).toBeNull();
     resetAgentsForTests();
+    onSwarmPersistNow(async (snapshot) => writeDurableNow('continuation-swarm', snapshot));
     restoreSwarm(swarmSnapshot);
     resetGoalStateForTests();
     // This suite deliberately uses short synthetic chat ids (`chat-a`/`chat-b`) that the Goal
@@ -759,7 +915,7 @@ describe('the swarm handover', () => {
     // this integration test isolates the continuation recovery move A→B.
     setGoalObjective(CHAT_A, 'keep the recovery objective attached to this work');
     resetContinuationsForTests();
-    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecovery });
+    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecoveryNow });
 
     await restoreContinuations(continuationSnapshot);
 
@@ -852,6 +1008,109 @@ describe('the swarm handover', () => {
 
     expect(await commitContinuation(opened.token, CHAT_B)).toBe(true);
     expect(primeConversation()).toBe(CHAT_B);
+  });
+
+  it('keeps the WAL committing until the broker move is crash-durable, then retries forward', async () => {
+    const from = '71717171-1111-2222-3333-444444444444';
+    const to = '72727272-1111-2222-3333-444444444444';
+    const summary = await createSession({ title: 'durable prime handover', conversationId: from });
+    startSwarm(from);
+    await writeDurableNow('continuation-swarm', snapshotSwarm());
+    await armLongRunWaitNow({
+      sessionId: summary.id,
+      conversationId: from,
+      sourceTurnId: 'durable-prime-handover-turn',
+      kind: 'timer',
+      dueAt: Date.now() + 60_000,
+      description: 'hold long-run authority on A until broker durability'
+    });
+    const opened = await openContinuationNow(summary.id, from);
+    await attachSummary(opened.token, SAMPLE_BRIEF);
+    await claimContinuationNow(opened.token, 'durable-broker-tab');
+
+    let failOnce = true;
+    onSwarmPersistNow(async (snapshot) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error('injected broker fsync failure');
+      }
+      await writeDurableNow('continuation-swarm', snapshot);
+    });
+    expect(await commitContinuation(opened.token, to)).toBe(false);
+    expect(await attachedChat(summary.id)).toBe(to);
+    expect(continuationForSession(summary.id)).toMatchObject({ state: 'committing', to });
+    expect(primeConversation()).toBe(to);
+    expect((await readDurable<any>('continuation-swarm'))?.primeConversationId).toBe(from);
+    expect(executionEpochFor(summary.id)?.conversationId).toBe(from);
+    expect((await readDurable<any>('long-run'))?.epochs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sessionId: summary.id, conversationId: from })
+    ]));
+
+    expect(await commitContinuation(opened.token, to)).toBe(true);
+    expect(continuationByToken(opened.token)?.state).toBe('committed');
+    expect(executionEpochFor(summary.id)?.conversationId).toBe(to);
+    expect((await readDurable<any>('long-run'))?.epochs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sessionId: summary.id, conversationId: to })
+    ]));
+    const savedSwarm = await readDurable<any>('continuation-swarm');
+    resetAgentsForTests();
+    restoreSwarm(savedSwarm);
+    expect(primeConversation()).toBe(to);
+  });
+
+  it('keeps Goal behind A when Long-Run fsync fails after the broker is already durable on B', async () => {
+    const from = '73737373-1111-2222-3333-444444444444';
+    const to = '74747474-1111-2222-3333-444444444444';
+    const summary = await createSession({ title: 'long-run barrier after broker', conversationId: from });
+    startSwarm(from);
+    await writeDurableNow('continuation-swarm', snapshotSwarm());
+    await setGoalObjectiveNow(from, 'stay on A until long-run is durable');
+    await armLongRunWaitNow({
+      sessionId: summary.id,
+      conversationId: from,
+      sourceTurnId: 'long-run-barrier-turn',
+      kind: 'timer',
+      dueAt: Date.now() + 60_000,
+      description: 'prove broker then long-run ordering'
+    });
+    const opened = await openContinuationNow(summary.id, from);
+    await attachSummary(opened.token, SAMPLE_BRIEF);
+    await claimContinuationNow(opened.token, 'long-run-barrier-tab');
+
+    const realRename = fs.rename.bind(fs);
+    let failed = false;
+    const rename = vi.spyOn(fs, 'rename').mockImplementation(async (fromPath, toPath) => {
+      if (!failed && String(toPath).endsWith('long-run.json')) {
+        failed = true;
+        throw new Error('injected long-run fsync failure');
+      }
+      return realRename(fromPath, toPath);
+    });
+    try {
+      expect(await commitContinuation(opened.token, to)).toBe(false);
+    } finally {
+      rename.mockRestore();
+    }
+
+    expect(await attachedChat(summary.id)).toBe(to);
+    expect(continuationForSession(summary.id)).toMatchObject({ state: 'committing', to });
+    expect(primeConversation()).toBe(to);
+    expect((await readDurable<any>('continuation-swarm'))?.primeConversationId).toBe(to);
+    expect(executionEpochFor(summary.id)?.conversationId).toBe(from);
+    expect((await readDurable<any>('long-run'))?.epochs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sessionId: summary.id, conversationId: from })
+    ]));
+    expect(goalObjectiveFor(from)).toBe('stay on A until long-run is durable');
+    expect(goalObjectiveFor(to)).toBe('');
+
+    expect(await commitContinuation(opened.token, to)).toBe(true);
+    expect(continuationByToken(opened.token)?.state).toBe('committed');
+    expect(executionEpochFor(summary.id)?.conversationId).toBe(to);
+    expect((await readDurable<any>('long-run'))?.epochs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sessionId: summary.id, conversationId: to })
+    ]));
+    expect(goalObjectiveFor(from)).toBe('');
+    expect(goalObjectiveFor(to)).toBe('stay on A until long-run is durable');
   });
 
   it('commits a handover however long the handoff turn took', async () => {
@@ -1354,6 +1613,23 @@ describe('the window in which a replacement chat is expected', () => {
     const to = '82828282-1111-2222-3333-444444444444';
     const source = await createSession({ title: 'prime before broken resume', conversationId: from });
     setGoalObjective(from, 'finish the release from the replacement chat');
+    await setGoalSwitchNow(from, 'loop', true);
+    const sourceReply = {
+      version: 1 as const,
+      savedAt: Date.now(),
+      replies: [{
+        conversationId: from,
+        sessionId: source.id,
+        replyId: 'shadow-source-final',
+        turnId: 'shadow-source-turn',
+        eventSeq: 1,
+        acceptedAt: Date.now(),
+        state: 'pending' as const
+      }]
+    };
+    restoreGoalReplies(sourceReply);
+    await writeDurableNow('goal-replies', sourceReply);
+    expect(goalPendingReplyFor(from)).toMatchObject({ replyId: 'shadow-source-final' });
     setWorkspaceFor(`chat:${from}`, { virtual: '/workspace/project', real: dir });
     spawn({ workers: [{ task: 'keep the reusable worker alive' }], caller: { conversationId: from } });
     const opened = await openContinuationNow(source.id, from);
@@ -1380,17 +1656,52 @@ describe('the window in which a replacement chat is expected', () => {
     // the objective/workspace just because some other resume attempt from A once collided.
     const unrelated = '83838383-1111-2222-3333-444444444444';
     await createSession({ title: 'ordinary unrelated chat', conversationId: unrelated });
-    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecovery });
+    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecoveryNow });
     expect(await repairPrimeFromResumeShadow(unrelated)).toBe(false);
     expect(goalObjectiveFor(from)).toBe('finish the release from the replacement chat');
     expect(goalObjectiveFor(unrelated)).toBe('');
     expect(workspaceEntries().filter((held) => held.key.startsWith('chat:')).map((held) => held.key)).toEqual([`chat:${from}`]);
 
-    expect(await repairPrimeFromResumeShadow(to)).toBe(true);
+    // The broker fence is a durable boundary. Goal/reply projection may not start merely because
+    // the live run already names B while the swarm snapshot is still waiting for fsync.
+    let brokerEntered!: () => void;
+    let releaseBroker!: () => void;
+    const atBrokerBarrier = new Promise<void>((resolve) => { brokerEntered = resolve; });
+    const brokerGate = new Promise<void>((resolve) => { releaseBroker = resolve; });
+    onSwarmPersistNow(async (snapshot) => {
+      brokerEntered();
+      await brokerGate;
+      await writeDurableNow('continuation-swarm', snapshot);
+    });
+    const repairing = repairPrimeFromResumeShadow(to);
+    await atBrokerBarrier;
+    expect(primeConversation()).toBe(to);
+    expect(goalObjectiveFor(from)).toBe('finish the release from the replacement chat');
+    expect(goalObjectiveFor(to)).toBe('');
+    expect(goalPendingReplyFor(from)).toMatchObject({ replyId: 'shadow-source-final' });
+    releaseBroker();
+    expect(await repairing).toBe(true);
     expect(primeConversation()).toBe(to);
     expect(goalObjectiveFor(from)).toBe('');
     expect(goalObjectiveFor(to)).toBe('finish the release from the replacement chat');
+    expect(goalSwitchFor(from).own).toBe(false);
+    expect(goalSwitchFor(to)).toMatchObject({ own: true, enabled: true, mode: 'loop' });
+    expect(goalPendingReplyFor(from)).toBeNull();
     expect(workspaceEntries().filter((held) => held.key.startsWith('chat:')).map((held) => held.key)).toEqual([`chat:${to}`]);
+
+    const savedObjectives = await readDurable<any>('goal-objectives');
+    const savedSwitches = await readDurable<any>('goal-switches');
+    const savedReplies = await readDurable<any>('goal-replies');
+    expect(savedReplies?.replies.some((row: any) => row.conversationId === from)).toBe(false);
+    resetGoalStateForTests();
+    restoreGoalObjectives(savedObjectives);
+    restoreGoalSwitches(savedSwitches);
+    restoreGoalReplies(savedReplies);
+    expect(goalObjectiveFor(from)).toBe('');
+    expect(goalObjectiveFor(to)).toBe('finish the release from the replacement chat');
+    expect(goalSwitchFor(from).own).toBe(false);
+    expect(goalSwitchFor(to)).toMatchObject({ own: true, enabled: true, mode: 'loop' });
+    expect(goalPendingReplyFor(from)).toBeNull();
 
     // The broker hook itself intentionally treats an already-satisfied replay as success. The
     // resume-shadow wrapper reports actual projection changes, so a later browser poll is a no-op.
@@ -1426,7 +1737,7 @@ describe('the window in which a replacement chat is expected', () => {
     ]);
     expect(await commitContinuation(opened.token, to)).toBe(false);
     abortContinuation(opened.token, 'the replacement chat already belongs to another local session');
-    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecovery });
+    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecoveryNow });
 
     const results = await Promise.all([repairPrimeFromResumeShadow(to), repairPrimeFromResumeShadow(to)]);
     expect(results.filter(Boolean)).toHaveLength(1);
@@ -1475,7 +1786,7 @@ describe('the window in which a replacement chat is expected', () => {
     expect(goalObjectiveFor(shadowChat)).toBe('');
     expect(goalObjectiveFor(currentChat)).toBe('');
 
-    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecovery });
+    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecoveryNow });
     expect(await repairPrimeFromResumeShadow(currentChat)).toBe(true);
     expect(primeConversation()).toBe(currentChat);
     expect(goalObjectiveFor(from)).toBe('');
@@ -1505,7 +1816,7 @@ describe('the window in which a replacement chat is expected', () => {
     ]);
 
     resetContinuationsForTests();
-    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecovery });
+    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecoveryNow });
     expect(await repairPrimeFromResumeShadow(to)).toBe(false);
     expect(primeConversation()).toBe(from);
     expect(goalObjectiveFor(from)).toBe('do not let an unrelated resume-looking chat steal this');
@@ -1538,7 +1849,7 @@ describe('the window in which a replacement chat is expected', () => {
     // those newer target-owned choices with stale A state; it only removes A's stale projections.
     setGoalObjective(to, 'newer goal already chosen in the resumed chat');
     setWorkspaceFor(`chat:${to}`, { virtual: '/workspace/newer', real: dir });
-    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecovery });
+    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecoveryNow });
     expect(await repairPrimeFromResumeShadow(to)).toBe(true);
     expect(goalObjectiveFor(from)).toBe('');
     expect(goalObjectiveFor(to)).toBe('newer goal already chosen in the resumed chat');
@@ -1547,7 +1858,7 @@ describe('the window in which a replacement chat is expected', () => {
     ]);
   });
 
-  it('finishes missing projection repair when the same old run already moved its prime ownership to the shadow', async () => {
+  it('re-enters the durable broker fence when a legacy shadow retry already has live Prime on B', async () => {
     const from = '8c8c8c8c-1111-2222-3333-444444444444';
     const to = '8d8d8d8d-1111-2222-3333-444444444444';
     const source = await createSession({ title: 'source with separately repaired ownership', conversationId: from });
@@ -1570,18 +1881,197 @@ describe('the window in which a replacement chat is expected', () => {
     expect(await commitContinuation(broken.token, to)).toBe(false);
     abortContinuation(broken.token, 'the replacement chat already belongs to another local session');
 
-    // This models the exact live machine: old code/another recovery path already repaired only
-    // swarm ownership A→B/C, while Goal/workspace stayed on A. Source A is no longer an owner.
-    expect(repairPrimeConversationAfterRecovery(from, to)).toBe(true);
+    // First attempt mutates the live broker A→B, but its fsync fails. Disk must remain on A and
+    // every Goal/workspace projection must remain behind that failed broker durability boundary.
+    await writeDurableNow('continuation-swarm', snapshotSwarm());
+    let failOnce = true;
+    onSwarmPersistNow(async (snapshot) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error('injected legacy broker fsync failure');
+      }
+      await writeDurableNow('continuation-swarm', snapshot);
+    });
+    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecoveryNow });
+    await expect(repairPrimeFromResumeShadow(to)).rejects.toThrow('injected legacy broker fsync failure');
     expect(primeConversation()).toBe(to);
     expect(goalObjectiveFor(from)).toBe('goal still stranded after ownership repaired first');
+    expect(goalObjectiveFor(to)).toBe('');
+    expect((await readDurable<any>('continuation-swarm'))?.primeConversationId).toBe(from);
+    expect(workspaceEntries().filter((held) => held.key.startsWith('chat:')).map((held) => held.key)).toEqual([`chat:${from}`]);
 
-    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecovery });
+    // Same-process retry sees live B already owning the run, but that is not a durability ACK. It
+    // must invoke the broker hook again, fsync B, and only then project Goal/workspace forward.
     expect(await repairPrimeFromResumeShadow(to)).toBe(true);
     expect(primeConversation()).toBe(to);
+    expect((await readDurable<any>('continuation-swarm'))?.primeConversationId).toBe(to);
     expect(goalObjectiveFor(from)).toBe('');
     expect(goalObjectiveFor(to)).toBe('goal still stranded after ownership repaired first');
     expect(workspaceEntries().filter((held) => held.key.startsWith('chat:')).map((held) => held.key)).toEqual([`chat:${to}`]);
+  });
+
+  it('does not early-return a pure broker retry while its critical A→B revision is still unpersisted', async () => {
+    const from = '8cbcbcbc-1111-2222-3333-444444444444';
+    const to = '8dbdbdbd-1111-2222-3333-444444444444';
+    const source = await createSession({ title: 'pure broker shadow retry', conversationId: from });
+    spawn({ workers: [{ task: 'keep only broker ownership alive for retry' }], caller: { conversationId: from } });
+
+    const broken = await openContinuationNow(source.id, from);
+    const handoff = await attachSummary(broken.token, SAMPLE_BRIEF);
+    expect(handoff).not.toBeNull();
+    await claimContinuationNow(broken.token, 'pure-broker-shadow-owner');
+    await createSession({
+      title: 'Resumed · pure broker shadow retry',
+      conversationId: to,
+      origin: { kind: 'resume', fromSessionId: source.id, agentId: null, task: '' }
+    });
+    await recordChatObservations(to, [
+      { kind: 'user_message', time: Date.now(), text: resumeBootstrapText(handoff!.text), messageId: 'm-pure-broker-bootstrap' }
+    ]);
+    expect(await commitContinuation(broken.token, to)).toBe(false);
+    abortContinuation(broken.token, 'the replacement chat already belongs to another local session');
+    expect(goalObjectiveFor(from)).toBe('');
+    expect(workspaceEntries().filter((held) => held.key.startsWith('chat:'))).toEqual([]);
+
+    await writeDurableNow('continuation-swarm', snapshotSwarm());
+    let failOnce = true;
+    onSwarmPersistNow(async (snapshot) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error('injected pure broker fsync failure');
+      }
+      await writeDurableNow('continuation-swarm', snapshot);
+    });
+
+    await expect(repairPrimeFromResumeShadow(to)).rejects.toThrow('injected pure broker fsync failure');
+    expect(primeConversation()).toBe(to);
+    expect((await readDurable<any>('continuation-swarm'))?.primeConversationId).toBe(from);
+
+    // There is no Goal/workspace/reply residue to keep the repair path alive. The pending critical
+    // revision itself must suppress the old fast-path return long enough to fsync live B.
+    expect(await repairPrimeFromResumeShadow(to)).toBe(false);
+    expect((await readDurable<any>('continuation-swarm'))?.primeConversationId).toBe(to);
+    // Once the pending revision is drained, the cheap no-projection fast path is safe again.
+    expect(await repairPrimeFromResumeShadow(to)).toBe(false);
+  });
+
+  it('retries a stranded Goal switch after broker/objective repair committed before its durable write failed', async () => {
+    const from = '8c9c9c9c-1111-2222-3333-444444444444';
+    const to = '8d9d9d9d-1111-2222-3333-444444444444';
+    const source = await createSession({ title: 'source with switch write failure', conversationId: from });
+    await setGoalObjectiveNow(from, 'objective can finish before the switch write');
+    await setGoalSwitchNow(from, 'loop', true);
+    spawn({ workers: [{ task: 'keep exact old prime ownership for switch retry' }], caller: { conversationId: from } });
+
+    const broken = await openContinuationNow(source.id, from);
+    const handoff = await attachSummary(broken.token, SAMPLE_BRIEF);
+    expect(handoff).not.toBeNull();
+    await claimContinuationNow(broken.token, 'switch-failure-shadow-owner');
+    await createSession({
+      title: 'Resumed · source with switch write failure',
+      conversationId: to,
+      origin: { kind: 'resume', fromSessionId: source.id, agentId: null, task: '' }
+    });
+    await recordChatObservations(to, [
+      { kind: 'user_message', time: Date.now(), text: resumeBootstrapText(handoff!.text), messageId: 'm-switch-failure-bootstrap' }
+    ]);
+    expect(await commitContinuation(broken.token, to)).toBe(false);
+    abortContinuation(broken.token, 'the replacement chat already belongs to another local session');
+    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecoveryNow });
+
+    const realRename = fs.rename.bind(fs);
+    let failed = false;
+    const rename = vi.spyOn(fs, 'rename').mockImplementation(async (fromPath, toPath) => {
+      if (!failed && String(toPath).endsWith('goal-switches.json')) {
+        failed = true;
+        throw new Error('injected legacy switch projection failure');
+      }
+      return realRename(fromPath, toPath);
+    });
+    try {
+      await expect(repairPrimeFromResumeShadow(to)).rejects.toThrow('injected legacy switch projection failure');
+    } finally {
+      rename.mockRestore();
+    }
+    expect(primeConversation()).toBe(to);
+    expect(goalObjectiveFor(from)).toBe('');
+    expect(goalObjectiveFor(to)).toBe('objective can finish before the switch write');
+    expect(goalSwitchFor(from)).toMatchObject({ own: true, enabled: true, mode: 'loop' });
+    expect(goalSwitchFor(to).own).toBe(false);
+
+    expect(await repairPrimeFromResumeShadow(to)).toBe(true);
+    expect(goalSwitchFor(from).own).toBe(false);
+    expect(goalSwitchFor(to)).toMatchObject({ own: true, enabled: true, mode: 'loop' });
+    const savedSwitches = await readDurable<any>('goal-switches');
+    expect(savedSwitches?.switches).toEqual(expect.arrayContaining([
+      expect.objectContaining({ conversationId: to, enabled: true, mode: 'loop' })
+    ]));
+    expect(savedSwitches?.switches.some((row: any) => row.conversationId === from)).toBe(false);
+  });
+
+  it('retries legacy source-reply retirement when that row is the only projection left on A', async () => {
+    const from = '8cacacac-1111-2222-3333-444444444444';
+    const to = '8dadadad-1111-2222-3333-444444444444';
+    const source = await createSession({ title: 'source with reply retirement failure', conversationId: from });
+    await setGoalObjectiveNow(from, 'move this objective before reply cleanup fails');
+    const sourceReply = {
+      version: 1 as const,
+      savedAt: Date.now(),
+      replies: [{
+        conversationId: from,
+        sessionId: source.id,
+        replyId: 'legacy-reply-retry',
+        turnId: 'legacy-reply-turn',
+        eventSeq: 1,
+        acceptedAt: Date.now(),
+        state: 'pending' as const
+      }]
+    };
+    restoreGoalReplies(sourceReply);
+    await writeDurableNow('goal-replies', sourceReply);
+    spawn({ workers: [{ task: 'keep exact old prime ownership for reply cleanup retry' }], caller: { conversationId: from } });
+
+    const broken = await openContinuationNow(source.id, from);
+    const handoff = await attachSummary(broken.token, SAMPLE_BRIEF);
+    expect(handoff).not.toBeNull();
+    await claimContinuationNow(broken.token, 'reply-failure-shadow-owner');
+    await createSession({
+      title: 'Resumed · source with reply retirement failure',
+      conversationId: to,
+      origin: { kind: 'resume', fromSessionId: source.id, agentId: null, task: '' }
+    });
+    await recordChatObservations(to, [
+      { kind: 'user_message', time: Date.now(), text: resumeBootstrapText(handoff!.text), messageId: 'm-reply-failure-bootstrap' }
+    ]);
+    expect(await commitContinuation(broken.token, to)).toBe(false);
+    abortContinuation(broken.token, 'the replacement chat already belongs to another local session');
+
+    const realRename = fs.rename.bind(fs);
+    let failed = false;
+    const rename = vi.spyOn(fs, 'rename').mockImplementation(async (fromPath, toPath) => {
+      if (!failed && String(toPath).endsWith('goal-replies.json')) {
+        failed = true;
+        throw new Error('injected legacy reply retirement failure');
+      }
+      return realRename(fromPath, toPath);
+    });
+    try {
+      await expect(repairPrimeFromResumeShadow(to)).rejects.toThrow('injected legacy reply retirement failure');
+    } finally {
+      rename.mockRestore();
+    }
+    expect(primeConversation()).toBe(to);
+    expect(goalObjectiveFor(from)).toBe('');
+    expect(goalObjectiveFor(to)).toBe('move this objective before reply cleanup fails');
+    expect(workspaceEntries().filter((held) => held.key.startsWith('chat:'))).toEqual([]);
+    expect(goalSwitchFor(from).own).toBe(false);
+    // Live authority is already revoked, but the row remains as retry evidence until deletion fsyncs.
+    expect(goalPendingReplyFor(from)).toBeNull();
+
+    expect(await repairPrimeFromResumeShadow(to)).toBe(true);
+    const savedReplies = await readDurable<any>('goal-replies');
+    expect(savedReplies?.replies.some((row: any) => row.conversationId === from)).toBe(false);
+    expect(await repairPrimeFromResumeShadow(to)).toBe(false);
   });
 
   it('refuses to merge an old parked prime into the same shadow chat after that chat starts an independent fresh run', async () => {
@@ -1616,7 +2106,7 @@ describe('the window in which a replacement chat is expected', () => {
     // conversations proves these are two owners, even though C still has the genuine old bootstrap.
     spawn({ workers: [{ task: 'fresh independent run in the descendant chat' }], caller: { conversationId: to } });
     expect(primeConversation()).toBe(to);
-    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecovery });
+    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecoveryNow });
     expect(await repairPrimeFromResumeShadow(to)).toBe(false);
     expect(goalObjectiveFor(from)).toBe('old parked goal must stay isolated');
     expect(goalObjectiveFor(to)).toBe('');

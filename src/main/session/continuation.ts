@@ -34,14 +34,15 @@
  *               a failure leaves chat A attached in memory *and* on disk. On failure the
  *               preflight is undone: the freeze is released and the transaction is claimable
  *               again.
- *   publish   — the live recorder mapping, the workspace key, the swarm's prime binding. Pure
- *               in-memory map work, none of it able to throw or to change its mind, running
- *               only once the durable record already says chat B.
+ *   project   — durable chat-owned Goal/Loop projections move forward under this continuation's
+ *               WAL, then rebuildable recorder/workspace/swarm projections follow. A failed
+ *               projection leaves the WAL at committing, so restart/retry converges toward B
+ *               instead of rolling the already-committed session back to A.
  *
- * So there is no window in which the session is in B while the workspace or the swarm is
- * still in A. The one thing the publish phase can still find missing is the run itself, if it
- * ended while the write was in flight — and a run that no longer exists has no prime left in
- * chat A to be inconsistent with.
+ * Session metadata is the authoritative A→B commit. Rebuildable process projections may lag
+ * while a durable secondary ledger is retrying, but the continuation WAL fences that transition
+ * and recovery only moves forward. A run that ends while the commit is in flight has no prime
+ * left in chat A to resurrect.
  *
  * The state is flipped to `committing` *synchronously*, before the first await, so two
  * replacement chats racing to commit cannot both pass the check; the loser is refused and
@@ -59,12 +60,20 @@ import {
   agentForOwnedConversation,
   beginPrimeTransfer,
   cancelPrimeTransfer,
-  commitPrimeTransfer,
+  commitPrimeTransferNow,
+  criticalSwarmPersistencePending,
   freezePrimeTransfer,
   thawPrimeTransfer
 } from '../agents.js';
 import { clearChatWorkspace, moveChatWorkspace, workspaceForChat } from '../workspace.js';
-import { clearGoalObjective, clearGoalSwitch, goalObjectiveFor, goalSwitchFor, moveGoalObjective, moveGoalSwitch } from '../goal.js';
+import {
+  goalObjectiveFor,
+  goalReplyRecordedFor,
+  goalSwitchFor,
+  discardGoalReplyForRecoveryNow,
+  repairGoalObjectiveProjectionNow,
+  repairGoalSwitchProjectionNow,
+} from '../goal.js';
 import { writeDurableNow, writeDurableSoon } from '../durable.js';
 import { prepareHandoff, resumeBootstrapMatches } from './handoff.js';
 import { ensureHandoffRecorded, recordHandoff, recordNote } from './recorder.js';
@@ -487,7 +496,7 @@ export interface ContinuationRecoveryHooks {
    * still use the frozen transfer guard. Prime wires this to the broker's WAL-authorised
    * repair hook; ordinary callers must never receive a model-callable adoption path.
    */
-  repairPrimeTransfer?: (fromConversationId: string, toConversationId: string) => boolean;
+  repairPrimeTransfer?: (fromConversationId: string, toConversationId: string) => boolean | Promise<boolean>;
 }
 
 let recoveryHooks: ContinuationRecoveryHooks = {};
@@ -730,7 +739,9 @@ export async function repairPrimeFromResumeShadow(conversationId: string): Promi
   // recovery hook deliberately reports an already-satisfied A→B as success, so calling it again
   // would otherwise turn every /activity poll into another "moved missing projections" warning
   // (and another exact-handoff event scan) forever on resumed chats that have no Goal.
-  if (targetOwner === PRIME_ID && !workspaceForChat(fromConversationId) && !goalObjectiveFor(fromConversationId)) {
+  if (targetOwner === PRIME_ID && !workspaceForChat(fromConversationId) && !goalObjectiveFor(fromConversationId) &&
+      !goalSwitchFor(fromConversationId).own && !goalReplyRecordedFor(fromConversationId) &&
+      !criticalSwarmPersistencePending()) {
     return false;
   }
   const failed = [...byToken.values()].find(
@@ -773,46 +784,43 @@ export async function repairPrimeFromResumeShadow(conversationId: string): Promi
   if (
     currentTargetOwner === PRIME_ID &&
     !workspaceForChat(fromConversationId) &&
-    !goalObjectiveFor(fromConversationId)
+    !goalObjectiveFor(fromConversationId) &&
+    !goalSwitchFor(fromConversationId).own &&
+    !goalReplyRecordedFor(fromConversationId) &&
+    !criticalSwarmPersistencePending()
   ) {
     return false;
   }
 
-  // The durable session rebind never landed in this legacy race, so normal
-  // publishCommittedProjection() never ran either. Once the exact app-created resume shadow +
-  // positive proof above identifies which A→B attempt this is, repair only projections that are
-  // still missing on the descendant. A descendant can have accumulated newer Goal/workspace
-  // state before an upgraded build gets its first chance to heal the old collision; that newer
-  // target state wins. The stale A projection is still removed so opening A later cannot keep
-  // using authority that belongs to the continued chat.
+  // Fence the broker identity first whenever either side still names a run. The durable hook is
+  // also an fsync barrier for an already-repaired B: a prior attempt may have moved live ownership
+  // A→B and then failed before the swarm snapshot reached disk. Re-entering the hook on retry keeps
+  // Goal/reply projection behind that pending broker durability instead of treating live B as ACK.
+  let repaired = false;
+  if (currentSourceOwner === PRIME_ID || currentTargetOwner === PRIME_ID) {
+    const brokerReady = await recoveryHooks.repairPrimeTransfer?.(fromConversationId, conversationId) ?? false;
+    if (!brokerReady) return false;
+    repaired = currentTargetOwner !== PRIME_ID;
+  }
+
+  // The durable session rebind never landed in this legacy race, so normal projection did not
+  // run either. Goal owners commit target-wins candidates: newer B state is preserved while stale
+  // A authority is removed. Only after those barriers land do rebuildable workspace maps follow.
+  let goalChanged = false;
+  if (await repairGoalObjectiveProjectionNow(fromConversationId, conversationId)) goalChanged = true;
+  if (await repairGoalSwitchProjectionNow(fromConversationId, conversationId)) goalChanged = true;
+  if (await discardGoalReplyForRecoveryNow(fromConversationId)) goalChanged = true;
+
   let workspaceChanged = false;
   if (workspaceForChat(conversationId)) {
     workspaceChanged = clearChatWorkspace(fromConversationId);
   } else {
     workspaceChanged = moveChatWorkspace(fromConversationId, conversationId);
   }
-  let goalChanged = false;
-  if (goalObjectiveFor(conversationId)) {
-    if (goalObjectiveFor(fromConversationId)) {
-      clearGoalObjective(fromConversationId);
-      goalChanged = true;
-    }
-  } else {
-    goalChanged = moveGoalObjective(fromConversationId, conversationId);
-  }
-  // The chat's own Goal/Loop switch travels with its objective. A loop that was running in A
-  // is still running in B — the whole point of Compact & Resume is that the work continues —
-  // and leaving the override behind would silently hand B back to the app-wide setting.
-  if (goalSwitchFor(conversationId).own) clearGoalSwitch(fromConversationId);
-  else if (moveGoalSwitch(fromConversationId, conversationId)) goalChanged = true;
   // The recovery hook uses success semantics: replaying an already-repaired target returns true
   // by design. Here this boolean means "changed on this call" and drives a user-visible warning,
   // so an already-owned target must not be counted as a fresh broker mutation. Missing Goal or
   // workspace projections above are still repaired normally.
-  const repaired =
-    currentTargetOwner === PRIME_ID
-      ? false
-      : (recoveryHooks.repairPrimeTransfer?.(fromConversationId, conversationId) ?? false);
   if (repaired || workspaceChanged || goalChanged) {
     logWarn(
       `resume-shadow repair (${proof}) moved missing projections into chat ${conversationId}`
@@ -1308,9 +1316,21 @@ async function publishCommittedProjectionDurably(
   toConversationId: string,
   swarm: 'absent' | 'frozen' | 'recovery'
 ): Promise<boolean> {
-  // Session metadata is already authoritative at every call site below. A long-run wait can
-  // outlive the continuation WAL retention window, so its execution epoch cannot rely on the
-  // old writeDurableSoon projection being replayed after another crash.
+  // Broker ownership is the first execution fence after the authoritative session rebind. Until
+  // its snapshot is durable, keep Long-Run and Goal on A: their dispatch paths also verify the
+  // session attachment, so stale A authority is inert while the WAL remains committing.
+  try {
+    await publishBrokerProjectionDurably(entry, toConversationId, swarm);
+  } catch (error) {
+    logWarn(
+      `continuation ${entry.token.slice(0, 8)} broker projection will retry — ${error instanceof Error ? error.message : String(error)}`
+    );
+    return false;
+  }
+
+  // A long-run wait can outlive the continuation WAL retention window, so move its execution
+  // epoch durably before Goal/Loop state follows. A failed secondary barrier leaves both ledgers
+  // behind B's canonical session and retries forward without granting executable B authority.
   let durable = false;
   try {
     durable = await moveLongRunStateNow(entry.sessionId, entry.from, toConversationId);
@@ -1321,35 +1341,48 @@ async function publishCommittedProjectionDurably(
     logWarn(
       `continuation ${entry.token.slice(0, 8)} long-run projection will retry — ${error instanceof Error ? error.message : String(error)}`
     );
+    return false;
   }
+  if (!durable) return false;
 
-  // The canonical session attachment already says B. Rebuildable live projections must follow
-  // that fact even if the extra long-run fsync barrier failed, otherwise Prime/workspace/Goal
-  // authority would stay split across A and B for the rest of this process. The continuation
-  // WAL stays committing until the durability barrier succeeds, so restart/retry repairs the
-  // remaining disk projection without rolling the authoritative A→B move backwards.
-  publishCommittedProjection(entry, toConversationId, swarm);
+  // Goal/Loop owns durable chat-scoped control state. Publish it only after both execution
+  // authorities above are crash-durable; rebuildable recorder/workspace projections follow there.
+  try {
+    await publishSessionRebindProjection(entry.sessionId, entry.from, toConversationId);
+  } catch (error) {
+    logWarn(
+      `continuation ${entry.token.slice(0, 8)} control projection will retry — ${error instanceof Error ? error.message : String(error)}`
+    );
+    return false;
+  }
   return durable;
 }
-function publishCommittedProjection(
+async function publishBrokerProjectionDurably(
   entry: Continuation,
   toConversationId: string,
   swarm: 'absent' | 'frozen' | 'recovery'
-): void {
-  publishSessionRebindProjection(entry.sessionId, entry.from, toConversationId);
+): Promise<void> {
+  // Broker ownership is the execution fence. Make it crash-durable before publishing any
+  // chat-scoped control state to B, so a restart can never observe Goal authority on B while the
+  // durable Prime still belongs to A. The canonical session attachment already says B here.
   if (swarm === 'frozen') {
-    if (!commitPrimeTransfer(entry.from, toConversationId)) {
+    const moved = await commitPrimeTransferNow(entry.from, toConversationId);
+    if (!moved) {
       // The frozen handover cannot expire. A miss here means the run ended outright while
       // the session write was in flight; there is no live prime left in A to split from.
+      if (agentForOwnedConversation(entry.from) === PRIME_ID || agentForOwnedConversation(toConversationId) === PRIME_ID) {
+        throw new Error('the frozen broker handover did not durably move the still-owned Prime');
+      }
       logWarn(`continuation ${entry.token.slice(0, 8)} committed after its run ended; no prime to move`);
     }
   } else if (swarm === 'recovery') {
-    // Normal commitPrimeTransfer intentionally requires the ephemeral frozen transfer. After
-    // restart that lock is gone, so only a recovery hook explicitly authorised by the durable
-    // continuation WAL may repair the broker's derived A→B prime projection.
-    const repaired = recoveryHooks.repairPrimeTransfer?.(entry.from, toConversationId) ?? false;
-    if (!repaired && !commitPrimeTransfer(entry.from, toConversationId)) {
-      logWarn(`continuation ${entry.token.slice(0, 8)} recovered without a broker prime repair hook`);
+    // After restart the ephemeral frozen transfer is gone. Only the recovery hook authorised by
+    // the durable continuation WAL may repair the broker, and that hook must include its durable
+    // authority barrier before resolving true.
+    const repaired = await recoveryHooks.repairPrimeTransfer?.(entry.from, toConversationId) ?? false;
+    if (!repaired &&
+        (agentForOwnedConversation(entry.from) === PRIME_ID || agentForOwnedConversation(toConversationId) === PRIME_ID)) {
+      throw new Error('the recovered continuation still has broker authority but no durable Prime repair');
     }
   }
 }
@@ -1415,7 +1448,7 @@ async function reconcileCommitting(entry: Continuation, toConversationId: string
       }
     }
     if (!(await publishCommittedProjectionDurably(entry, toConversationId, 'recovery'))) {
-      return { status: 'retryable', reason: 'the session moved, but long-run execution authority is not durable in the replacement chat yet' };
+      return { status: 'retryable', reason: 'the session moved, but durable execution/control projections have not converged in the replacement chat yet' };
     }
     await finishCommittedRecord(entry, toConversationId);
     return { status: 'already-committed', conversationId: toConversationId };
@@ -1490,7 +1523,7 @@ async function reconcileCommitting(entry: Continuation, toConversationId: string
         }
       }
       if (!(await publishCommittedProjectionDurably(entry, toConversationId, swarm === 'frozen' ? 'frozen' : 'absent'))) {
-        return { status: 'retryable', reason: 'the session moved, but long-run execution authority is not durable in the replacement chat yet' };
+        return { status: 'retryable', reason: 'the session moved, but durable execution/control projections have not converged in the replacement chat yet' };
       }
       await finishCommittedRecord(entry, toConversationId);
       return { status: 'committed', conversationId: toConversationId };
@@ -1512,10 +1545,10 @@ async function reconcileCommitting(entry: Continuation, toConversationId: string
     return { status: 'retryable', reason };
   }
 
-  // --- publish. The authoritative durable attachment already says B. Long-run execution
-  // authority crosses its own fsync barrier before the remaining rebuildable map projections.
+  // --- project. The authoritative durable attachment already says B. Secondary durable
+  // execution/control owners converge forward under the continuation WAL before rebuildable maps.
   if (!(await publishCommittedProjectionDurably(entry, toConversationId, swarm === 'frozen' ? 'frozen' : 'absent'))) {
-    return { status: 'retryable', reason: 'the session moved, but long-run execution authority is not durable in the replacement chat yet' };
+    return { status: 'retryable', reason: 'the session moved, but durable execution/control projections have not converged in the replacement chat yet' };
   }
   await finishCommittedRecord(entry, toConversationId);
   logInfo(

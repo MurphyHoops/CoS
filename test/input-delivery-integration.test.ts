@@ -1406,12 +1406,12 @@ describe('IPC input delivery and Goal control integration', () => {
     expect((await call('sessions:objective', { text: 'Current destination', mode: 'loop' })).data.conversationId).toBe(destination);
     expect(goal.goalObjectiveFor(conversationId)).toBe('Updated in browser');
     const { setChatBlocked } = await import('../src/main/session/blocked-chats.js');
-    setChatBlocked(destination, true);
+    await setChatBlocked(destination, true);
     expect((await call('sessions:objective', { text: 'Forbidden replacement', mode: 'goal' })).error).toBe('chat_blocked');
     expect(goal.goalObjectiveFor(destination)).toBe('Current destination');
     expect((await call('sessions:objective', { text: '', mode: 'goal' })).data).toMatchObject({ objective: '', automation: 'off' });
     expect(goal.goalSwitchFor(destination)).toMatchObject({ enabled: false, mode: 'loop' });
-    setChatBlocked(destination, false);
+    await setChatBlocked(destination, false);
     await goal.registerGoalDecisionChat(destination);
     expect((await call('sessions:objective', { text: 'Not a source', mode: 'goal' })).error).toBe('goal_worker_chat');
   });
@@ -1452,12 +1452,12 @@ describe('IPC input delivery and Goal control integration', () => {
     expect(first.data.job.token).toBeTruthy();
     const repeated = await handlers.get('sessions:compact')!(null, { id: session.id });
     expect(repeated.data.job.token).toBe(first.data.job.token);
-    setChatBlocked(conversationId, true);
+    await setChatBlocked(conversationId, true);
     expect((await handlers.get('sessions:compact')!(null, { id: session.id })).error).toBe('chat_blocked');
     expect((await handlers.get('sessions:automation')!(null, { id: session.id, automation: 'goal' })).error).toBe('chat_blocked');
     expect((await handlers.get('sessions:automation')!(null, { id: session.id, automation: 'off' })).ok).toBe(true);
     expect((await handlers.get('sessions:cancelCompaction')!(null, { id: session.id })).ok).toBe(true);
-    setChatBlocked(conversationId, false);
+    await setChatBlocked(conversationId, false);
   });
   it('fences durable decision helpers from Goal and compaction after reload', async () => {
     const conversationId = randomUUID();

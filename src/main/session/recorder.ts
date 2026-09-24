@@ -1410,7 +1410,7 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
         target.conversationId !== null &&
         filed?.conversationId === target.conversationId &&
         !(await conversationWasSuperseded(target.conversationId));
-      attributionListener?.(
+      await attributionListener?.(
         target.conversationId,
         sessionId,
         currentConversation,
@@ -1555,7 +1555,7 @@ let attributionListener:
       requestId: string | null,
       reopenedTurnId: string | null,
       filedSession: SessionSummary | null
-    ) => void)
+    ) => void | Promise<void>)
   | null = null;
 
 export function setCallAttributionListener(
@@ -1571,7 +1571,7 @@ export function setCallAttributionListener(
         /** The turn this call reopened, when it proved the page's completed end false. */
         reopenedTurnId: string | null,
         filedSession: SessionSummary | null
-      ) => void)
+      ) => void | Promise<void>)
     | null
 ): void {
   attributionListener = listen;

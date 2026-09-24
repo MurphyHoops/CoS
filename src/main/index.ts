@@ -33,7 +33,7 @@ import {
   onSwarmPersist,
   onSwarmPersistNow,
   pauseSwarmForDisable,
-  repairPrimeConversationAfterRecovery,
+  repairPrimeConversationAfterRecoveryNow,
   restoreRetiredWorkers,
   restoreSwarm,
   snapshotRetiredWorkers,
@@ -134,10 +134,11 @@ function createWindow(): void {
 
   if (process.platform === 'win32') window.removeMenu();
 
-  // First use discovers the account once. A restored catalog is immediately usable;
-  // showing the window again cannot refresh it or open another browser attempt.
+  // First visible use may passively ask an already-present ChatGPT document for its model
+  // catalogue. Merely showing the app never grants authority to open a browser document;
+  // explicit Refresh and real delivery operations own that stronger action separately.
   window.on('show', () => {
-    if (!quitting && getChatModels().state === 'unknown') void startChatModelDiscovery(true)
+    if (!quitting && getChatModels().state === 'unknown') void startChatModelDiscovery(false)
       .catch(error => logWarn(`model discovery on window open: ${error.message}`));
   });
   window.once('ready-to-show', () => {
@@ -393,7 +394,7 @@ void app.whenReady().then(async () => {
   // Continuation recovery is after swarm restore because an interrupted durable rebind may
   // have to finish publishing the prime transfer that was frozen in that snapshot.
   setContinuationRecoveryHooks({
-    repairPrimeTransfer: repairPrimeConversationAfterRecovery
+    repairPrimeTransfer: repairPrimeConversationAfterRecoveryNow
   });
   const savedContinuations = await readDurable<ContinuationSnapshot>(CONTINUATIONS_STATE);
   if (windowActivation.isDisabled()) return;

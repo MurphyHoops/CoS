@@ -4027,7 +4027,7 @@ describe('blocked chats', () => {
   afterAll(() => resetBlockedChatsForTests());
 
   it('refuses a blocked chat’s call and tells the model to stop instead of retrying', async () => {
-    setChatBlocked(ROGUE, true);
+    await setChatBlocked(ROGUE, true);
     const reply = await readAs(owned(ROGUE));
     const text = textOf(reply);
 
@@ -4044,7 +4044,7 @@ describe('blocked chats', () => {
   it('blocks every tool the chat has, not only the one it was blocked during', async () => {
     ctx.caps = withCaps({ command: true, create: true, edit: true });
     ctx.readOnly = false;
-    setChatBlocked(ROGUE, true);
+    await setChatBlocked(ROGUE, true);
 
     for (const call of [
       { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } },
@@ -4059,7 +4059,7 @@ describe('blocked chats', () => {
   });
 
   it('never touches another chat, or a call it cannot place at all', async () => {
-    setChatBlocked(ROGUE, true);
+    await setChatBlocked(ROGUE, true);
 
     const other = await readAs(owned(BYSTANDER));
     expect(failed(other)).toBe(false);
@@ -4073,7 +4073,7 @@ describe('blocked chats', () => {
   });
 
   it('refuses the call whose page evidence proves the blocked chat only after it arrives', async () => {
-    setChatBlocked(ROGUE, true);
+    await setChatBlocked(ROGUE, true);
 
     const reply = await readAs(provenLate(ROGUE, 40));
 
@@ -4085,7 +4085,7 @@ describe('blocked chats', () => {
   });
 
   it('still lets a call through when the page never proves it at all', async () => {
-    setChatBlocked(ROGUE, true);
+    await setChatBlocked(ROGUE, true);
 
     // The wait is bounded by the same window attribution uses, and it ends the same way:
     // unproven is unproven. A phone, or a chat with no extension behind it, is not the rogue
@@ -4098,10 +4098,10 @@ describe('blocked chats', () => {
 
   it('gives the chat its tools back the moment it is released, same request id and all', async () => {
     const requestId = owned(ROGUE);
-    setChatBlocked(ROGUE, true);
+    await setChatBlocked(ROGUE, true);
     expect(textOf(await readAs(requestId))).toContain('CHAT_BLOCKED');
 
-    setChatBlocked(ROGUE, false);
+    await setChatBlocked(ROGUE, false);
     const after = await readAs(requestId);
     expect(failed(after)).toBe(false);
     expect(textOf(after)).toContain('/workspace/notes.txt');

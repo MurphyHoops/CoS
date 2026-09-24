@@ -1,36 +1,43 @@
 /**
- * Publishes the in-memory projections of an already-durable session rebind.
+ * Converges the secondary projections of an already-durable session rebind.
  *
  * This function owns no transaction and grants no authority to move a session. Callers must
  * first prove `rebindSession()` committed A→B (or recover that fact from session metadata).
- * Keeping these total map moves together prevents Compact & Resume and Emergency Resume from
- * drifting on which session-owned projections follow the durable identity.
+ * Durable Goal/Loop owners cross their own commit barriers here; recorder/workspace remain
+ * rebuildable process projections. Keeping the moves together prevents Compact & Resume and
+ * Emergency Resume from drifting on which session-owned facts follow the durable identity.
  */
 
 import {
-  moveGoalObjective,
   moveGoalObjectiveNow,
   moveGoalReplyNow,
-  moveGoalSwitch,
   moveGoalSwitchNow,
-  retireGoalDraftsFor
+  retireGoalDraftsFor,
+  retireGoalDraftsForNow
 } from '../goal.js';
 import { moveChatWorkspace } from '../workspace.js';
 import { moveLongRunState, moveLongRunStateNow } from './long-run.js';
 import { rebindConversation } from './recorder.js';
 
-export function publishSessionRebindProjection(
+export async function publishSessionRebindProjection(
   sessionId: string,
   fromConversationId: string,
   toConversationId: string
-): void {
+): Promise<void> {
+  // Goal/Loop rows are durable control state. Commit them under their owning serializers before
+  // publishing rebuildable process projections so a successful continuation never falls back to
+  // debounced best-effort writes for the authority that crossed A→B.
+  if (!(await moveGoalObjectiveNow(fromConversationId, toConversationId))) {
+    throw new Error('Goal objective projection refused the session rebind');
+  }
+  if (!(await moveGoalSwitchNow(fromConversationId, toConversationId))) {
+    throw new Error('Goal/Loop switch projection refused the session rebind');
+  }
   rebindConversation(sessionId, fromConversationId, toConversationId);
   moveChatWorkspace(fromConversationId, toConversationId);
-  moveGoalObjective(fromConversationId, toConversationId);
-  moveGoalSwitch(fromConversationId, toConversationId);
   moveLongRunState(sessionId, fromConversationId, toConversationId);
   // A's final belongs to the executor that was retired. B earns its own Goal/Loop reply debt.
-  retireGoalDraftsFor(fromConversationId);
+  await retireGoalDraftsForNow(fromConversationId);
 }
 
 /**
