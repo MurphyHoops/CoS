@@ -601,6 +601,71 @@ describe('agents durable recovery bridge fence', () => {
     expect(pendingCommands().map((entry) => entry.id).sort()).toEqual(beforePause);
   });
 
+  it('parks Compact, Resume, and Emergency Resume when agent identity authority is unreadable', async () => {
+    await pair();
+    const conversationId = 'agent-provider-pause-a';
+    const session = await createSession({ title: 'provider dependency pause', conversationId });
+    const resumeToken = await readyContinuation(session.id, 'provider replacement must wait for agents', conversationId);
+
+    noteDurableRecoveryIncident({
+      domain: 'agents',
+      ledger: 'swarm',
+      failure: 'schema_invalid',
+      disposition: 'pause'
+    });
+
+    await expect(compactSession(session.id)).rejects.toThrow('agents_durable_recovery_required');
+    expect(queueResume(session.id, resumeToken)).toBeNull();
+    expect(await queueEmergencyResume(session.id, conversationId, 'agents-paused-recovery')).toBeNull();
+    expect(pendingCommands().filter((entry) => entry.what.startsWith('resume:') || entry.what.startsWith('recovery:'))).toEqual([]);
+  });
+
+  it('keeps an existing resume carrier inert when only agents authority is paused', async () => {
+    await pair();
+    const conversationId = 'agent-provider-custody-a';
+    const session = await createSession({ title: 'resume custody under agents pause', conversationId });
+    const resumeToken = await readyContinuation(session.id, 'resume custody must not outrun swarm recovery', conversationId);
+
+    publishProviderTransportStatus({
+      ...connectedTransport,
+      state: 'offline',
+      detail: 'fixture outage',
+      handshakeAt: null
+    });
+    const queued = queueResume(session.id, resumeToken);
+    expect(queued).not.toBeNull();
+    await flushDurable();
+    const commandId = queued!.id;
+
+    resetBridgeForTests();
+    opened.length = 0;
+    setBrowserOpener(async (url) => { opened.push(url); });
+    noteDurableRecoveryIncident({
+      domain: 'agents',
+      ledger: 'retired-workers',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    await restoreCommands();
+    expect(pendingCommands()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: commandId, what: `resume:${session.id}` })
+    ]));
+
+    publishProviderTransportStatus({ ...connectedTransport, handshakeAt: Date.now() });
+    await flushBridgeTransportRecoveryForTests();
+    expect(opened).toEqual([]);
+
+    const redeemPaused = await request('POST', '/commands/redeem', {
+      body: { id: commandId, client: 'agents-paused-resume-page' }
+    });
+    expect(redeemPaused.status).toBe(503);
+    expect(redeemPaused.body).toMatchObject({ error: 'agents_recovery_required', retryable: true });
+    expect(pendingCommands()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: commandId, what: `resume:${session.id}` })
+    ]));
+  });
+
   it('keeps an existing worker carrier inert across restart and refuses redeem while paused', async () => {
     await pair();
     const prime = { conversationId: 'agent-custody-prime' };

@@ -341,6 +341,50 @@ describe('durable continuation corruption recovery', () => {
   });
 });
 
+describe('agents authority dependency', () => {
+  it('does not publish a new continuation or cross A to B while agent identity is recovery-paused', async () => {
+    const { sessionId, token } = await readyContinuation();
+    const before = continuationByToken(token);
+    expect(before?.state).toBe('awaiting-chat');
+
+    noteDurableRecoveryIncident({
+      domain: 'agents',
+      ledger: 'swarm',
+      failure: 'schema_invalid',
+      disposition: 'pause'
+    });
+
+    const result = await commitContinuationResult(token, CHAT_B);
+    expect(result).toMatchObject({ status: 'retryable' });
+    expect((await getSession(sessionId))?.conversationId).toBe(CHAT_A);
+    expect(continuationByToken(token)).toMatchObject({ state: 'awaiting-chat', to: null });
+
+    const another = await createSession({ title: 'blocked open', conversationId: CHAT_C });
+    await expect(openContinuationNow(another.id, CHAT_C)).rejects.toThrow('agents_durable_recovery_required');
+  });
+
+  it('defers healthy continuation WAL restore without rewriting or misclassifying it when agents are paused', async () => {
+    const { sessionId, token } = await readyContinuation();
+    await flushDurable();
+    const before = await fs.readFile(continuationPrimary(), 'utf8');
+    expect(before).toContain(token);
+
+    resetContinuationsForTests();
+    noteDurableRecoveryIncident({
+      domain: 'agents',
+      ledger: 'retired-workers',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    await restoreContinuationsDurableState();
+
+    expect(continuationForSession(sessionId)).toBeNull();
+    expect(durableRecoveryIncidents('continuation')).toEqual([]);
+    expect(await fs.readFile(continuationPrimary(), 'utf8')).toBe(before);
+  });
+});
+
 describe('capturing the brief', () => {
   it('freezes exact source model intent across selection changes and durable restore', async () => {
     const summary = await createSession({ title: 'model transfer', conversationId: CHAT_A });
