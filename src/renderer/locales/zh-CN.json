@@ -134,6 +134,7 @@
   "In Chrome, click Load unpacked, paste the copied folder path and select that folder.": "在 Chrome 中点击 Load unpacked（加载已解压的扩展程序），粘贴复制的文件夹路径并选择该文件夹。",
   "Load unpacked": "Load unpacked（加载已解压的扩展程序）",
   "The extension pairs with this app automatically — there is no code to type.": "扩展会自动与本应用配对，无需输入验证码。",
+  "The extension pairs automatically on first use — there is no code to type. If you explicitly Disconnect it, open the companion popup → Advanced → Connect to authorize it again.": "扩展首次使用时会自动配对，无需输入验证码。如果你明确选择了“断开连接”，请打开配套扩展弹窗 → 高级 → 连接，重新授权。",
   "Required for sub-agents:": "子智能体必需：",
   "the companion extension must be loaded and connected in ChatGPT. Without it, Chat On Steroids cannot identify, open or coordinate worker chats.": "请加载配套扩展并在 ChatGPT 中保持连接。否则，Chat On Steroids 无法识别、打开或协调子智能体聊天。",
   "Open extension folder": "打开扩展文件夹",

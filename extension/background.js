@@ -42,7 +42,9 @@ const MODEL_REQUEST_TIMEOUT_MS = 190_000;
 /** The reason a deadline aborts with, so it is a fact the caller can act on rather than prose. */
 const TIMED_OUT = 'the app took too long to answer';
 /** Bumped only when the request/response shape changes; the app compares it. */
-const BRIDGE_PROTOCOL = 14;
+const BRIDGE_PROTOCOL = 15;
+/** Must match companion-build.txt; packaging/tests enforce this release identity. */
+const COMPANION_BUILD_ID = 'cos-3.1.1-companion-diagnostics-v1';
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a
@@ -140,6 +142,7 @@ let portCheckedAt = 0;
 let portCompatible = null;
 let appVersion = null;
 let appProtocol = null;
+let appCompanionBuildId = null;
 const PORT_TRUST_MS = 30_000;
 
 /**
@@ -995,7 +998,11 @@ function versionHeaders() {
   } catch {
     // Not worth failing a request over.
   }
-  return { 'x-extension-version': version, 'x-extension-protocol': String(BRIDGE_PROTOCOL) };
+  return {
+    'x-extension-version': version,
+    'x-extension-protocol': String(BRIDGE_PROTOCOL),
+    'x-extension-build-id': COMPANION_BUILD_ID
+  };
 }
 
 /**
@@ -1009,7 +1016,7 @@ function versionHeaders() {
 async function discover(force = false) {
   await load();
   if (port !== null && !force) {
-    if (Date.now() - portCheckedAt < PORT_TRUST_MS) return { port, paired: token !== null, compatible: portCompatible !== false, version: appVersion, bridge: appProtocol };
+    if (Date.now() - portCheckedAt < PORT_TRUST_MS) return { port, paired: token !== null, compatible: portCompatible !== false, version: appVersion, bridge: appProtocol, companionBuildId: appCompanionBuildId };
     const body = await hello(port);
     if (body) {
       if (body.disconnected === true) await latchAppDisconnect();
@@ -1017,7 +1024,8 @@ async function discover(force = false) {
       portCompatible = body.compatible !== false && body.bridge === BRIDGE_PROTOCOL;
       appVersion = typeof body.version === 'string' ? body.version : null;
       appProtocol = Number.isFinite(Number(body.bridge)) ? Number(body.bridge) : null;
-      return { port, paired: body.paired === true, compatible: portCompatible, version: appVersion, bridge: appProtocol };
+      appCompanionBuildId = typeof body.companionBuildId === 'string' ? body.companionBuildId : null;
+      return { port, paired: body.paired === true, compatible: portCompatible, version: appVersion, bridge: appProtocol, companionBuildId: appCompanionBuildId };
     }
   }
   for (const candidate of PORTS) {
@@ -1029,8 +1037,16 @@ async function discover(force = false) {
       portCompatible = body.compatible !== false && body.bridge === BRIDGE_PROTOCOL;
       appVersion = typeof body.version === 'string' ? body.version : null;
       appProtocol = Number.isFinite(Number(body.bridge)) ? Number(body.bridge) : null;
+      appCompanionBuildId = typeof body.companionBuildId === 'string' ? body.companionBuildId : null;
       await persist();
-      return { port: candidate, paired: body.paired === true, compatible: portCompatible, version: appVersion, bridge: appProtocol };
+      return {
+        port: candidate,
+        paired: body.paired === true,
+        compatible: portCompatible,
+        version: appVersion,
+        bridge: appProtocol,
+        companionBuildId: appCompanionBuildId
+      };
     }
   }
   port = null;
@@ -1038,6 +1054,7 @@ async function discover(force = false) {
   portCompatible = null;
   appVersion = null;
   appProtocol = null;
+  appCompanionBuildId = null;
   await persist();
   return null;
 }
@@ -3008,8 +3025,10 @@ const HANDLERS = {
       compatible: found ? found.compatible !== false : null,
       appVersion: found ? found.version : null,
       appProtocol: found ? found.bridge : null,
+      appCompanionBuildId: found ? found.companionBuildId ?? null : null,
       extensionVersion: chrome.runtime.getManifest().version,
       extensionProtocol: BRIDGE_PROTOCOL,
+      extensionBuildId: COMPANION_BUILD_ID,
       ...(pairingError ? { pairError: pairingError } : {})
     };
   },

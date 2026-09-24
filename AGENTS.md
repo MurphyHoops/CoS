@@ -21,8 +21,8 @@ changed lines before applying an older patch. Document the work and its actual v
 the code currently does it. Known implementation gaps are collected in §21 instead of being
 mixed into the happy path as features.
 
-Canonical source: **MurphyHoops/CoS**, independent runtime line, **2026-09-21**. App/extension **3.0.0**,
-bridge protocol **14** in the checked declarations (`package.json`, `src/main/version.ts`,
+Canonical source: **MurphyHoops/CoS**, independent runtime line, **2026-09-21**. App/extension **3.1.1**,
+bridge protocol **15** in the checked declarations (`package.json`, `src/main/version.ts`,
 `extension/manifest.json`). This does not prove release, installation or live Chrome behavior.
 
 **Repository policy.** `origin` is the standalone canonical repository and direct development line. Historical and external repositories are reference-only inputs, never branch authorities. Port a reviewed external change only when it preserves the durable-runtime invariants in this file and passes this repository's own validation.
@@ -1605,25 +1605,27 @@ awaiting-summary -> awaiting-chat -> claimed -> committing -> committed
 Restart restoration must converge on that same committed projection. A persisted send attempt
 can outlive a transport command; expiration releases transport, not permission for another
 blind Send. Automatic tickets can wait indefinitely before the request was sent and retain a
-six-hour sent-request window; manual transport is shorter (ten minutes). Pickup budgets depend
-on phase: unsent 2m×5, writing 5m×3, opening 15m×3. These are bounded recovery of one obligation,
-not fresh compaction attempts. Re-observe the exact page before advancing its state.
-A manual ticket whose frozen source selection is Pro instead gets a one-hour deadline while the
-brief is being written: Pro reasoning is not visible transcript, so it produces no text growth
-to renew the ordinary clock, and a healthy long Pro generation used to be swept as "took too
-long". Captured/claimed phases and an unobserved selection keep the ordinary ten minutes.
+six-hour sent-request window. Manual tickets keep the ordinary ten-minute source-writing budget;
+a frozen Pro source selection gets one hour because hidden reasoning produces no transcript
+growth to renew that clock. **Once the brief is durably captured, manual and automatic tickets
+both become app-owned opening debt and have no wall-clock continuation expiry.** Opening carriers
+use a 15-minute lease; a safe pre-dispatch carrier may be retired and another carrier may take
+the same exact handoff. Opening pickup continues at that cadence until commit/cancel rather than
+stopping after three attempts. `dispatched-unresolved` or `sent` never becomes replayable merely
+because a carrier or pickup timer expired. Source acquisition remains bounded recovery of one
+obligation, not fresh compaction attempts. Re-observe the exact page before advancing its state.
 
 The continuation WAL freezes the source's confirmed model and reasoning selection when its
 session and selection both name A. Placement and bootstrap project that one intent; B's native
 picker still verifies and records its own selection before Send. Legacy or unobserved selection
 stays null and is never reconstructed from a later change in A.
 
-An expired automatic browser command durably releases only its own unattempted destination
-claim before command retirement. Redeem, destination checkpoints and retirement serialize
-through command custody; checkpoints also prove the exact document owner and WAL claimant.
-Attempted/ambiguous sends retain their fence. A committing transaction or failed durable
-retirement grants no immediate delivery retry. A loading destination can checkpoint only on
-its owned URL; a foreign pending route remains ineligible.
+An expired resume browser command durably releases only its own provably pre-dispatch
+destination claim before command retirement. Redeem, destination checkpoints and retirement
+serialize through command custody; checkpoints also prove the exact document owner and WAL
+claimant. Dispatched/ambiguous sends retain their fence. A committing transaction or failed
+durable retirement grants no immediate delivery retry. A loading destination can checkpoint
+only on its owned URL; a foreign pending route remains ineligible.
 
 Before a pickup can Stop the original answer, refresh the ticket's source-send checkpoint.
 An already dispatched or sent summary request can only be observed, never stopped by another

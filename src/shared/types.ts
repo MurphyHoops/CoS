@@ -467,17 +467,22 @@ export interface BridgeStatus {
   port: number | null;
   /** Durable authorization: true once a browser extension has been issued this app's token. */
   paired: boolean;
-  /** Live presence: true only while this app process has heard from the extension recently. */
+  /** Durable explicit user intent: true only after Disconnect until an explicit reconnect. */
+  disconnected?: boolean;
+  /** Detection is weaker than authorization: a companion has identified itself over /hello. */
+  detected?: boolean;
+  /** Live authenticated HTTP presence in this app process. */
   present: boolean;
-  /** Epoch ms of the last message from the extension, or null. */
+  /** Live authenticated wake websocket; useful for diagnosing a paired-but-sleeping companion. */
+  wakeConnected?: boolean;
+  /** Epoch ms of the last authenticated message from the extension, or null. */
   lastSeenAt: number | null;
-  /**
-   * Version of the connected browser extension, learned from its own authenticated requests.
-   *
-   * This is the only place that fact lives. It is null before an extension has ever spoken to
-   * this app process, which is why "no extension version" never means "outdated extension".
-   */
+  /** Version reported by the last detected companion, authenticated or not. */
   extensionVersion: string | null;
+  /** Opaque release identity reported by the detected companion. Never a filesystem path. */
+  extensionBuildId?: string | null;
+  /** Whether the detected companion matches the exact extension tree shipped by this app. */
+  extensionSourceCurrent?: boolean | null;
 }
 
 /**

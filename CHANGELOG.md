@@ -10,8 +10,22 @@ historical release records; their repository links, terminology and implementati
 document what was true at the time and are not the current architecture contract.
 
 The app and the `extension/` companion are versioned together. **Reload the
-extension after updating the app**. If their bridge protocols are incompatible,
-the app refuses the extension and asks you to reload the matching copy.
+extension after updating the app**. If their bridge protocols or exact companion-build
+identities do not match, the app reports the mismatch and asks you to reload the copy shipped
+with the current app.
+
+## [3.1.1] — 2026-09-24
+
+### Durable Compact & Resume opening and companion diagnostics
+
+- Fixed the manual Compact & Resume failure reproduced from 3.0 logs: after a handoff brief had already been durably captured, one replacement-chat timeout could still abort the continuation and leave the mission in the old conversation.
+- Captured handoffs are now durable app-owned opening debt across browser-carrier timeout and app restart. A provably pre-dispatch carrier may be replaced without regenerating the brief; `dispatched-unresolved` and `sent` checkpoints remain fail-closed and are never blindly replayed.
+- Opening pickup keeps the 15-minute carrier cadence until exact commit or explicit cancellation instead of silently stopping after three replacement attempts.
+- Bridge protocol **15** adds an opaque companion-build identity, allowing CoS to distinguish “same version” from Chrome actually running the exact unpacked extension tree shipped by this app.
+- App and companion UI now distinguish detection, authorization, authenticated presence, wake-channel state, deliberate Disconnect, protocol mismatch and stale unpacked-copy mismatch, with exact reload/reconnect guidance.
+- Added regression coverage for the 3.0 manual-compaction failure, restart retention, pre-dispatch carrier replacement, stale unpacked-source detection and companion release identity.
+
+See [the 3.1.1 release notes](docs/release-notes/v3.1.1.md).
 
 ## [3.1.0] — 2026-09-22
 

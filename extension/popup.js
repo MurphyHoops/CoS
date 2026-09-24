@@ -211,15 +211,19 @@ function paintHeader(status) {
   const connected = status && status.connected === true;
   const paired = status && status.paired === true;
   const incompatible = connected && status.compatible === false;
+  const sourceMismatch = connected && status.appCompanionBuildId &&
+    status.extensionBuildId && status.appCompanionBuildId !== status.extensionBuildId;
   // Disconnected on purpose. This has to say so plainly rather than describing it as a
   // connection that has not finished yet, which is what it looked like back when the next
   // poll would silently undo it.
   const off = status && status.disconnected === true && !paired;
-  const ready = connected && paired && status.compatible === true;
+  const ready = connected && paired && status.compatible === true && !sourceMismatch;
 
-  $('pill').className = `pill ${ready ? '' : incompatible ? 'bad' : 'off'}`;
-  $('state').textContent = incompatible
-    ? 'Version mismatch'
+  $('pill').className = `pill ${ready ? '' : incompatible || sourceMismatch ? 'bad' : 'off'}`;
+  $('state').textContent = sourceMismatch
+    ? 'Loaded copy mismatch'
+    : incompatible
+      ? 'Version mismatch'
     : off
       ? 'Disconnected'
       : !connected
@@ -229,20 +233,24 @@ function paintHeader(status) {
           ? `App reachable · Port ${status.port}`
           : `Port ${status.port} · connecting`;
 
-  $('retryBtn').hidden = ready || incompatible;
+  $('retryBtn').hidden = ready || incompatible || sourceMismatch;
   $('retryBtn').textContent = off ? 'Connect' : 'Try again';
-  $('unpairBtn').hidden = !paired || incompatible;
+  $('unpairBtn').hidden = !paired || incompatible || sourceMismatch;
   return ready;
 }
 
 function paintAlert(status, info) {
   const page = info && info.page;
   const incompatible = status && status.connected === true && status.compatible === false;
+  const sourceMismatch = status && status.connected === true && status.appCompanionBuildId &&
+    status.extensionBuildId && status.appCompanionBuildId !== status.extensionBuildId;
   const pairError = status && status.pairError;
   const error = page && page.lastError;
-  const text = incompatible
-    ? `App v${status.appVersion || '?'} (protocol ${status.appProtocol ?? '?'}); companion v${status.extensionVersion || '?'} (protocol ${status.extensionProtocol ?? '?'}). Open your browser's Extensions page, enable Developer mode, then Update / Reload this companion. If the mismatch remains, use Open extension folder in Chat On Steroids and load that folder. Reload ChatGPT tabs when their active work is finished.`
-    : pairError && pairError.message
+  const text = sourceMismatch
+    ? `Chrome is running a different unpacked Chat On Steroids companion copy than app v${status.appVersion || '?'}. Open Chat On Steroids → Setup → Open extension folder, then in chrome://extensions remove or Reload the companion from that exact folder. Reload ChatGPT tabs when their active work is finished.`
+    : incompatible
+      ? `App v${status.appVersion || '?'} (protocol ${status.appProtocol ?? '?'}); companion v${status.extensionVersion || '?'} (protocol ${status.extensionProtocol ?? '?'}). Open your browser's Extensions page, enable Developer mode, then Update / Reload this companion. If the mismatch remains, use Open extension folder in Chat On Steroids and load that folder. Reload ChatGPT tabs when their active work is finished.`
+      : pairError && pairError.message
       ? pairError.message
       : pairError && pairError.error === 'secure_storage_unavailable'
         ? 'Secure credential storage is unavailable. Open Chat On Steroids for setup instructions.'
@@ -277,12 +285,16 @@ function paintDetails(status, info) {
   const sent = info && info.delivery;
 
   detail(grid, 'app', status ? `v${status.appVersion || '?'} · port ${status.port || '—'}` : null);
+  const sourceMismatch = status && status.appCompanionBuildId &&
+    status.extensionBuildId && status.appCompanionBuildId !== status.extensionBuildId;
   detail(
     grid,
     'extension',
     status ? `v${status.extensionVersion} · protocol ${status.extensionProtocol}` : null,
-    status && status.compatible === false
+    status && (status.compatible === false || sourceMismatch)
   );
+  detail(grid, 'companion build', status ? status.extensionBuildId : null, Boolean(sourceMismatch));
+  detail(grid, 'app expects build', status ? status.appCompanionBuildId : null, Boolean(sourceMismatch));
   detail(grid, 'chat id', (info && info.conversationId) || null);
   detail(grid, 'app session', (page && page.session) || null, Boolean(page && !page.session));
   detail(grid, 'tab', info ? `${info.tab} · epoch ${info.epoch ?? '—'}` : null);

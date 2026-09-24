@@ -183,7 +183,6 @@ import {
   commitContinuationResult,
   continuationByToken,
   continuationProviderAskedAt,
-  continuationProviderDeadlineAt,
   continuationForSession,
   pendingContinuations,
   pauseContinuationTransportNow,
@@ -222,7 +221,7 @@ import {
   resumeUnattemptedRecoveryAfterTransportNow
 } from './session/self-healing.js';
 import { readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
-import { APP_VERSION, BRIDGE_PROTOCOL } from './version.js';
+import { APP_VERSION, BRIDGE_PROTOCOL, COMPANION_BUILD_ID } from './version.js';
 import { conversationHasMcpCallSince } from './session/store.js';
 import { sessionWorkingAt } from '../shared/session-activity.js';
 import { requestCorrelation } from './session/correlation.js';
@@ -637,6 +636,7 @@ const commandRedeems = new Map<string, Promise<void>>();
 let requestWindow = { start: Date.now(), count: 0 };
 const listeners = new Set<() => void>();
 let extensionVersion: string | null = null;
+let extensionBuildId: string | null = null;
 let versionWarned = false;
 
 export function onBridgeChange(listener: () => void): () => void {
@@ -650,13 +650,20 @@ function changed(): void {
 
 export async function bridgeStatus(): Promise<BridgeStatus> {
   const stored = await getSecret('bridgeToken');
+  const expectedBuild = COMPANION_BUILD_ID;
+  const detected = extensionVersion !== null;
   return {
     running: server !== null,
     port,
     paired: stored !== null && stored !== BROWSER_DISCONNECTED,
+    disconnected: stored === BROWSER_DISCONNECTED,
+    detected,
     present: browserPresent(),
+    wakeConnected: browserWakeConnected(),
     lastSeenAt,
-    extensionVersion
+    extensionVersion,
+    extensionBuildId,
+    extensionSourceCurrent: !detected ? null : extensionBuildId === expectedBuild
   };
 }
 
@@ -784,14 +791,23 @@ function protocolCompatible(req: http.IncomingMessage): boolean {
 
 function noteExtensionVersion(req: http.IncomingMessage): void {
   const version = req.headers['x-extension-version'];
+  const build = req.headers['x-extension-build-id'];
   const protocol = extensionProtocol(req);
-  if (typeof version === 'string' && version !== extensionVersion) {
-    extensionVersion = version.slice(0, 32);
-    logInfo(`bridge: browser extension ${extensionVersion} connected`);
-    // Even an incompatible peer reports its version before the protocol fence.
-    // Publish that evidence without falsely granting compatible browser presence.
-    changed();
+  const nextVersion = typeof version === 'string' ? version.slice(0, 32) : null;
+  const nextBuild = typeof build === 'string' && /^[A-Za-z0-9._:-]{8,128}$/.test(build) ? build : null;
+  let identityChanged = false;
+  if (nextVersion !== null && nextVersion !== extensionVersion) {
+    extensionVersion = nextVersion;
+    logInfo(`bridge: browser extension ${extensionVersion} detected`);
+    identityChanged = true;
   }
+  if (nextBuild !== extensionBuildId) {
+    extensionBuildId = nextBuild;
+    identityChanged = true;
+  }
+  // Even an incompatible or unpaired peer may report its identity before the protocol/auth fence.
+  // Publish detection as diagnostics only; noteBrowserSeen() remains the live-presence authority.
+  if (identityChanged) changed();
   if (!versionWarned && protocol !== null && protocol !== BRIDGE_PROTOCOL) {
     versionWarned = true;
     logWarn(
@@ -1753,7 +1769,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!origin) return json(res, 403, { error: 'forbidden_origin' }, null);
     res.writeHead(204, {
       'access-control-allow-origin': origin,
-      'access-control-allow-headers': 'authorization, content-type, x-extension-version, x-extension-protocol',
+      'access-control-allow-headers': 'authorization, content-type, x-extension-version, x-extension-protocol, x-extension-build-id',
       'access-control-allow-methods': 'GET, POST, OPTIONS',
       // Chrome asks for this before letting an extension reach a loopback address.
       'access-control-allow-private-network': 'true',
@@ -1779,7 +1795,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         bridge: BRIDGE_PROTOCOL,
         compatible: protocolCompatible(req),
         paired: stored !== null && stored !== BROWSER_DISCONNECTED,
-        disconnected: stored === BROWSER_DISCONNECTED
+        disconnected: stored === BROWSER_DISCONNECTED,
+        companionBuildId: COMPANION_BUILD_ID
       },
       origin
     );
@@ -7898,7 +7915,8 @@ const PICKUP_WATCH_LIFETIME_MS = 12 * 60 * 60_000;
  * three of them. The ticket is never failed by a pickup in this phase; it stays collectable.
  *
  * `opening` — the brief landed and the replacement chat is owed. The resume command is leased
- * for a quarter of an hour, so that is the cadence, three times.
+ * for a quarter of an hour, so that is the cadence. Unlike source acquisition, a captured handoff
+ * is durable app debt: safe pre-dispatch attempts keep using this cadence until commit/cancel.
  *
  * Page activity never pushes any of these; `since` is when the phase began (the ticket's
  * opening, the prompt's durable dispatch) or when it was last picked up. A phase change resets
@@ -8117,7 +8135,7 @@ async function inspectOwedCompactions(now: number): Promise<boolean> {
     }
     const schedule = COMPACTION_PICKUPS[phase];
     if (now < watch.since + schedule.every) continue;
-    if (watch.attempts >= schedule.attempts) {
+    if (watch.attempts >= schedule.attempts && phase !== 'opening') {
       if (phase !== 'asking') continue;
       // Ten minutes and five raised reloads without the prompt ever reaching ChatGPT. The
       // chat's tools were never fenced (that starts at the send), so nothing is stranded by
@@ -8165,7 +8183,9 @@ async function inspectOwedCompactions(now: number): Promise<boolean> {
     watch.since = now;
     queued = true;
     logInfo(
-      `bridge: compaction ticket ${entry.token.slice(0, 8)} ${phase} pickup ${watch.attempts} of ${schedule.attempts}`
+      phase === 'opening'
+        ? `bridge: compaction ticket ${entry.token.slice(0, 8)} opening pickup ${watch.attempts}; durable handoff remains owed until commit/cancel`
+        : `bridge: compaction ticket ${entry.token.slice(0, 8)} ${phase} pickup ${watch.attempts} of ${schedule.attempts}`
     );
   }
   return queued;
@@ -8999,17 +9019,11 @@ function revivalDeadlineAt(command: Command): number {
 function commandDeadlineDelay(command: Command, now = Date.now()): number {
   if (command.spec.type === 'stop') return command.deadlineCreatedAt + STOP_COMMAND_TIMEOUT_MS - now;
   if (command.spec.type === 'revive') return revivalDeadlineAt(command) - now;
-  if (command.spec.type === 'resume' && continuationByToken(command.spec.token)?.automatic) {
-    // One checkpoint, not a failure trigger. Expiry releases only this browser transport;
-    // the auto-compaction ticket remains and the next 15-minute pickup may open it again.
+  if (command.spec.type === 'resume') {
+    // A captured handoff is durable continuation debt, regardless of whether the user requested
+    // it manually or the context threshold filed it automatically. This deadline owns only one
+    // browser carrier. Expiry may retire/release that carrier, never the handoff itself.
     return (command.deadlineClaimedAt ?? command.deadlineCreatedAt) + COMPACTION_PICKUPS.opening.every - now;
-  }
-  if (command.spec.type === 'resume' && command.owner !== null) {
-    const continuation = continuationByToken(command.spec.token);
-    if (continuation?.state === 'claimed') {
-      const deadline = continuationProviderDeadlineAt(command.spec.token);
-      if (deadline !== null) return deadline - now;
-    }
   }
   if (command.spec.type === 'worker') {
     // Absolute, from the invitation. Whatever else this command is waiting for, the slot it
@@ -9065,12 +9079,10 @@ function rearmRetainedCommandDeadlines(): void {
  *
  * Two ordinary outcomes are quiet successes that simply have no acknowledgement of
  * their own: a worker whose chat was bound is done being a command, and a command already
- * gone has nothing left to end. The third is the failure this design chose over retrying —
- * the tab never redeemed, or redeemed and never typed, or typed into a chat it never named
- * — and `drop()` is what makes it safe: a manual continuation is aborted and its session stays
- * where it is, or the worker slot is failed so the prime stops waiting on a chat that does
- * not exist. An automatic continuation is the deliberate exception: only its expired browser
- * transport is released, leaving the ticket for its next 15-minute pickup.
+ * gone has nothing left to end. A resume is different: once its handoff is durable, this timer
+ * owns only the current browser carrier. Safe pre-dispatch failure releases that carrier and
+ * leaves the continuation for a later pickup; ambiguous post-dispatch state keeps its fence and
+ * is never replayed. Worker/revival failure retains its existing slot semantics.
  */
 function expire(command: Command): void {
   if (!commands.includes(command)) return;
@@ -9349,48 +9361,42 @@ function drop(command: Command, why: string): boolean {
     });
     return true;
   }
-  const automaticEntry = command.spec.type === 'resume' ? continuationByToken(command.spec.token) : null;
-  const automaticResume =
-    automaticEntry?.automatic === true && automaticEntry.state !== 'committing' && automaticEntry.state !== 'committed';
-  if (automaticResume) {
-    // Serialize retirement with redeem and destination permits. Release the old
-    // unattempted claim first: a crash can retain its reclaimable old command,
-    // but cannot leave a dead claimant behind a durably removed command.
+  const resumeEntry = command.spec.type === 'resume' ? continuationByToken(command.spec.token) : null;
+  const resumableResume = resumeEntry !== null &&
+    resumeEntry.state !== 'committing' && resumeEntry.state !== 'committed' && resumeEntry.state !== 'aborted';
+  if (resumableResume) {
+    // Serialize retirement with redeem and destination permits. A command may relinquish only a
+    // checkpoint that still proves nothing was dispatched. Once Send is ambiguous/sent, remove
+    // this carrier but preserve the continuation fence so a later exact marker may reconcile it.
     void writeCommandTransition(command, async () => {
       if (!commands.includes(command) || command.spec.type !== 'resume') return false;
       const entry = continuationByToken(command.spec.token);
-      if (!entry?.automatic || entry.state === 'committing' || entry.state === 'committed') return false;
-      if (entry.destinationSend.state === 'not-attempted')
-        await releaseContinuationDestinationSendNow(command.spec.token, command.id);
+      if (!entry || entry.state === 'committing' || entry.state === 'committed' || entry.state === 'aborted') return false;
+      if (sendUnattempted(entry.destinationSend)) {
+        // Continuation owns claimant identity. This call is idempotently true if the carrier
+        // never redeemed, releases this exact carrier if it did, and refuses a different owner.
+        const released = await releaseContinuationDestinationSendNow(command.spec.token, command.id);
+        if (!released) return false;
+      }
       await writeDurableNow(COMMANDS_STATE, commandSnapshot({ removeCommandId: command.id }));
       if (command.timer) clearTimeout(command.timer);
       command.timer = null;
       commands = commands.filter(candidate => candidate !== command);
-      logWarn(`bridge: released ${specKey(command.spec)} browser attempt without closing its ticket — ${why}`);
+      logWarn(`bridge: released ${specKey(command.spec)} browser attempt without closing its continuation — ${why}`);
       changed();
       return true;
     }).then(retired => {
       if (retired) scheduleDeliver();
+      else if (commands.includes(command)) armDeadline(command, 30_000);
     }).catch(error => {
       persistCommands();
       logWarn(`bridge: could not durably retire ${specKey(command.spec)} — ${error instanceof Error ? error.message : String(error)}`);
+      if (commands.includes(command)) armDeadline(command, 30_000);
     });
     return true;
   }
   const needsBrokerFence = command.spec.type === 'worker' || command.spec.type === 'revive';
   if (needsBrokerFence) commandRetirementsAwaitingBroker.set(command.id, command);
-  // A resume whose replacement chat never opened has to end its transaction too, or the
-  // session sits "opening" forever with nothing coming. Aborting leaves the session
-  // attached to the chat it is already in, which is the safe side of this failure.
-  if (command.spec.type === 'resume') {
-    const before = continuationByToken(command.spec.token);
-    const aborted = before ? abortContinuation(command.spec.token, why) : false;
-    const after = continuationByToken(command.spec.token);
-    if (!aborted && (after?.state === 'committing' || after?.state === 'committed')) {
-      logWarn(`bridge: ${specKey(command.spec)} could not be cancelled after its commit boundary — ${why}`);
-      return false;
-    }
-  }
   if (command.timer) clearTimeout(command.timer);
   command.timer = null;
   commands = commands.filter((entry) => entry !== command);
@@ -10314,6 +10320,7 @@ export function resetBridgeForTests(): void {
   lastBrowserLaunchAt = 0;
   lastSeenAt = null;
   extensionVersion = null;
+  extensionBuildId = null;
   versionWarned = false;
   requestWindow = { start: Date.now(), count: 0 };
 }

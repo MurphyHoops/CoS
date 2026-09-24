@@ -10,10 +10,14 @@ Install the CoS desktop app and use the companion extension shipped with the sam
 
 After updating either component:
 - restart/reopen CoS;
-- reload the unpacked companion extension;
+- reload the unpacked companion extension from the **extension folder opened by that exact app build**;
 - refresh/reconnect the CoS custom app in ChatGPT if the MCP schema changed.
 
-App/extension protocol mismatch is a configuration error, not a recovery condition.
+Version equality alone does not prove Chrome is running the right unpacked directory. CoS 3.1.1
+also compares an opaque companion-build identity. If the app or extension says **Loaded copy
+mismatch**, open **Setup → Open extension folder**, then in `chrome://extensions` remove/reload
+the companion from that exact folder. App/extension protocol or companion-build mismatch is a
+configuration error, not a recovery condition.
 
 ## 2. Approve workspace capabilities
 
@@ -38,7 +42,10 @@ When a new tool such as `session_wait` is added, refresh the custom app and star
 
 ## 4. Pair the companion extension
 
-Load the extension directory as an unpacked Chromium extension and keep the matching version loaded.
+Load the extension directory as an unpacked Chromium extension and keep the matching release
+copy loaded. First use provisions the local bridge automatically. If you explicitly choose
+**Disconnect**, that intent is durable; reconnect from the companion popup under **Advanced →
+Connect** rather than expecting a background poll to undo it.
 
 The extension provides:
 - provider conversation identity;
@@ -46,7 +53,9 @@ The extension provides:
 - browser delivery/acceptance evidence;
 - background browser wake/repair support.
 
-It does not own mission identity. CoS local durable state does.
+The app reports detection, authorization, authenticated presence and wake-channel state
+separately so a stale unpacked copy or a deliberate disconnect is diagnosable. The extension
+does not own mission identity. CoS local durable state does.
 
 ## 5. Start work
 
@@ -100,6 +109,13 @@ The replacement keeps:
 - continuation/recovery provenance.
 
 The source conversation is fenced after the replacement transaction commits.
+
+Once the source brief has been durably captured, that handoff is app-owned continuation debt.
+A replacement tab that fails before Send may lose its 15-minute carrier lease and be safely
+replaced without discarding the handoff, including across an app restart. A destination that
+has reached `dispatched-unresolved` or `sent` is different: CoS preserves the ambiguity fence
+and does **not** type the brief again merely because an ACK, tab or timer was lost. The handoff
+ends only by exact commit or explicit cancellation.
 
 ## 8. Self-Healing
 

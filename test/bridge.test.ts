@@ -13,7 +13,7 @@ import { once } from 'node:events';
 import { WebSocket } from 'ws';
 import sharp from 'sharp';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { APP_VERSION, BRIDGE_PROTOCOL } from '../src/main/version.js';
+import { APP_VERSION, BRIDGE_PROTOCOL, COMPANION_BUILD_ID } from '../src/main/version.js';
 import { userPromptText } from '../src/shared/user-prompt.js';
 import { currentCoreInstructions } from '../src/main/mcp/instructions.js';
 import { browserControl } from '../src/main/browser-control.js';
@@ -230,9 +230,8 @@ async function compactedSession(from: string, brief: string): Promise<{ sessionI
 /**
  * The same, but the ticket the app files for itself rather than one the user asked for.
  *
- * Automatic tickets take a different failure path: a manual resume that never reports back is
- * aborted, an automatic one keeps its ticket for a later pickup. Only the automatic one can
- * reach the state this file's claim test is about.
+ * Manual and automatic captured handoffs now share durable opening semantics. This helper keeps
+ * the automatic flag only for tests of automatic source-writing policy and threshold behavior.
  */
 async function automaticCompactedSession(from: string, brief: string): Promise<{ sessionId: string; token: string }> {
   const reply = await request('POST', '/events', {
@@ -268,7 +267,7 @@ interface Reply {
 function request(
   method: string,
   path: string,
-  options: { body?: unknown; origin?: string | null; auth?: string | null; raw?: string; extensionVersion?: string; protocol?: number } = {}
+  options: { body?: unknown; origin?: string | null; auth?: string | null; raw?: string; extensionVersion?: string; protocol?: number; buildId?: string | null } = {}
 ): Promise<Reply> {
   const url = new URL(path, base);
   const payload = options.raw ?? (options.body === undefined ? null : JSON.stringify(options.body));
@@ -278,6 +277,7 @@ function request(
   // only produce confusing downstream failures.
   headers['x-extension-version'] = options.extensionVersion ?? APP_VERSION;
   headers['x-extension-protocol'] = String(options.protocol ?? BRIDGE_PROTOCOL);
+  if (options.buildId !== null) headers['x-extension-build-id'] = options.buildId ?? COMPANION_BUILD_ID;
   if (payload !== null) {
     headers['content-type'] = 'application/json';
     headers['content-length'] = String(Buffer.byteLength(payload));
@@ -539,6 +539,26 @@ describe('who is allowed to talk to it', () => {
     } finally { unsubscribe(); }
   });
 
+  it('detects a same-version companion loaded from a different unpacked release copy', async () => {
+    const staleBuild = 'cos-stale-checkout-build-v1';
+    await request('GET', '/hello', { auth: null, buildId: staleBuild });
+    expect(await bridgeStatus()).toMatchObject({
+      detected: true,
+      paired: false,
+      present: false,
+      extensionVersion: APP_VERSION,
+      extensionBuildId: staleBuild,
+      extensionSourceCurrent: false
+    });
+
+    await request('GET', '/hello', { auth: null });
+    expect(await bridgeStatus()).toMatchObject({
+      detected: true,
+      extensionBuildId: COMPANION_BUILD_ID,
+      extensionSourceCurrent: true
+    });
+  });
+
   it('binds a loopback port only', () => {
     expect(bridgePort()).toBeGreaterThan(0);
     expect(base.startsWith('http://127.0.0.1:')).toBe(true);
@@ -560,8 +580,9 @@ describe('who is allowed to talk to it', () => {
     expect(reply.body.bridge).toBe(BRIDGE_PROTOCOL);
     expect(reply.body.paired).toBe(false);
     // Identification must not double as a status leak.
-    expect(Object.keys(reply.body)).toEqual(['app', 'version', 'bridge', 'compatible', 'paired', 'disconnected']);
+    expect(Object.keys(reply.body)).toEqual(['app', 'version', 'bridge', 'compatible', 'paired', 'disconnected', 'companionBuildId']);
     expect(reply.body.disconnected).toBe(false);
+    expect(reply.body.companionBuildId).toBe(COMPANION_BUILD_ID);
     expect(reply.body.compatible).toBe(true);
   });
 
@@ -5396,21 +5417,26 @@ describe('targeted open', () => {
   });
 
   /**
-   * No opener at all is an ending, not a wait.
+   * No opener can end the current carrier, but not the captured handoff.
    *
-   * There used to be a poll route behind this: a command nothing could open simply sat in
-   * the queue until some ChatGPT tab came and asked for it. With that gone, a queue with no
-   * reader is a job that can never happen, so it fails here — the continuation aborts, the
-   * session stays in the chat it is in, and nothing is left for a later sweep to find.
+   * This is the 3.0 regression: the model had already produced and stored the brief, then one
+   * failed browser-open attempt destroyed the continuation. The browser carrier is replaceable;
+   * the durable handoff remains owed until it commits or the user explicitly cancels it.
    */
-  it('ends a command outright when this process cannot open a browser at all', async () => {
+  it('keeps a captured manual handoff when this process cannot open a browser yet', async () => {
     setBrowserOpener(null);
     await pair();
     const { sessionId, token } = await compactedSession('77777777-8888-9999-aaaa-bbbbbbbbbbbb', 'carry on');
     queueResume(sessionId, token);
 
-    expect(pendingCommands()).toEqual([]);
-    expect(continuationByToken(token)?.state).toBe('aborted');
+    await vi.waitFor(() => expect(pendingCommands()).toEqual([]));
+    expect(continuationByToken(token)).toMatchObject({ state: 'awaiting-chat', automatic: false });
+
+    setBrowserOpener(async (url) => { opened.push(url); });
+    const retry = queueResume(sessionId, token)!;
+    await waitForOpened(1);
+    expect((await redeem(retry.id, 'replacement-tab')).text).toContain('carry on');
+    expect(continuationByToken(token)?.state).toBe('claimed');
   });
 
   it('does not spin automatic retirement when no browser opener exists and its durable removal fails', async () => {
@@ -5465,8 +5491,13 @@ describe('targeted open', () => {
       changed = true;
       for (let n = 0; n < 80; n++) await Promise.resolve();
       expect(refreshed).toBe(true);
-      expect(removals).toBe(0);
-      expect(pendingCommands().some(entry => entry.id === command.id)).toBe(true);
+      expect(removals).toBe(phase === 'manual' ? 1 : 0);
+      if (phase === 'manual') {
+        await vi.waitFor(() => expect(pendingCommands().some(entry => entry.id === command.id)).toBe(false));
+        expect(continuationByToken(token)?.state).not.toBe('aborted');
+      } else {
+        expect(pendingCommands().some(entry => entry.id === command.id)).toBe(true);
+      }
     } finally { read.mockRestore(); write.mockRestore(); }
   });
 
@@ -5522,15 +5553,13 @@ describe('targeted open', () => {
   });
 
   /**
-   * The tab opened and then nothing happened. There is no scheduler waiting to try again.
+   * One opened replacement that never reports back retires only that browser carrier.
    *
-   * This is the whole failure model in one test: the app opens exactly one chat, gives that
-   * page a deadline, and when the deadline passes the attempt is over. Over means the
-   * continuation is aborted and the session is still attached to the chat it was already
-   * in — a state the user can see and act on — rather than a queue entry that reopens a
-   * tab minutes later, on its own, for something they have stopped expecting.
+   * Reproduces the 3.0 failure where a captured manual handoff was abandoned ten minutes after
+   * "opening the replacement chat". No Send happened here, so a later carrier may safely claim
+   * the same durable brief; the local session never silently drops its continuation debt.
    */
-  it('ends the continuation when the chat it opened never reports back', async () => {
+  it('retains a manual continuation when the replacement chat never reports back', async () => {
     vi.useFakeTimers();
     try {
       setBrowserOpener(async (url) => {
@@ -5538,17 +5567,24 @@ describe('targeted open', () => {
       });
       await pair();
       const { sessionId, token } = await compactedSession('44444444-5555-6666-7777-888888888888', 'carry on');
-      const command = queueResume(sessionId, token)!;
+      const first = queueResume(sessionId, token)!;
       await waitForOpened(1);
-      expect(opened).toEqual([commandUrl(command.id)]);
+      expect(opened).toEqual([commandUrl(first.id)]);
 
-      // The page never redeems, never acks, never types.
-      await vi.advanceTimersByTimeAsync(90_000);
+      // The page never redeems, never acks, never types. The 15-minute carrier lease expires.
+      await vi.advanceTimersByTimeAsync(15 * 60_000 + 1);
+      await vi.waitFor(() => expect(pendingCommands().some(entry => entry.id === first.id)).toBe(false));
+      expect(continuationByToken(token)).toMatchObject({
+        state: 'awaiting-chat',
+        automatic: false,
+        destinationSend: { state: 'not-attempted' }
+      });
 
-      expect(pendingCommands()).toEqual([]);
-      expect(continuationByToken(token)?.state).toBe('aborted');
-      // And no second tab was opened for it on the way out.
-      expect(opened).toEqual([commandUrl(command.id)]);
+      // The same durable debt can be carried again without recapturing or regenerating the brief.
+      const second = queueResume(sessionId, token)!;
+      expect(second.id).not.toBe(first.id);
+      expect((await redeem(second.id, 'replacement-tab-2')).text).toContain('carry on');
+      expect(continuationByToken(token)?.state).toBe('claimed');
     } finally {
       vi.useRealTimers();
     }
@@ -5650,7 +5686,7 @@ describe('targeted open', () => {
     );
   });
 
-  it('keeps a redeemed resume alive past the short ACK deadline without outliving its continuation', async () => {
+  it('releases a redeemed pre-dispatch carrier without abandoning the captured manual handoff', async () => {
     vi.useFakeTimers();
     try {
       setBrowserOpener(async (url) => {
@@ -5662,24 +5698,33 @@ describe('targeted open', () => {
         sourceConversation,
         'the slow-start brief'
       );
-      const command = queueResume(sessionId, token)!;
+      const first = queueResume(sessionId, token)!;
+      await waitForOpened(1);
 
-      // Browser/ChatGPT startup consumes most of the original open-attempt deadline.
+      // Let the opened page spend a minute hydrating after the carrier lease starts.
       await vi.advanceTimersByTimeAsync(60_000);
-      expect((await redeem(command.id, 'slow-tab')).text).toContain('the slow-start brief');
+      expect((await redeem(first.id, 'slow-tab')).text).toContain('the slow-start brief');
 
-      // Hidden Chromium tabs can stretch content.js's conversation-id wait beyond 90s. The exact
-      // page already owns the one-shot continuation, so the short command deadline must not abort
-      // it while that existing continuation is still valid.
-      await vi.advanceTimersByTimeAsync(2 * 60_000);
-      expect(pendingCommands().map((entry) => entry.what)).toEqual([`resume:${sessionId}`]);
-      expect(continuationByToken(token)?.state).toBe('claimed');
+      // The page may spend time hydrating before it ever arms Send. It owns the claim but has
+      // not crossed the irreversible boundary, so carrier expiry may safely relinquish it.
+      expect((await request('POST', '/compact', {
+        body: { token, commandId: first.id, client: 'slow-tab', destinationAttempt: true }
+      })).body.allowed).toBe(true);
+      await vi.advanceTimersByTimeAsync(15 * 60_000 + 1);
 
-      // The claim is progress, then ten minutes without further progress ends its waiting lease.
-      await vi.advanceTimersByTimeAsync(8 * 60_000 + 1);
-      expect(pendingCommands()).toEqual([]);
-      expect(continuationByToken(token)?.state).toBe('aborted');
+      // Expiry first fsyncs the released checkpoint + command removal, then publishes the live
+      // queue. Wait for that durability boundary rather than racing the timer callback's promise.
+      await vi.waitFor(() => expect(pendingCommands().some(entry => entry.id === first.id)).toBe(false));
+      expect(continuationByToken(token)).toMatchObject({
+        state: 'awaiting-chat',
+        automatic: false,
+        destinationSend: { state: 'not-attempted' }
+      });
       expect((await getSession(sessionId))?.conversationId).toBe(sourceConversation);
+
+      const second = queueResume(sessionId, token)!;
+      expect(second.id).not.toBe(first.id);
+      expect((await redeem(second.id, 'next-tab')).text).toContain('the slow-start brief');
     } finally {
       vi.useRealTimers();
     }
