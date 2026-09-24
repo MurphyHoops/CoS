@@ -241,6 +241,31 @@ describe('capturing the brief', () => {
     expect(await handoffCount(summary.id)).toBe(1);
   });
 
+  it('keeps a captured manual handoff as durable opening debt past the old ten-minute timeout and restart', async () => {
+    vi.useFakeTimers();
+    const { sessionId, token } = await readyContinuation();
+
+    // 3.0 used to abort this exact state after ten minutes if the replacement chat failed to
+    // report. Once the handoff exists, elapsed wall time is not permission to discard the debt.
+    await vi.advanceTimersByTimeAsync(CONTINUATION_TTL_MS * 3);
+    expect(continuationForSession(sessionId)).toMatchObject({
+      token,
+      state: 'awaiting-chat',
+      automatic: false
+    });
+
+    // The same fact must survive an app restart. Restore reads the old timestamps but keeps a
+    // captured manual handoff until commit or explicit cancel.
+    const snapshot = snapshotContinuations();
+    resetContinuationsForTests();
+    await restoreContinuations(snapshot);
+    expect(continuationForSession(sessionId)).toMatchObject({
+      token,
+      state: 'awaiting-chat',
+      automatic: false
+    });
+  });
+
   it('writes one handoff even when two captures race', async () => {
     const summary = await createSession({ title: 'work', conversationId: CHAT_A });
     const opened = await openContinuationNow(summary.id, CHAT_A);
@@ -506,7 +531,7 @@ describe('committing', () => {
     expect(await releaseContinuationDestinationSendNow('0000000000000000000000000000dead')).toBe(false);
   });
 
-  it.each(['unattempted', 'attempted', 'dispatched', 'sent'])('command retirement only releases its own unattempted claim (%s)', async state => {
+  it.each(['unattempted', 'attempted', 'dispatched', 'sent'])('command retirement releases only its own safe pre-dispatch claim (%s)', async state => {
     const { token } = await readyContinuation();
     await claimContinuationNow(token, 'old-command');
     expect(await releaseContinuationDestinationSendNow(token, 'foreign-command')).toBe(false);
@@ -514,8 +539,13 @@ describe('committing', () => {
     if (state === 'dispatched' || state === 'sent') await dispatchContinuationDestinationSendNow(token);
     if (state === 'sent') await bindContinuationDestinationMessageNow(token, CHAT_B, 'exact-resume-message');
     const before = snapshotContinuations();
-    expect(await releaseContinuationDestinationSendNow(token, 'old-command')).toBe(state === 'unattempted');
-    if (state === 'unattempted') {
+    const releasable = state === 'unattempted' || state === 'attempted';
+    expect(await releaseContinuationDestinationSendNow(token, 'old-command')).toBe(releasable);
+    if (releasable) {
+      expect(continuationByToken(token)).toMatchObject({
+        state: 'awaiting-chat',
+        destinationSend: { state: 'not-attempted' }
+      });
       expect(await claimContinuationNow(token, 'new-command')).not.toBeNull();
       expect(await releaseContinuationDestinationSendNow(token, 'old-command')).toBe(false);
       expect(snapshotContinuations().entries.find(row => row.token === token)?.claimedBy).toBe('new-command');
@@ -1689,7 +1719,7 @@ describe('an exact handoff response owns its waiting deadline', () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it('returns a captured Pro brief to the ordinary clock for the app-paced phases', async () => {
+  it('keeps a captured Pro brief as durable app-paced opening debt', async () => {
     vi.useFakeTimers();
     try {
       const session = await createSession({ title: 'pro captured', conversationId: CHAT_A });
@@ -1704,9 +1734,10 @@ describe('an exact handoff response owns its waiting deadline', () => {
 
       expect(await attachSummary(opened.token, SAMPLE_BRIEF)).not.toBeNull();
       expect(continuationByToken(opened.token)?.state).toBe('awaiting-chat');
-      // Opening the replacement is app-paced work; the ordinary ten-minute clock is back.
-      vi.setSystemTime(Date.now() + CONTINUATION_TTL_MS + 1);
-      expect(continuationByToken(opened.token)?.state).toBe('aborted');
+      // Once captured, opening the replacement is app-owned durable debt. The longer Pro source
+      // budget no longer matters, and the old ordinary ten-minute opening timeout must not return.
+      vi.setSystemTime(Date.now() + CONTINUATION_PRO_WRITING_TTL_MS * 2);
+      expect(continuationByToken(opened.token)?.state).toBe('awaiting-chat');
     } finally { vi.useRealTimers(); }
   });
 });

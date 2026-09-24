@@ -12,7 +12,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
-const { APP_VERSION, BRIDGE_PROTOCOL } = await import('../src/main/version.js');
+const { APP_VERSION, BRIDGE_PROTOCOL, COMPANION_BUILD_ID } = await import('../src/main/version.js');
 
 let domSource = '';
 let backgroundSource = '';
@@ -39,8 +39,21 @@ describe('extension release metadata', () => {
     expect(lock.version).toBe(APP_VERSION);
     expect(lock.packages?.['']?.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
-    expect(BRIDGE_PROTOCOL).toBe(14);
-    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 14;');
+    expect(BRIDGE_PROTOCOL).toBe(15);
+    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 15;');
+    expect(backgroundSource).toContain(`const COMPANION_BUILD_ID = '${COMPANION_BUILD_ID}';`);
+    expect((await fs.readFile(path.join(process.cwd(), 'extension', 'companion-build.txt'), 'utf8')).trim()).toBe(COMPANION_BUILD_ID);
+
+    // Discovery has both a cached-port refresh path and a first-scan path. Both must learn the
+    // app's expected build id or the popup diagnoses an unpacked-copy mismatch only on its second
+    // refresh. Losing the clear on app disappearance would leave the inverse stale diagnosis.
+    expect(backgroundSource.match(/appCompanionBuildId = typeof body\.companionBuildId/g)).toHaveLength(2);
+    expect(backgroundSource).toContain('appCompanionBuildId = null;');
+    expect(backgroundSource).toContain('appCompanionBuildId: found ? found.companionBuildId ?? null : null');
+
+    const popup = await fs.readFile(path.join(process.cwd(), 'extension', 'popup.js'), 'utf8');
+    expect(popup).toContain('Loaded copy mismatch');
+    expect(popup).toContain('status.appCompanionBuildId !== status.extensionBuildId');
   });
 
   /**

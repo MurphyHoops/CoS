@@ -541,39 +541,46 @@ const handoffAsked = (entry: Continuation): boolean =>
   entry.sourceSend.state === 'sent';
 
 /**
- * The waiting deadline for a manual ticket. Pro's longer budget exists only while its brief
- * is being written: later phases are app-paced and keep the ordinary clock.
+ * The model-writing deadline for a manual ticket.
+ *
+ * Once a handoff is captured, the remaining transition is app-owned durable debt: opening and
+ * committing B may need browser restarts, transport suspension or another pickup. A user-requested
+ * continuation must not be cancelled merely because one replacement carrier failed to report.
+ * Pro gets the longer source-writing budget because hidden reasoning has no text growth to renew it.
  */
-const manualWaitingTtlMs = (state: ContinuationState, requested: RequestedModel | null): number =>
-  state === 'awaiting-summary' && requested !== null &&
-  isProModel(requested.model, requested.reasoningEffort ?? undefined)
+const manualWritingTtlMs = (requested: RequestedModel | null): number =>
+  requested !== null && isProModel(requested.model, requested.reasoningEffort ?? undefined)
     ? CONTINUATION_PRO_WRITING_TTL_MS
     : CONTINUATION_TTL_MS;
 
 /**
- * Whether a nonterminal continuation has outlived its wait. A manual one gets
- * CONTINUATION_TTL_MS from its last sign of progress — CONTINUATION_PRO_WRITING_TTL_MS while
- * a Pro brief is still being written; an automatic one has no clock until it is asked for and
- * AUTOMATIC_HANDOVER_TTL_MS from then.
+ * Whether a nonterminal continuation has outlived a provider wait.
+ *
+ * Manual tickets are timed only while ChatGPT is still producing the source brief. After that
+ * brief is durable, cancellation is explicit and browser transport retries are owned by bridge
+ * pickups. Automatic tickets retain their existing six-hour source-request fence.
  */
 const expired = (entry: Continuation, now = Date.now()): boolean => {
   const budgetNow = transportBudgetNow(now);
-  return entry.automatic
-    ? entry.deadlineAskedAt !== null && budgetNow - entry.deadlineAskedAt >= AUTOMATIC_HANDOVER_TTL_MS
-    : budgetNow - entry.deadlineTouchedAt >= manualWaitingTtlMs(entry.state, entry.requestedModel);
+  if (entry.automatic) {
+    return entry.deadlineAskedAt !== null && budgetNow - entry.deadlineAskedAt >= AUTOMATIC_HANDOVER_TTL_MS;
+  }
+  if (entry.state !== 'awaiting-summary') return false;
+  return budgetNow - entry.deadlineTouchedAt >= manualWritingTtlMs(entry.requestedModel);
 };
 
 const isOpen = (entry: Continuation): boolean =>
   entry.state !== 'committed' && entry.state !== 'aborted' && !expired(entry);
 
-/** Provider-ready deadline for bridge custody; causal touched/asked timestamps remain unchanged. */
+/** Provider-ready source-writing deadline; captured manual handoffs are durable opening debt. */
 export function continuationProviderDeadlineAt(token: string): number | null {
   const entry = byToken.get(token);
   if (!entry || entry.state === 'committed' || entry.state === 'aborted') return null;
   if (entry.automatic) {
     return entry.deadlineAskedAt === null ? null : entry.deadlineAskedAt + AUTOMATIC_HANDOVER_TTL_MS;
   }
-  return entry.deadlineTouchedAt + manualWaitingTtlMs(entry.state, entry.requestedModel);
+  if (entry.state !== 'awaiting-summary') return null;
+  return entry.deadlineTouchedAt + manualWritingTtlMs(entry.requestedModel);
 }
 
 /** Provider-ready anchor for the durable source-send phase, used only by browser pickup scheduling. */
@@ -1087,10 +1094,15 @@ export async function releaseContinuationDestinationSendNow(token: string, unatt
     if (!entry || !isOpen(entry) || !entry.handoffId || entry.state === 'awaiting-summary') return false;
     // Command retirement has no page proof of loss. It can release only its own
     // still-unattempted claim, rechecked inside the same Send checkpoint lock.
-    if (unattemptedClaimant !== undefined &&
-        (entry.claimedBy !== unattemptedClaimant || entry.destinationSend.state !== 'not-attempted')) return false;
+    if (unattemptedClaimant !== undefined) {
+      if (!sendUnattempted(entry.destinationSend)) return false;
+      // A carrier that died before redeeming never became the WAL claimant. Retiring that exact
+      // command is already safe and has nothing to release inside the continuation.
+      if (entry.claimedBy === null) return true;
+      if (entry.claimedBy !== unattemptedClaimant) return false;
+    }
     if (entry.destinationSend.state === 'sent') return false;
-    if (entry.destinationSend.state === 'not-attempted' && entry.claimedBy === null) return true;
+    if (sendUnattempted(entry.destinationSend) && entry.claimedBy === null) return true;
     // The claim goes with the dispatch. It named the one command whose page was to send the
     // brief; that page has sent nothing and its command is retired, so the next command — a
     // fresh id — must be able to claim, or the released brief could never be offered again.
@@ -1687,10 +1699,11 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
   ]);
   for (const raw of snapshot.entries.slice(0, 32)) {
     if (!raw) continue;
-    // The retention window scales with the same per-ticket deadline the live sweep uses:
-    // a Pro brief still inside its longer writing clock must survive a restart within it
-    // rather than vanish silently at twice the ordinary TTL.
-    const retentionMs = manualWaitingTtlMs(raw.state, requestedModel(raw.requestedModel)) * 2;
+    // Source-writing retention scales with the same deadline as the live sweep. Captured
+    // manual handoffs are different: they are durable opening debt and therefore have no
+    // wall-clock restore expiry before explicit cancel/commit.
+    const restoredRequestedModel = requestedModel(raw.requestedModel);
+    const retentionMs = manualWritingTtlMs(restoredRequestedModel) * 2;
     const lastTouchedAt = Number.isFinite(raw.touchedAt) && raw.touchedAt! <= now ? raw.touchedAt! : raw.openedAt;
     const terminal = raw.state === 'committed' || raw.state === 'aborted';
     let deadlineTouchedAt = Number.isFinite(raw.deadlineTouchedAt) && raw.deadlineTouchedAt! <= now
@@ -1705,12 +1718,12 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
       !validStates.has(raw.state) ||
       !Number.isFinite(raw.openedAt) ||
       (terminal && now - lastTouchedAt >= retentionMs) ||
-      (!terminal && raw.automatic !== true && now - deadlineTouchedAt >= retentionMs)
+      (!terminal && raw.automatic !== true && raw.state === 'awaiting-summary' && now - deadlineTouchedAt >= retentionMs)
     ) {
       continue;
     }
     const entry: Continuation = {
-      requestedModel: requestedModel(raw.requestedModel),
+      requestedModel: restoredRequestedModel,
       sourceTurnId: typeof raw.sourceTurnId === 'string' ? raw.sourceTurnId : null,
       token: raw.token,
       sessionId: raw.sessionId,
@@ -1772,7 +1785,10 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
       if (!terminal && persistedPauseAt !== null) deadlineAskedAt += restartSuspensionMs;
       entry.deadlineAskedAt = deadlineAskedAt;
     }
-    const waitingExpired = entry.state !== 'committed' && entry.state !== 'aborted' && expired(entry, now);
+    const legacyCommittingExpired = raw.state === 'committing' && !raw.destinationSend && raw.automatic !== true &&
+      now - deadlineTouchedAt >= CONTINUATION_TTL_MS;
+    const waitingExpired = entry.state !== 'committed' && entry.state !== 'aborted' &&
+      (expired(entry, now) || legacyCommittingExpired);
     if (entry.handoffId) {
       try {
         entry.handoff = await readHandoff(entry.sessionId, entry.handoffId);

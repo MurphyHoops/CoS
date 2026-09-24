@@ -12,7 +12,9 @@
  * extension does nothing" into a diagnosable mismatch.
  */
 
-export const APP_VERSION = '3.1.0';
+export const APP_VERSION = '3.1.1';
+/** Opaque companion release identity. Must match extension/background.js and companion-build.txt. */
+export const COMPANION_BUILD_ID = 'cos-3.1.1-companion-diagnostics-v1';
 
 /**
  * Standalone extension recovery must stay on the app's own release. Using GitHub's moving
@@ -68,4 +70,6 @@ export function extensionDownloadUrl(version = APP_VERSION): string {
 // draft ownership. A 12 companion would silently send text without these files.
 // 14 — exact native generated-image metadata and bounded preview observations. A 13 app
 // would ACK the journal while silently discarding that new event kind.
-export const BRIDGE_PROTOCOL = 14;
+// 15 — companion release-build identity is carried on every request and /hello publishes the
+// expected build. A 14 peer cannot diagnose Chrome still loading a stale unpacked directory.
+export const BRIDGE_PROTOCOL = 15;

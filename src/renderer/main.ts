@@ -751,10 +751,15 @@ function updateSummary({ bridge, update, config, status }: AppState): { text: st
     bridge.extensionVersion && isNewer(update.current, bridge.extensionVersion)
       ? bridge.extensionVersion
       : null;
+  const detected = bridge.detected ?? bridge.extensionVersion !== null;
+  const sourceMismatch = detected && bridge.extensionSourceCurrent === false;
+  const manuallyDisconnected = detected && bridge.disconnected === true;
   // A mismatched companion can fail the protocol gate before it becomes present.
-  // Retain its last observed version until a matching companion actually reports in.
-  const missing = !stale && bridge.running && !bridge.present && isRunning(status.state) && browserExtensionRequired(config);
-  if (!stale && !missing && !update.latest && update.stage === 'idle' && !update.checkedAt) return null;
+  // Retain its last observed identity until a matching companion actually reports in.
+  const missing = !stale && !sourceMismatch && !manuallyDisconnected &&
+    bridge.running && !bridge.present && isRunning(status.state) && browserExtensionRequired(config);
+  if (!stale && !sourceMismatch && !manuallyDisconnected && !missing &&
+      !update.latest && update.stage === 'idle' && !update.checkedAt) return null;
 
   const lines: string[] = [];
   let tone: UpdateTone = 'work';
@@ -779,7 +784,7 @@ function updateSummary({ bridge, update, config, status }: AppState): { text: st
     tone = 'bad';
   } else if (update.stage === 'checking') {
     lines.push(t("Checking for a newer version…"));
-  } else if (!stale && !missing) {
+  } else if (!stale && !sourceMismatch && !manuallyDisconnected && !missing) {
     const extension = bridge.present && bridge.extensionVersion ? t(" · extension {0}", [bridge.extensionVersion]) : '';
     lines.push(t("Up to date! Chat On Steroids {0}{1}", [update.current, extension]));
     tone = 'ok';
@@ -791,8 +796,31 @@ function updateSummary({ bridge, update, config, status }: AppState): { text: st
     );
     tone = 'bad';
   }
-  if (missing) { lines.push(t("Browser extension not connected. Open ChatGPT and check the companion in Setup to load models and send messages.")); tone = 'bad'; }
-  return { text: lines.join(' '), tone, notice: Boolean(update.latest || stale || missing), extensionAction: stale ? t("Update extension") : missing ? t("Check extension") : null };
+  if (sourceMismatch) {
+    lines.push(t("Chrome is running a different unpacked companion copy than the one shipped with this app. Reload it from this app’s extension folder."));
+    tone = 'bad';
+  }
+  if (manuallyDisconnected) {
+    lines.push(t("Browser companion is detected but manually disconnected. Open its popup → Advanced → Connect."));
+    tone = 'bad';
+  }
+  if (missing) {
+    lines.push(t("Browser extension not connected. Open ChatGPT and check the companion in Setup to load models and send messages."));
+    tone = 'bad';
+  }
+  const extensionAction = stale || sourceMismatch
+    ? t("Update extension")
+    : manuallyDisconnected
+      ? t("Reconnect extension")
+      : missing
+        ? t("Check extension")
+        : null;
+  return {
+    text: lines.join(' '),
+    tone,
+    notice: Boolean(update.latest || stale || sourceMismatch || manuallyDisconnected || missing),
+    extensionAction
+  };
 }
 
 /** The header bar, the Activity line and the one notification, from that single sentence. */
@@ -1114,7 +1142,7 @@ function apply(next: AppState): void {
   // only that this extension is allowed to connect; setup is complete when a required browser
   // has actually checked in during this process. If no enabled feature needs the browser,
   // this optional step is hidden and deliberately cannot block the wizard.
-  if (!browserRequired || next.bridge.present) done.add('browser');
+  if (!browserRequired || (next.bridge.present && next.bridge.extensionSourceCurrent !== false)) done.add('browser');
   const current = order.find((name) => !done.has(name)) ?? null;
   for (const name of order) {
     const node = step(name);

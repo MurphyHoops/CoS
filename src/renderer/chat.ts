@@ -3236,8 +3236,14 @@ export function chatApply(state: AppState, previous?: Config): void {
   applyChatValue($<HTMLSelectElement>('helperReasoning'), config.goal.helperReasoning ?? 'high', previous?.goal.helperReasoning);
   applyGoal(state, previous);
 
-  // Extension bridge. Connecting is automatic, so this reports rather than asks.
+  // Extension bridge. Detection, authorization and live wake are deliberately separate facts.
+  // A /hello proves a companion exists; it does not prove the user authorized it or that the
+  // authenticated wake channel is alive. Keep those states visible instead of collapsing every
+  // failure into "not connected".
   const browserRequired = browserExtensionRequired(config);
+  const detected = bridge.detected ?? bridge.extensionVersion !== null;
+  const manuallyDisconnected = bridge.disconnected === true;
+  const sourceMismatch = bridge.extensionSourceCurrent === false;
   $<HTMLButtonElement>('bridgeUnpair').disabled = !bridge.paired;
   const secureStorageAvailable = state.secureStorage?.available ?? true;
   ui($('bridgeState'), 'textContent', () => !browserRequired
@@ -3246,12 +3252,23 @@ export function chatApply(state: AppState, previous?: Config): void {
       ? (state.secureStorage?.detail ?? t("Secure credential storage is unavailable, so the extension cannot pair safely."))
     : !bridge.running
       ? t("The local bridge is off even though recording or multi-agent mode needs it.")
+      : sourceMismatch
+        ? t("Browser companion {0} is detected, but Chrome is loading a different unpacked copy. Remove or reload it from the extension folder shown below.", [bridge.extensionVersion ?? '?'])
+      : manuallyDisconnected && detected
+        ? t("Browser companion {0} is detected and compatible, but it was manually disconnected. Open the companion popup → Advanced → Connect.", [bridge.extensionVersion ?? '?'])
       : bridge.present
-        ? t("Connected. Listening on 127.0.0.1:{0} · last message {1}.", [bridge.port ?? '?', ago(bridge.lastSeenAt)])
+        ? bridge.wakeConnected === false
+          ? t("Connected on 127.0.0.1:{0}; authenticated HTTP is live and the wake channel is reconnecting.", [bridge.port ?? '?'])
+          : t("Connected. Listening on 127.0.0.1:{0} · wake channel ready · last message {1}.", [bridge.port ?? '?', ago(bridge.lastSeenAt)])
         : bridge.paired
           ? t("Authorized, but the browser extension is not currently connected. {0}", [bridge.lastSeenAt === null ? t("It has not checked in since this app started.") : t("Last seen {0}.", [ago(bridge.lastSeenAt)])])
-          : t("Listening on 127.0.0.1:{0} · no browser is authorized or connected yet.", [bridge.port ?? '?']));
-  $('bridgeState').classList.toggle('is-warn', browserRequired && (!bridge.present || !secureStorageAvailable));
+          : detected
+            ? t("Browser companion {0} is detected on 127.0.0.1:{1}, but it is not authorized. Open the companion popup → Advanced → Connect.", [bridge.extensionVersion ?? '?', bridge.port ?? '?'])
+            : t("Listening on 127.0.0.1:{0} · no browser companion has been detected in this app process yet.", [bridge.port ?? '?']));
+  $('bridgeState').classList.toggle(
+    'is-warn',
+    browserRequired && (!bridge.present || sourceMismatch || manuallyDisconnected || !secureStorageAvailable)
+  );
   void showExtensionPath();
 
   if (sessions.length > 0) paintSessions();
