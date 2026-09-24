@@ -17,7 +17,8 @@ vi.mock('../src/main/session/store.js', async original => ({
   conversationAttachment: fixture.attachment,
   hasSupersededConversationHistory: vi.fn(async () => false)
 }));
-vi.mock('../src/main/session/input.js', () => ({
+vi.mock('../src/main/session/input.js', async original => ({
+  ...await original<typeof import('../src/main/session/input.js')>(),
   offerToolInput: async () => ({ messages: [], reminder: '' }),
   acknowledgeToolInput: fixture.inputAck,
   TOOL_INPUT_HEADER: ''
@@ -131,6 +132,23 @@ it('fails closed during agents authority recovery before handler or queued-input
 
   expect(result.isError).toBe(true);
   expect(JSON.stringify(result)).toContain('multi-agent authority ledgers');
+  expect(run).not.toHaveBeenCalled();
+  expect(fixture.inputAck).not.toHaveBeenCalled();
+});
+
+it('fails closed during session-input recovery before handler or input-receipt side effects', async () => {
+  noteDurableRecoveryIncident({
+    domain: 'input',
+    ledger: 'session-input',
+    failure: 'schema_invalid',
+    disposition: 'pause'
+  });
+  const run = vi.fn(async () => ok('should-not-run'));
+
+  const result = await invoke('request-a', run);
+
+  expect(result.isError).toBe(true);
+  expect(JSON.stringify(result)).toContain('durable session input ledger');
   expect(run).not.toHaveBeenCalled();
   expect(fixture.inputAck).not.toHaveBeenCalled();
 });

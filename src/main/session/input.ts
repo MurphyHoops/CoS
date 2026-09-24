@@ -9,7 +9,12 @@ import type { SessionSummary } from '../../shared/session.js';
 import { getConfig } from '../config.js';
 import { randomUUID } from 'node:crypto';
 import { userTitle } from './title.js';
-import { readDurable, writeDurableNow, writeDurableSoon } from '../durable.js';
+import { readDurableResult, writeDurableCheckpointNow, writeDurableNow, writeDurableSoon } from '../durable.js';
+import {
+  durableRecoveryPaused,
+  noteDurableRecoveryIncident,
+  resolveDurableRecoveryIncident
+} from '../durable-recovery.js';
 import { getSession, findSessionByConversation, createSession, deleteSession, rebindSession, conversationWasSuperseded, readRecentEvents, listUsageSessions, turnHasMcpCall, sessionDirectoryMissing, readCompletedFinal } from './store.js';
 import { assignSessionProject, projectWorkspace, getSessionProject } from '../projects.js';
 import { isChatBlocked } from './blocked-chats.js';
@@ -94,7 +99,11 @@ const entrySchema = inputArgs.extend({
   queueOrder: z.number().int().nonnegative().optional()
 });
 export type InputEntry = z.infer<typeof entrySchema>;
-const STATE = 'session-input';
+export const SESSION_INPUT_STATE = 'session-input';
+const STATE = SESSION_INPUT_STATE;
+export const INPUT_RECOVERY_REFUSAL =
+  'INPUT_DURABLE_RECOVERY_PAUSED: the durable session input ledger could not be read safely, so CoS cannot prove queued input, browser/tool claim custody, or delivery receipts. No local tool was run.';
+export function inputRecoveryPaused(): boolean { return durableRecoveryPaused('input'); }
 const TOOL_INPUT_TEXT_BYTES = 128000;
 export const TOOL_INPUT_HEADER = '\n--- New instructions from the user ---\n';
 export interface ToolInputBatch {
@@ -312,12 +321,139 @@ async function migrateLegacyOpeningOwners(current: InputEntry[]): Promise<boolea
   return changed;
 }
 
+function decodeInputSnapshot(value: unknown): InputEntry[] | null {
+  const parsed = z.array(entrySchema).safeParse(value);
+  if (!parsed.success) return null;
+  const ids = new Set<string>();
+  const companions = new Set<string>();
+  for (const row of parsed.data) {
+    if (ids.has(row.id)) return null;
+    ids.add(row.id);
+  }
+  for (const row of parsed.data) {
+    if (!row.companionInputId) continue;
+    if (row.companionInputId === row.id || !ids.has(row.companionInputId) || companions.has(row.companionInputId)) return null;
+    companions.add(row.companionInputId);
+    const companion = parsed.data.find(other => other.id === row.companionInputId);
+    if (!companion || companion.sessionId !== row.sessionId) return null;
+  }
+  return parsed.data;
+}
+
+export function validateSessionInputSnapshot(value: unknown): value is InputEntry[] {
+  return decodeInputSnapshot(value) !== null;
+}
+
+async function inspectInputBackup(): Promise<void> {
+  const backup = await readDurableResult<unknown>(STATE, 'backup');
+  if (backup.kind === 'missing') {
+    resolveDurableRecoveryIncident('input', STATE, 'backup');
+    return;
+  }
+  if (backup.kind === 'io_error') {
+    noteDurableRecoveryIncident({
+      domain: 'input', ledger: STATE, copy: 'backup', failure: 'io_error', disposition: 'degraded', detail: backup.error
+    });
+    return;
+  }
+  if (backup.kind === 'corrupt') {
+    noteDurableRecoveryIncident({
+      domain: 'input', ledger: STATE, copy: 'backup', failure: 'json_corrupt', disposition: 'degraded', detail: backup.error
+    });
+    return;
+  }
+  if (!validateSessionInputSnapshot(backup.value)) {
+    noteDurableRecoveryIncident({
+      domain: 'input', ledger: STATE, copy: 'backup', failure: 'schema_invalid', disposition: 'degraded',
+      detail: 'session-input backup failed owner schema validation'
+    });
+    return;
+  }
+  resolveDurableRecoveryIncident('input', STATE, 'backup');
+}
+
+async function checkpointInputLedger(rows: InputEntry[]): Promise<void> {
+  try {
+    await writeDurableCheckpointNow(STATE, rows);
+    resolveDurableRecoveryIncident('input', STATE, 'backup');
+  } catch (error) {
+    noteDurableRecoveryIncident({
+      domain: 'input',
+      ledger: STATE,
+      copy: 'backup',
+      failure: 'checkpoint_degraded',
+      disposition: 'degraded',
+      detail: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+async function readInputAuthority(): Promise<InputEntry[]> {
+  const primary = await readDurableResult<unknown>(STATE);
+  if (primary.kind === 'missing') {
+    const backup = await readDurableResult<unknown>(STATE, 'backup');
+    if (backup.kind !== 'missing') {
+      if (backup.kind === 'valid' && !validateSessionInputSnapshot(backup.value)) {
+        noteDurableRecoveryIncident({
+          domain: 'input', ledger: STATE, copy: 'backup', failure: 'schema_invalid', disposition: 'degraded',
+          detail: 'session-input backup failed owner schema validation'
+        });
+      } else if (backup.kind === 'corrupt') {
+        noteDurableRecoveryIncident({
+          domain: 'input', ledger: STATE, copy: 'backup', failure: 'json_corrupt', disposition: 'degraded', detail: backup.error
+        });
+      } else if (backup.kind === 'io_error') {
+        noteDurableRecoveryIncident({
+          domain: 'input', ledger: STATE, copy: 'backup', failure: 'io_error', disposition: 'degraded', detail: backup.error
+        });
+      }
+      noteDurableRecoveryIncident({
+        domain: 'input',
+        ledger: STATE,
+        copy: 'primary',
+        failure: 'orphan_backup',
+        disposition: 'pause',
+        detail: 'session-input primary is missing while recovery evidence still exists'
+      });
+      throw new Error('input_durable_recovery_required');
+    }
+    resolveDurableRecoveryIncident('input', STATE, 'primary');
+    resolveDurableRecoveryIncident('input', STATE, 'backup');
+    return [];
+  }
+  if (primary.kind === 'io_error') {
+    noteDurableRecoveryIncident({
+      domain: 'input', ledger: STATE, copy: 'primary', failure: 'io_error', disposition: 'pause', detail: primary.error
+    });
+    await inspectInputBackup();
+    throw new Error('input_durable_recovery_required');
+  }
+  if (primary.kind === 'corrupt') {
+    noteDurableRecoveryIncident({
+      domain: 'input', ledger: STATE, copy: 'primary', failure: 'json_corrupt', disposition: 'pause', detail: primary.error
+    });
+    await inspectInputBackup();
+    throw new Error('input_durable_recovery_required');
+  }
+  const decoded = decodeInputSnapshot(primary.value);
+  if (!decoded) {
+    noteDurableRecoveryIncident({
+      domain: 'input', ledger: STATE, copy: 'primary', failure: 'schema_invalid', disposition: 'pause',
+      detail: 'session-input primary failed owner schema validation'
+    });
+    await inspectInputBackup();
+    throw new Error('input_durable_recovery_required');
+  }
+  resolveDurableRecoveryIncident('input', STATE, 'primary');
+  await inspectInputBackup();
+  await checkpointInputLedger(decoded);
+  return decoded;
+}
+
 async function load(): Promise<InputEntry[]> {
+  if (entries && inputRecoveryPaused()) throw new Error('input_durable_recovery_required');
   if (entries) return expireQueued(entries);
-  const raw = await readDurable<unknown>(STATE);
-  const parsed = z.array(entrySchema).safeParse(raw ?? []);
-  if (!parsed.success) throw new Error('The message outbox could not be read safely');
-  entries = parsed.data;
+  entries = await readInputAuthority();
   const legacyOpeningRepair = await migrateLegacyOpeningOwners(entries);
   // One failed/deleted project must not prevent unrelated accepted work loading.
   let openingRepair = legacyOpeningRepair;
@@ -458,15 +594,23 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
   if (next.some((row, index) => row !== current[index])) await commit(next);
   return entries!;
 }
-async function commit(next: InputEntry[]): Promise<void> {
+function durableInputRows(rows: InputEntry[]): InputEntry[] {
   // A temporary planner keeps only ownership metadata across restart, never its task or answer.
-  const durableRows = (rows: InputEntry[]) => rows.map(row => row.lifetime === 'temporary-planner'
+  return rows.map(row => row.lifetime === 'temporary-planner'
     ? { ...row, text: '[Temporary planner]', deliveryText: undefined, response: undefined } : row);
-  try { await writeDurableNow(STATE, durableRows(next)); }
+}
+
+async function commit(next: InputEntry[]): Promise<void> {
+  if (inputRecoveryPaused()) throw new Error('input_durable_recovery_required');
+  const durableNext = durableInputRows(next);
+  try {
+    await writeDurableNow(STATE, durableNext);
+    await checkpointInputLedger(durableNext);
+  }
   catch (error) {
     // durable.ts retries failed generations. Never let a rejected send claim or
     // enqueue become live later behind the caller's back.
-    writeDurableSoon(STATE, durableRows(entries ?? []));
+    writeDurableSoon(STATE, durableInputRows(entries ?? []));
     throw error;
   }
   entries = next;

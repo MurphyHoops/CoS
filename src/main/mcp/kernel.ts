@@ -1,4 +1,4 @@
-import { offerToolInput, acknowledgeToolInput, TOOL_INPUT_HEADER } from '../session/input.js';
+import { INPUT_RECOVERY_REFUSAL, inputRecoveryPaused, offerToolInput, acknowledgeToolInput, TOOL_INPUT_HEADER } from '../session/input.js';
 import { pluginManager } from '../plugins/manager.js';
 import { WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-computer.js';
 /**
@@ -589,7 +589,8 @@ async function dispatchTracked(
   const longRunLedgerRecovery = longRunRecoveryPaused();
   const continuationLedgerRecovery = continuationRecoveryPaused();
   const agentsLedgerRecovery = agentsRecoveryPaused();
-  const durableControlRecovery = blockedLedgerRecovery || longRunLedgerRecovery || continuationLedgerRecovery || agentsLedgerRecovery;
+  const inputLedgerRecovery = inputRecoveryPaused();
+  const durableControlRecovery = blockedLedgerRecovery || longRunLedgerRecovery || continuationLedgerRecovery || agentsLedgerRecovery || inputLedgerRecovery;
   const startedAt = context.startedAt;
   // Cheap, non-blocking ingress identity. When the page has already reported this exact
   // request id, identity-sensitive handlers (workspace/session/agents) see it before they
@@ -825,6 +826,8 @@ async function dispatchTracked(
         ? Promise.resolve(fail(CONTINUATION_RECOVERY_REFUSAL))
         : agentsLedgerRecovery
         ? Promise.resolve(fail(AGENTS_RECOVERY_REFUSAL))
+        : inputLedgerRecovery
+        ? Promise.resolve(fail(INPUT_RECOVERY_REFUSAL))
         : blockedChat
         ? Promise.resolve(fail(BLOCKED_CHAT_REFUSAL))
         : recoveringConversation
