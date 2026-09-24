@@ -61,16 +61,19 @@ type DurableReadResult<T> =
 
 该层不理解 Goal、worker、continuation，也不把 schema invalid 判为 empty。
 
-### 4.2 checkpoint 层：备份只保存已成功发布过的 generation
+### 4.2 checkpoint 层：备份只保存已经接受的 generation
 
-关键账本采用 `<name>.backup.json`。
-primary 成功 rename 后再更新 backup；`writeDurableNow()` 的成功 ACK 必须等待该 generation 的
-backup checkpoint 完成。这样已向调用者确认的控制 transition 不会只存在于 primary。
+关键账本采用 `<name>.backup.json`。现有 primary durable commit 继续是 control transition 的唯一
+ACK barrier；只有该 barrier 成功后，owner 才把同一已接受 snapshot 写成 recovery checkpoint。
+backup 写失败不得把一个已经接受的 primary transition 重新解释成失败，否则会制造新的
+“primary 已前进、live owner 却认为提交失败”的歧义窗口。
 
-background write 也更新 backup，但 crash 可留下“backup 落后一代”的合法状态。
-因此恢复时 backup 只能作为候选，绝不能因 parse 成功直接获得执行 authority。
+因此 backup 更新是可重试的恢复冗余，不授予 mutation authority。crash 可以合法留下旧 backup，
+甚至留下 primary valid 而 checkpoint 缺失；恢复时 backup 只能作为候选，绝不能因 parse 成功
+直接获得执行 authority。primary missing 也绝不能自动从 backup resurrection，因为 missing 可能是
+一次已经接受的显式清空。owner 必须用独立 durable proof 判断 backup 是否 replay-safe。
 
-备份写入失败必须保持当前 generation 可重试；不得用旧 backup 的成功掩盖 primary/backup barrier 失败。### 4.3 owner schema 层：整份 snapshot 校验
+### 4.3 owner schema 层：整份 snapshot 校验
 
 每个 authority owner 提供 snapshot decoder/validator。
 任何会改变 authority 的 row invalid，都把**整个 snapshot**判为 schema corruption，
