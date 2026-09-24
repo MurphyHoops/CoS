@@ -224,7 +224,12 @@ import {
   resumeSelfHealingTransportNow,
   resumeUnattemptedRecoveryAfterTransportNow
 } from './session/self-healing.js';
-import { readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
+import { readDurableResult, writeDurableCheckpointNow, writeDurableNow, writeDurableSoon } from './durable.js';
+import {
+  durableRecoveryPaused,
+  noteDurableRecoveryIncident,
+  resolveDurableRecoveryIncident
+} from './durable-recovery.js';
 import { APP_VERSION, BRIDGE_PROTOCOL, COMPANION_BUILD_ID } from './version.js';
 import { conversationHasMcpCallSince } from './session/store.js';
 import { sessionWorkingAt } from '../shared/session-activity.js';
@@ -334,7 +339,13 @@ export const REVIVAL_ACTIVITY_MS = REVIVAL_DEADLINE_MS + DETACHED_SILENCE_MS;
 const COMMAND_TTL_MS = 30 * 60_000;
 const MAX_COMMANDS = 20;
 const MAX_COMMAND_RECEIPTS = 64;
-const COMMANDS_STATE = 'bridge-commands';
+export const BRIDGE_COMMANDS_STATE = 'bridge-commands';
+const COMMANDS_STATE = BRIDGE_COMMANDS_STATE;
+export const BROWSER_COMMAND_RECOVERY_REFUSAL =
+  'BROWSER_COMMAND_DURABLE_RECOVERY_PAUSED: the durable browser-command ledger could not be read safely, so CoS cannot prove command custody, leases, or ACK receipts.';
+export function browserCommandRecoveryPaused(): boolean {
+  return durableRecoveryPaused('browser-command');
+}
 /**
  * Durable explicit-disconnect marker stored in the bridge credential slot itself.
  *
@@ -1674,9 +1685,10 @@ export async function setSessionAutomation(sessionId: string, automation: Sessio
   if (automation !== 'off') scheduleDeliver();
   return sessionControlsFor(sessionId);
 }
-function providerReplacementRecoveryError(): 'continuation_recovery_required' | 'agents_recovery_required' | null {
+function providerReplacementRecoveryError(): 'continuation_recovery_required' | 'agents_recovery_required' | 'browser_command_recovery_required' | null {
   if (continuationRecoveryPaused()) return 'continuation_recovery_required';
   if (agentsRecoveryPaused()) return 'agents_recovery_required';
+  if (browserCommandRecoveryPaused()) return 'browser_command_recovery_required';
   return null;
 }
 
@@ -1687,6 +1699,7 @@ function providerReplacementRecoveryPaused(): boolean {
 function assertProviderReplacementWritable(): void {
   if (continuationRecoveryPaused()) throw new Error('continuation_durable_recovery_required');
   if (agentsRecoveryPaused()) throw new Error('agents_durable_recovery_required');
+  if (browserCommandRecoveryPaused()) throw new Error('browser_command_recovery_required');
 }
 
 /** One ticket publication boundary shared by browser and app controls. */
@@ -3364,7 +3377,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         owner: null
       };
       try {
-        await writeDurableNow(COMMANDS_STATE, commandSnapshot({ commandOverride: { command, record } }));
+        await writeCommandLedgerNow(commandSnapshot({ commandOverride: { command, record } }));
       } catch (err) {
         // Session WAL already proves no native click occurred. Keep the old in-memory lease and
         // let startup recover the conservative disk row instead of publishing a re-open that was
@@ -4064,6 +4077,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
       return json(res, 400, { error: 'bad_request' }, origin);
     }
+    if (browserCommandRecoveryPaused()) {
+      return json(res, 503, { error: 'browser_command_recovery_required', retryable: true }, origin);
+    }
     tidyCommands();
     const wanted = typeof body['id'] === 'string' ? body['id'] : '';
     const client = typeof body['client'] === 'string' ? body['client'].slice(0, 64) : '';
@@ -4274,6 +4290,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     } catch (err) {
       if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
       return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    if (browserCommandRecoveryPaused()) {
+      return json(res, 503, { error: 'browser_command_recovery_required', retryable: true }, origin);
     }
     const id = typeof body['id'] === 'string' ? body['id'] : '';
     // A protocol-1 extension sends no status and only ever acknowledges a success, so
@@ -5673,10 +5692,11 @@ function commandSnapshot(options: {
 
 async function persistCommandsNow(): Promise<void> {
   if (commandWrites.size) await Promise.allSettled([...commandWrites.values()]);
-  await writeDurableNow(COMMANDS_STATE, commandSnapshot());
+  await writeCommandLedgerNow(commandSnapshot());
 }
 
 function persistCommands(): void {
+  if (browserCommandRecoveryPaused()) return;
   if (commandWrites.size) {
     // Never capture a stale full-ledger snapshot while a lease/receipt is staged.
     void Promise.allSettled([...commandWrites.values()]).then(() => persistCommands());
@@ -5716,7 +5736,7 @@ async function persistCommandLease(
       owner
     };
     try {
-      await writeDurableNow(COMMANDS_STATE, commandSnapshot({ commandOverride: { command, record } }));
+      await writeCommandLedgerNow(commandSnapshot({ commandOverride: { command, record } }));
     } catch (err) {
       // The staged lease did not become authoritative. Supersede durable.ts's retained failed
       // generation with the still-authoritative queued/current snapshot so a background retry
@@ -5888,7 +5908,7 @@ async function finalizeCommand(command: Command, receipt: CommandReceipt): Promi
     try {
       // The receipt and command retirement are one durable state transition. Publishing either
       // side in memory first recreates the lost-response ambiguity this tombstone exists to end.
-      await writeDurableNow(COMMANDS_STATE, commandSnapshot({ removeCommandId: command.id, addReceipt: receipt }));
+      await writeCommandLedgerNow(commandSnapshot({ removeCommandId: command.id, addReceipt: receipt }));
     } catch (err) {
       persistCommands();
       logWarn(`bridge: could not persist the final receipt for ${specKey(command.spec)} — ${err instanceof Error ? err.message : String(err)}`);
@@ -5904,6 +5924,7 @@ async function finalizeCommand(command: Command, receipt: CommandReceipt): Promi
 }
 
 function queue(spec: CommandSpec): Command {
+  if (browserCommandRecoveryPaused()) throw new Error('browser_command_recovery_required');
   const key = specKey(spec);
   const existing = commands.find((command) => specKey(command.spec) === key);
   if (existing) {
@@ -6149,7 +6170,7 @@ export async function cancelResumeNow(sessionId: string): Promise<boolean> {
     if (queued.timer) clearTimeout(queued.timer);
     queued.timer = null;
     try {
-      await writeDurableNow(COMMANDS_STATE, commandSnapshot({ removeCommandId: queued.id }));
+      await writeCommandLedgerNow(commandSnapshot({ removeCommandId: queued.id }));
     } catch (err) {
       // The semantic abort already landed. Keeping the failed removal generation queued for
       // durable.ts retry is safe, and the in-memory transport must still disappear immediately.
@@ -6184,7 +6205,7 @@ async function cancelAutomaticResumesNow(sessionId?: string): Promise<number> {
  * recovery key exists only if the user asks the app for one after that has failed.
  */
 export function queueWorkerBootstrap(agent: string, task: string, model: string | null, reasoningEffort: ReasoningEffort | null, runId: string): BridgeCommand | null {
-  if (agentsRecoveryPaused()) return null;
+  if (agentsRecoveryPaused() || browserCommandRecoveryPaused()) return null;
   // A worker bootstrap is authority for one concrete broker incarnation. There is no safe
   // meaning for one outside a run, and manufacturing an unscoped command here is exactly how
   // stale durable work later becomes somebody else's `worker-1`.
@@ -6212,7 +6233,7 @@ export function queueWorkerRevival(
   wake: readonly string[],
   runId: string
 ): BridgeCommand | null {
-  if (agentsRecoveryPaused()) return null;
+  if (agentsRecoveryPaused() || browserCommandRecoveryPaused()) return null;
   // Same rule as a bootstrap: authority for one concrete broker incarnation, or nothing.
   if (!runId || !conversationId || !swarmRunning(runId)) return null;
   // An empty wake is not a wake. The broker republishes its whole `waking` list on every
@@ -6551,6 +6572,7 @@ function pendingBrowserPlacement(conversationId: string | null): {
   id: string; model: string | null; reasoningEffort: ReasoningEffort | null;
   background?: true; active: boolean; homeConversationId: string | null; project: string | null;
 } | null {
+  if (browserCommandRecoveryPaused()) return null;
   const command = commands.find(entry => entry.owner === null && entry.placement &&
     (entry.placement.conversationId === conversationId || (conversationId === null && entry.spec.type === 'worker')));
   if (!command?.placement) return null;
@@ -8990,7 +9012,7 @@ async function deliver(): Promise<void> {
 }
 
 async function deliverOne(): Promise<void> {
-  if (providerTransportUnavailable()) return;
+  if (browserCommandRecoveryPaused() || providerTransportUnavailable()) return;
   tidyCommands();
   const command = nextDeliverable();
   if (!command) return;
@@ -9186,6 +9208,10 @@ function rearmRetainedCommandDeadlines(): void {
  */
 function expire(command: Command): void {
   if (!commands.includes(command)) return;
+  if (browserCommandRecoveryPaused()) {
+    armDeadline(command, 30_000);
+    return;
+  }
   if (providerTransportUnavailable()) {
     command.timer = null;
     return;
@@ -9423,7 +9449,7 @@ function drop(command: Command, why: string): boolean {
             );
             if (committed.status === 'retryable') return false;
             if (committed.status === 'committed') {
-              await writeDurableNow(COMMANDS_STATE, commandSnapshot({ removeCommandId: command.id }));
+              await writeCommandLedgerNow(commandSnapshot({ removeCommandId: command.id }));
               commands = commands.filter((entry) => entry !== command);
               changed();
               return true;
@@ -9455,7 +9481,7 @@ function drop(command: Command, why: string): boolean {
         // elsewhere. If the same hard-recovery episode is still current, keep the durable command
         // and retry the local failure write later rather than dropping the only attempt record.
         if (!failed && await recoveryCommandCurrent(command.spec)) return false;
-        await writeDurableNow(COMMANDS_STATE, commandSnapshot({ removeCommandId: command.id }));
+        await writeCommandLedgerNow(commandSnapshot({ removeCommandId: command.id }));
       } catch (error) {
         logWarn(`bridge: could not durably fail ${specKey(command.spec)} — ${error instanceof Error ? error.message : String(error)}`);
         return false;
@@ -9491,7 +9517,7 @@ function drop(command: Command, why: string): boolean {
         const released = await releaseContinuationDestinationSendNow(command.spec.token, command.id);
         if (!released) return false;
       }
-      await writeDurableNow(COMMANDS_STATE, commandSnapshot({ removeCommandId: command.id }));
+      await writeCommandLedgerNow(commandSnapshot({ removeCommandId: command.id }));
       if (command.timer) clearTimeout(command.timer);
       command.timer = null;
       commands = commands.filter(candidate => candidate !== command);
@@ -9560,7 +9586,7 @@ function drop(command: Command, why: string): boolean {
  * Retires and expires commands. Run before anything is handed out or delivered.
  */
 function tidyCommands(): void {
-  if (providerTransportUnavailable()) return;
+  if (browserCommandRecoveryPaused() || providerTransportUnavailable()) return;
   const now = Date.now();
   const pendingWorkers = new Set(pendingWorkerSpawns().map(worker => `${worker.runId}:${worker.id}`));
   const wakingWorkers = new Set(pendingWorkerRevivals().map(revival => `${revival.runId}:${revival.id}`));
@@ -9849,6 +9875,210 @@ interface CommandRestorePlan {
   restored: number;
   /** Process-local restart anchor when the durable ledger proves transport was already paused. */
   transportPausedAt: number | null;
+}
+
+function validStoredCommandSpec(version: number, value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Partial<CommandSpec>;
+  if (raw.type === 'stop') {
+    const stop = raw as Partial<Extract<CommandSpec, { type: 'stop' }>>;
+    return typeof stop.sessionId === 'string' && /^[a-z0-9-]{8,64}$/i.test(stop.sessionId) &&
+      typeof stop.conversationId === 'string' && !!conversationId(stop.conversationId) &&
+      typeof stop.turnId === 'string' && stop.turnId.length > 0 && stop.turnId.length <= 256 &&
+      (stop.userMessageId === undefined ||
+        (typeof stop.userMessageId === 'string' && stop.userMessageId.length > 0 && stop.userMessageId.length <= 256));
+  }
+  if (raw.type === 'resume') {
+    const resume = raw as Partial<Extract<CommandSpec, { type: 'resume' }>>;
+    return typeof resume.sessionId === 'string' && /^[a-z0-9-]{8,64}$/i.test(resume.sessionId) &&
+      typeof resume.token === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(resume.token);
+  }
+  if (raw.type === 'worker') {
+    if (version < 3) return false;
+    const worker = raw as Partial<Extract<CommandSpec, { type: 'worker' }>>;
+    return typeof worker.agent === 'string' && /^[a-z0-9-]{1,40}$/i.test(worker.agent) &&
+      typeof worker.task === 'string' &&
+      typeof worker.runId === 'string' && worker.runId.length > 0 &&
+      (worker.model === undefined || worker.model === null || typeof worker.model === 'string') &&
+      (worker.reasoningEffort === undefined || worker.reasoningEffort === null || typeof worker.reasoningEffort === 'string');
+  }
+  if (raw.type === 'revive') {
+    if (version < 4) return false;
+    const revive = raw as Partial<Extract<CommandSpec, { type: 'revive' }>>;
+    return typeof revive.agent === 'string' && /^[a-z0-9-]{1,40}$/i.test(revive.agent) &&
+      typeof revive.conversationId === 'string' && !!conversationId(revive.conversationId) &&
+      typeof revive.runId === 'string' && revive.runId.length > 0 &&
+      (revive.wake === undefined || typeof revive.wake === 'string');
+  }
+  if (raw.type === 'recovery') {
+    if (version < 5) return false;
+    const recovery = raw as Partial<Extract<CommandSpec, { type: 'recovery' }>>;
+    return typeof recovery.sessionId === 'string' && recovery.sessionId.length > 0 && recovery.sessionId.length <= 64 &&
+      typeof recovery.fromConversationId === 'string' && !!conversationId(recovery.fromConversationId) &&
+      typeof recovery.episodeId === 'string' && recovery.episodeId.length > 0 && recovery.episodeId.length <= 64 &&
+      typeof recovery.text === 'string' && recovery.text.length <= MAX_CHATGPT_MESSAGE_CHARS &&
+      (recovery.generation === undefined || typeof recovery.generation === 'number') &&
+      (recovery.agent === undefined || recovery.agent === null || typeof recovery.agent === 'string') &&
+      (recovery.runId === undefined || recovery.runId === null || typeof recovery.runId === 'string') &&
+      (recovery.model === undefined || recovery.model === null || typeof recovery.model === 'string') &&
+      (recovery.reasoningEffort === undefined || recovery.reasoningEffort === null || typeof recovery.reasoningEffort === 'string');
+  }
+  return false;
+}
+
+function validStoredCommandRecord(version: number, value: unknown): value is DurableCommandRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Partial<DurableCommandRecord>;
+  if (typeof raw.id !== 'string' || raw.id.length === 0 || raw.id.length > 64 ||
+      !validStoredCommandSpec(version, raw.spec) ||
+      typeof raw.createdAt !== 'number' || !Number.isFinite(raw.createdAt)) return false;
+
+  if (version >= 2 && raw.phase !== 'queued' && raw.phase !== 'leased') return false;
+  if (version === 1 && !(raw.phase === undefined || raw.phase === 'queued' || raw.phase === 'leased')) return false;
+  if (!(raw.claimedAt === undefined || raw.claimedAt === null ||
+        (typeof raw.claimedAt === 'number' && Number.isFinite(raw.claimedAt)))) return false;
+  if (version >= 2 && raw.phase === 'queued' && raw.claimedAt != null) return false;
+  if (!(raw.deadlineCreatedAt === undefined ||
+        (typeof raw.deadlineCreatedAt === 'number' && Number.isFinite(raw.deadlineCreatedAt)))) return false;
+  if (!(raw.deadlineClaimedAt === undefined || raw.deadlineClaimedAt === null ||
+        (typeof raw.deadlineClaimedAt === 'number' && Number.isFinite(raw.deadlineClaimedAt)))) return false;
+  if (!(raw.owner === undefined || raw.owner === null ||
+        (typeof raw.owner === 'string' && raw.owner.length <= 64))) return false;
+  if (!(raw.lastError === undefined || raw.lastError === null || typeof raw.lastError === 'string')) return false;
+  return true;
+}
+
+function validStoredCommandReceipt(value: unknown): value is CommandReceipt {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Partial<CommandReceipt>;
+  return typeof raw.id === 'string' && raw.id.length > 0 && raw.id.length <= 64 &&
+    (raw.client === undefined || raw.client === null || (typeof raw.client === 'string' && raw.client.length <= 64)) &&
+    (raw.conversationId === undefined || raw.conversationId === null || typeof raw.conversationId === 'string') &&
+    (raw.outcome === 'committed' || raw.outcome === 'terminal-failure') &&
+    typeof raw.committed === 'boolean' &&
+    (raw.outcome === 'committed') === raw.committed &&
+    (raw.error === undefined || raw.error === null || typeof raw.error === 'string') &&
+    typeof raw.completedAt === 'number' && Number.isFinite(raw.completedAt);
+}
+
+export function validateBridgeCommandSnapshot(value: unknown): value is DurableCommandSnapshot {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as { version?: unknown; commands?: unknown; receipts?: unknown; transportPausedAt?: unknown };
+  const version = raw.version;
+  if (version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5) return false;
+  if (!Array.isArray(raw.commands)) return false;
+  if (version >= 3 && !Array.isArray(raw.receipts)) return false;
+  if (!(raw.receipts === undefined || Array.isArray(raw.receipts))) return false;
+  if (!(raw.transportPausedAt === undefined || raw.transportPausedAt === null ||
+        (typeof raw.transportPausedAt === 'number' && Number.isFinite(raw.transportPausedAt)))) return false;
+
+  const commandIds = new Set<string>();
+  for (const command of raw.commands) {
+    if (!validStoredCommandRecord(version, command) || commandIds.has(command.id)) return false;
+    commandIds.add(command.id);
+  }
+  const receiptIds = new Set<string>();
+  for (const receipt of (raw.receipts ?? []) as unknown[]) {
+    if (!validStoredCommandReceipt(receipt) || receiptIds.has(receipt.id)) return false;
+    receiptIds.add(receipt.id);
+  }
+  return true;
+}
+
+function noteBrowserCommandRecovery(
+  copy: 'primary' | 'backup',
+  failure: 'json_corrupt' | 'schema_invalid' | 'io_error' | 'checkpoint_degraded',
+  disposition: 'pause' | 'degraded',
+  detail?: string
+): void {
+  noteDurableRecoveryIncident({
+    domain: 'browser-command',
+    ledger: COMMANDS_STATE,
+    copy,
+    failure,
+    disposition,
+    detail
+  });
+}
+
+async function inspectCommandBackup(): Promise<void> {
+  const backup = await readDurableResult<unknown>(COMMANDS_STATE, 'backup');
+  if (backup.kind === 'missing') {
+    resolveDurableRecoveryIncident('browser-command', COMMANDS_STATE, 'backup');
+    return;
+  }
+  if (backup.kind === 'io_error') {
+    noteBrowserCommandRecovery('backup', 'io_error', 'degraded', backup.error);
+    return;
+  }
+  if (backup.kind === 'corrupt') {
+    noteBrowserCommandRecovery('backup', 'json_corrupt', 'degraded', backup.error);
+    return;
+  }
+  if (!validateBridgeCommandSnapshot(backup.value)) {
+    noteBrowserCommandRecovery('backup', 'schema_invalid', 'degraded', 'bridge-command backup failed owner schema validation');
+    return;
+  }
+  resolveDurableRecoveryIncident('browser-command', COMMANDS_STATE, 'backup');
+}
+
+async function checkpointCommandLedger(snapshot: DurableCommandSnapshot): Promise<void> {
+  try {
+    await writeDurableCheckpointNow(COMMANDS_STATE, snapshot);
+    resolveDurableRecoveryIncident('browser-command', COMMANDS_STATE, 'backup');
+  } catch (error) {
+    noteBrowserCommandRecovery(
+      'backup',
+      'checkpoint_degraded',
+      'degraded',
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+}
+
+async function readCommandAuthority(): Promise<DurableCommandSnapshot | null> {
+  const primary = await readDurableResult<unknown>(COMMANDS_STATE);
+  if (primary.kind === 'missing') {
+    // Missing is an owner-defined empty crash point. Session/self-healing WAL may reconstruct
+    // only independently proved recovery custody; stale command backup must never resurrect work.
+    try {
+      await writeDurableCheckpointNow(COMMANDS_STATE, null);
+      resolveDurableRecoveryIncident('browser-command', COMMANDS_STATE, 'backup');
+    } catch (error) {
+      noteBrowserCommandRecovery(
+        'backup',
+        'checkpoint_degraded',
+        'degraded',
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+    resolveDurableRecoveryIncident('browser-command', COMMANDS_STATE, 'primary');
+    return { version: 5, commands: [], receipts: [] };
+  }
+  if (primary.kind === 'io_error') {
+    noteBrowserCommandRecovery('primary', 'io_error', 'pause', primary.error);
+    await inspectCommandBackup();
+    return null;
+  }
+  if (primary.kind === 'corrupt') {
+    noteBrowserCommandRecovery('primary', 'json_corrupt', 'pause', primary.error);
+    await inspectCommandBackup();
+    return null;
+  }
+  if (!validateBridgeCommandSnapshot(primary.value)) {
+    noteBrowserCommandRecovery('primary', 'schema_invalid', 'pause', 'bridge-command primary failed owner schema validation');
+    await inspectCommandBackup();
+    return null;
+  }
+  resolveDurableRecoveryIncident('browser-command', COMMANDS_STATE, 'primary');
+  await inspectCommandBackup();
+  return primary.value;
+}
+
+async function writeCommandLedgerNow(snapshot: DurableCommandSnapshot): Promise<void> {
+  if (browserCommandRecoveryPaused()) throw new Error('browser_command_recovery_required');
+  await writeDurableNow(COMMANDS_STATE, snapshot);
+  await checkpointCommandLedger(snapshot);
 }
 
 /** One durable receipt that is still useful, rebuilt field-by-field. */
@@ -10333,22 +10563,24 @@ async function restoreMissingEmergencyResumes(plan: CommandRestorePlan, now: num
  * 1 is migrated conservatively, including resume commands whose continuation WAL survived.
  */
 export async function restoreCommands(): Promise<void> {
+  const saved = await readCommandAuthority();
+  if (!saved) return;
+
   // Provider replacement depends on both its own transaction/session evidence and the broker
   // identity owner it may have to move. If either owner is paused, preserve carriers as inert
   // custody and do not manufacture or reconcile replacement execution on startup.
   if (!providerReplacementRecoveryPaused()) await reconcileSelfHealingAfterRestart();
-  const saved = await readDurable<{
-    version?: number;
-    commands?: unknown;
-    receipts?: unknown;
-    transportPausedAt?: unknown;
-  }>(COMMANDS_STATE);
   const now = Date.now();
-  // A missing command file is a valid crash point: the session WAL can already say
-  // `hard_recovery` before the transport has performed its first durable write. Seed an empty
-  // version-5 snapshot from retained in-memory state so that episode can reconstruct below.
-  const plan = planCommandRestore(saved ?? { version: 5, commands: [], receipts: [] }, now);
-  if (!plan) return;
+  const plan = planCommandRestore(saved, now);
+  if (!plan) {
+    noteBrowserCommandRecovery(
+      'primary',
+      'schema_invalid',
+      'pause',
+      'validated bridge-command snapshot could not be planned safely'
+    );
+    return;
+  }
 
   // Recovery commands carry local-session authority rather than a standalone continuation WAL.
   // Revalidate them after session crash reconciliation and before any command is published or
@@ -10421,7 +10653,7 @@ export async function restoreCommands(): Promise<void> {
   // plan in memory is safe because admission is still fenced by bridgeRecovering.
   let rewriteDurable = true;
   try {
-    await writeDurableNow(COMMANDS_STATE, restoredCommandSnapshot(plan.commands, plan.receipts, now, plan.transportPausedAt));
+    await writeCommandLedgerNow(restoredCommandSnapshot(plan.commands, plan.receipts, now, plan.transportPausedAt));
     rewriteDurable = false;
   } catch (err) {
     logWarn(`bridge: could not persist reconstructed command state — ${err instanceof Error ? err.message : String(err)}`);

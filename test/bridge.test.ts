@@ -48,6 +48,8 @@ const { safeStorage } = await import('electron');
 const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath, resetSecretsCacheForTests, setSecret } = await import('../src/main/secrets.js');
 const {
+  BRIDGE_COMMANDS_STATE,
+  browserCommandRecoveryPaused,
   bridgePort,
   bridgeStatus,
   flushBridgeTransportRecoveryForTests,
@@ -87,8 +89,8 @@ const {
   sweepStaleSwarm,
   unpair
 } = await import('../src/main/bridge.js');
-const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
-const { noteDurableRecoveryIncident, resetDurableRecoveryForTests } = await import('../src/main/durable-recovery.js');
+const { flushDurable, initDurableStore, readDurable, readDurableResult, writeDurableCheckpointNow, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
+const { durableRecoveryIncidents, noteDurableRecoveryIncident, resetDurableRecoveryForTests } = await import('../src/main/durable-recovery.js');
 const {
   GOAL_OBJECTIVES_STATE,
   GOAL_REPLIES_STATE,
@@ -478,6 +480,7 @@ beforeEach(async () => {
   resetRecorderForTests();
   writeDurableSoon('bridge-commands', null);
   await flushDurable();
+  await writeDurableCheckpointNow('bridge-commands', null);
   await setSecret('bridgeToken', '');
   token = null;
 });
@@ -711,6 +714,167 @@ describe('agents durable recovery bridge fence', () => {
     expect(redeemPaused.body).toMatchObject({ error: 'agents_recovery_required', retryable: true });
     expect(pendingCommands()).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: commandId })
+    ]));
+  });
+});
+
+describe('bridge-command durable corruption recovery', () => {
+  const emptySnapshot = () => ({ version: 5 as const, commands: [], receipts: [] });
+  const durablePath = async (copy: 'primary' | 'backup' = 'primary') => {
+    const path = await import('node:path');
+    return path.join(dir, 'state', copy === 'primary' ? `${BRIDGE_COMMANDS_STATE}.json` : `${BRIDGE_COMMANDS_STATE}.backup.json`);
+  };
+
+  it('pauses on corrupt primary and never restores a valid backup as command authority', async () => {
+    const fs = await import('node:fs/promises');
+    const snapshot = emptySnapshot();
+    await writeDurableNow(BRIDGE_COMMANDS_STATE, snapshot);
+    await writeDurableCheckpointNow(BRIDGE_COMMANDS_STATE, snapshot);
+    await fs.writeFile(await durablePath(), '{"version":', 'utf8');
+
+    resetBridgeForTests();
+    await restoreCommands();
+
+    expect(browserCommandRecoveryPaused()).toBe(true);
+    expect(pendingCommands()).toEqual([]);
+    expect(durableRecoveryIncidents('browser-command')).toContainEqual(
+      expect.objectContaining({
+        ledger: BRIDGE_COMMANDS_STATE,
+        copy: 'primary',
+        failure: 'json_corrupt',
+        disposition: 'pause'
+      })
+    );
+    expect(await readDurableResult(BRIDGE_COMMANDS_STATE, 'backup')).toMatchObject({ kind: 'valid' });
+  });
+
+  it('keeps browser-command recovery paused when both durable copies are malformed', async () => {
+    const fs = await import('node:fs/promises');
+    await fs.mkdir((await import('node:path')).dirname(await durablePath()), { recursive: true });
+    await fs.writeFile(await durablePath(), '{"version":', 'utf8');
+    await fs.writeFile(await durablePath('backup'), '{"version":', 'utf8');
+
+    resetBridgeForTests();
+    await restoreCommands();
+
+    expect(browserCommandRecoveryPaused()).toBe(true);
+    expect(durableRecoveryIncidents('browser-command')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ copy: 'primary', failure: 'json_corrupt', disposition: 'pause' }),
+      expect.objectContaining({ copy: 'backup', failure: 'json_corrupt', disposition: 'degraded' })
+    ]));
+  });
+
+  it('rejects impossible leased evidence as whole-ledger schema corruption', async () => {
+    await writeDurableNow(BRIDGE_COMMANDS_STATE, {
+      version: 5,
+      commands: [{
+        id: 'bad-queued-claim',
+        spec: {
+          type: 'stop',
+          sessionId: 'session-bridge-command',
+          conversationId: 'cafe9001-0000-4000-8000-000000009001',
+          turnId: 'turn-one'
+        },
+        createdAt: Date.now(),
+        phase: 'queued',
+        claimedAt: Date.now(),
+        owner: 'page-that-cannot-own-a-queued-command',
+        lastError: null
+      }],
+      receipts: []
+    });
+
+    resetBridgeForTests();
+    await restoreCommands();
+
+    expect(browserCommandRecoveryPaused()).toBe(true);
+    expect(pendingCommands()).toEqual([]);
+    expect(durableRecoveryIncidents('browser-command')).toContainEqual(
+      expect.objectContaining({ copy: 'primary', failure: 'schema_invalid', disposition: 'pause' })
+    );
+  });
+
+  it('treats a missing command primary as an empty crash point and deletes stale backup evidence', async () => {
+    const stale = {
+      version: 5 as const,
+      commands: [{
+        id: 'stale-stop-command',
+        spec: {
+          type: 'stop' as const,
+          sessionId: 'session-stale-stop',
+          conversationId: 'cafe9002-0000-4000-8000-000000009002',
+          turnId: 'stale-turn'
+        },
+        createdAt: Date.now(),
+        phase: 'queued' as const,
+        claimedAt: null,
+        owner: null,
+        lastError: null
+      }],
+      receipts: []
+    };
+    await writeDurableCheckpointNow(BRIDGE_COMMANDS_STATE, stale);
+    expect(await readDurableResult(BRIDGE_COMMANDS_STATE)).toMatchObject({ kind: 'missing' });
+
+    resetBridgeForTests();
+    await restoreCommands();
+
+    expect(browserCommandRecoveryPaused()).toBe(false);
+    expect(pendingCommands()).toEqual([]);
+    expect(await readDurableResult(BRIDGE_COMMANDS_STATE, 'backup')).toMatchObject({
+      kind: 'valid',
+      value: expect.objectContaining({ version: 5, commands: [], receipts: [] })
+    });
+  });
+
+  it('keeps an existing carrier inert and refuses redeem or ACK while command authority is paused', async () => {
+    await pair();
+    const sourceChat = 'cafe9003-0000-4000-8000-000000009003';
+    const source = await createSession({ title: 'command custody', conversationId: sourceChat });
+    const continuation = await readyContinuation(source.id, 'retain command custody', sourceChat);
+
+    publishProviderTransportStatus({
+      ...connectedTransport,
+      state: 'offline',
+      detail: 'fixture outage',
+      handshakeAt: null
+    });
+    const command = queueResume(source.id, continuation);
+    expect(command).not.toBeNull();
+    opened.length = 0;
+
+    noteDurableRecoveryIncident({
+      domain: 'browser-command',
+      ledger: BRIDGE_COMMANDS_STATE,
+      failure: 'schema_invalid',
+      disposition: 'pause'
+    });
+
+    publishProviderTransportStatus({ ...connectedTransport, handshakeAt: Date.now() });
+    await flushBridgeTransportRecoveryForTests();
+    expect(opened).toEqual([]);
+    expect(pendingCommands()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: command!.id, what: `resume:${source.id}` })
+    ]));
+
+    const redeemPaused = await request('POST', '/commands/redeem', {
+      body: { id: command!.id, client: 'paused-command-page' }
+    });
+    expect(redeemPaused.status).toBe(503);
+    expect(redeemPaused.body).toMatchObject({ error: 'browser_command_recovery_required', retryable: true });
+
+    const ackPaused = await request('POST', '/commands/ack', {
+      body: {
+        id: command!.id,
+        client: 'paused-command-page',
+        status: 'sent',
+        conversationId: 'cafe9004-0000-4000-8000-000000009004'
+      }
+    });
+    expect(ackPaused.status).toBe(503);
+    expect(ackPaused.body).toMatchObject({ error: 'browser_command_recovery_required', retryable: true });
+    expect(pendingCommands()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: command!.id })
     ]));
   });
 });
