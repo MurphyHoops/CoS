@@ -86,6 +86,7 @@ const {
   unpair
 } = await import('../src/main/bridge.js');
 const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
+const { noteDurableRecoveryIncident, resetDurableRecoveryForTests } = await import('../src/main/durable-recovery.js');
 const {
   GOAL_OBJECTIVES_STATE,
   GOAL_REPLIES_STATE,
@@ -463,6 +464,7 @@ beforeEach(async () => {
   resetBridgeForTests();
   publishProviderTransportStatus(connectedTransport);
   resetLongRunStateForTests();
+  resetDurableRecoveryForTests();
   opened.length = 0;
   anonymousRedeemIndex = 0;
   // The app opens the chat itself, always: there is no queue for a tab to come and ask.
@@ -921,6 +923,40 @@ describe('observations', () => {
     await send([{ ...user, reaction: null }]);
     rows = await readEvents(first.body.sessionId, { kinds: ['user_message'] });
     expect(rows[0]).toMatchObject({ reaction: null, origin: before.seq });
+  });
+
+  it('keeps Stop observation processing alive while the long-run ledger is recovery-paused', async () => {
+    await pair();
+    const conversationId = 'f0f00003-1111-4111-8111-111111111120';
+    const opened = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [
+          { kind: 'user_message', time: Date.now(), text: 'start durable work', messageId: 'stop-pause-user' },
+          { kind: 'turn_start', time: Date.now(), turnId: 'stop-pause-turn' }
+        ]
+      }
+    });
+    expect(opened.status).toBe(200);
+    await ensureRecoveryWorkNow(opened.body.sessionId, conversationId, 'recovery:stop-pause');
+
+    noteDurableRecoveryIncident({
+      domain: 'long-run',
+      ledger: 'long-run',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    const stopped = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [{ kind: 'turn_end', time: Date.now(), turnId: 'stop-pause-turn', outcome: 'stopped' }]
+      }
+    });
+
+    expect(stopped.status).toBe(200);
+    const rows = await readEvents(opened.body.sessionId, { kinds: ['turn_end'] });
+    expect(rows).toContainEqual(expect.objectContaining({ turnId: 'stop-pause-turn', outcome: 'stopped' }));
   });
 
   it('refuses anything that is not a conversation id', async () => {

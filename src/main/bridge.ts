@@ -7318,7 +7318,11 @@ async function noteRecoveryObservations(
   const ended = observations.findLast(item => item.kind === 'turn_end');
   if (sessionId && ended?.outcome === 'stopped') {
     await cancelSelfHealingForStopNow(sessionId, conversationId);
-    await cancelLongRunNow(sessionId, conversationId, 'manual_stop');
+    // Stop remains the highest-priority revocation even when the Long-Run ledger itself is in
+    // recovery pause. Failure to amend that corrupt ledger must not abort the rest of Stop's
+    // browser/session cleanup; the global recovery fence already denies Long-Run execution.
+    await cancelLongRunNow(sessionId, conversationId, 'manual_stop').catch((error) =>
+      logWarn(`bridge: could not persist Long-Run Stop revocation — ${error instanceof Error ? error.message : String(error)}`));
     const cancelledWork = longRunWorkFor(sessionId);
     if (cancelledWork?.state === 'cancelled' && cancelledWork.inputId) {
       await cancelInput(cancelledWork.inputId);

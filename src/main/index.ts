@@ -63,7 +63,7 @@ import {
   type ContinuationSnapshot
 } from './session/continuation.js';
 import { reconcileSelfHealingAfterRestart } from './session/self-healing.js';
-import { LONG_RUN_STATE, restoreLongRunState, type LongRunSnapshot } from './session/long-run.js';
+import { restoreLongRunDurableState } from './session/long-run.js';
 import { startLongRunRuntime, stopLongRunRuntime } from './session/long-run-runtime.js';
 import { runShutdownSequence } from './shutdown.js';
 import { applyStagedUpdate, startUpdateChecks } from './update.js';
@@ -330,9 +330,8 @@ void app.whenReady().then(async () => {
   const savedGoalReplies = await readDurable<GoalRepliesSnapshot>(GOAL_REPLIES_STATE);
   if (windowActivation.isDisabled()) return;
   restoreGoalReplies(savedGoalReplies);
-  const savedLongRun = await readDurable<LongRunSnapshot>(LONG_RUN_STATE);
+  await restoreLongRunDurableState();
   if (windowActivation.isDisabled()) return;
-  restoreLongRunState(savedLongRun);
   // Request ownership must exist before either side of the bridge can race in. A request id
   // that was proved yesterday remains the same workflow today even if its ChatGPT tab closed.
   await restoreRequestCorrelations();

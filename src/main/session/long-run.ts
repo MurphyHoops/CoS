@@ -10,9 +10,25 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { writeDurableNow, writeDurableSoon } from '../durable.js';
+import {
+  readDurableResult,
+  writeDurableCheckpointNow,
+  writeDurableNow,
+  writeDurableSoon
+} from '../durable.js';
+import {
+  durableRecoveryPaused,
+  noteDurableRecoveryIncident,
+  resolveDurableRecoveryIncident
+} from '../durable-recovery.js';
 
 export const LONG_RUN_STATE = 'long-run';
+const LONG_RUN_RECOVERY_DOMAIN = 'long-run' as const;
+
+export const LONG_RUN_RECOVERY_REFUSAL =
+  'DURABLE_RECOVERY_PAUSED: the long-run execution ledger could not be read safely, so CoS cannot ' +
+  'prove wait debt, execution generation, or old-executor fences. No local tool was run. Resolve ' +
+  'the durable recovery incident before continuing automated work.';
 
 export type LongRunWorkReason =
   | 'recovery_resume'
@@ -139,8 +155,16 @@ const waits = new Map<string, LongRunWaitContract>();
 let transportPausedAt: number | null = null;
 let chain: Promise<unknown> = Promise.resolve();
 
+export function longRunRecoveryPaused(): boolean {
+  return durableRecoveryPaused(LONG_RUN_RECOVERY_DOMAIN);
+}
+
 function serial<T>(work: () => Promise<T>): Promise<T> {
-  const next = chain.then(work, work);
+  const guarded = (): Promise<T> => {
+    if (longRunRecoveryPaused()) return Promise.reject(new Error('long_run_durable_recovery_required'));
+    return work();
+  };
+  const next = chain.then(guarded, guarded);
   chain = next.then(() => undefined, () => undefined);
   return next;
 }
@@ -177,6 +201,59 @@ function cloneEpoch(row: ExecutionEpoch): ExecutionEpoch { return { ...row }; }
 function cloneWork(row: WorkObligation): WorkObligation { return { ...row }; }
 function cloneWait(row: LongRunWaitContract): LongRunWaitContract { return { ...row }; }
 
+function validRequiredString(value: unknown, max: number): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= max;
+}
+
+function validNullableString(value: unknown, max: number): value is string | null {
+  return value === null || (typeof value === 'string' && value.length <= max);
+}
+
+function validPositiveInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) > 0;
+}
+
+function validLongRunInputId(value: unknown): value is string {
+  return typeof value === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function noteLongRunRecovery(
+  copy: 'primary' | 'backup',
+  failure: 'json_corrupt' | 'schema_invalid' | 'io_error' | 'checkpoint_degraded' | 'orphan_backup',
+  disposition: 'pause' | 'degraded',
+  detail?: string
+): void {
+  noteDurableRecoveryIncident({
+    domain: LONG_RUN_RECOVERY_DOMAIN,
+    ledger: LONG_RUN_STATE,
+    copy,
+    failure,
+    disposition,
+    detail
+  });
+}
+
+async function checkpointAcceptedLongRun(value: LongRunSnapshot): Promise<void> {
+  try {
+    await writeDurableCheckpointNow(LONG_RUN_STATE, value);
+    resolveDurableRecoveryIncident(LONG_RUN_RECOVERY_DOMAIN, LONG_RUN_STATE, 'backup');
+  } catch (error) {
+    noteLongRunRecovery(
+      'backup',
+      'checkpoint_degraded',
+      'degraded',
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+}
+
+async function commitLongRunNow(): Promise<void> {
+  const accepted = snapshotLongRunState();
+  await writeDurableNow(LONG_RUN_STATE, accepted);
+  await checkpointAcceptedLongRun(accepted);
+}
+
 export function snapshotLongRunState(): LongRunSnapshot {
   return {
     version: 1,
@@ -188,6 +265,244 @@ export function snapshotLongRunState(): LongRunSnapshot {
   };
 }
 
+function decodeLongRunSnapshot(value: unknown): LongRunSnapshot | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as {
+    version?: unknown;
+    savedAt?: unknown;
+    epochs?: unknown;
+    obligations?: unknown;
+    waits?: unknown;
+    transportPausedAt?: unknown;
+  };
+  if (raw.version !== 1 || !validPositiveInteger(raw.savedAt) ||
+      !Array.isArray(raw.epochs) || !Array.isArray(raw.obligations) || !Array.isArray(raw.waits) ||
+      !(raw.transportPausedAt === undefined || raw.transportPausedAt === null ||
+        validPositiveInteger(raw.transportPausedAt))) return null;
+
+  const decodedEpochs: ExecutionEpoch[] = [];
+  const epochBySession = new Map<string, ExecutionEpoch>();
+  for (const candidate of raw.epochs) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+    const epoch = candidate as Partial<ExecutionEpoch>;
+    if (!validSessionId(epoch.sessionId) || !validConversationId(epoch.conversationId) ||
+        !validGeneration(epoch.generation) || !validPositiveInteger(epoch.updatedAt) ||
+        epochBySession.has(epoch.sessionId)) return null;
+    const normalized: ExecutionEpoch = {
+      sessionId: epoch.sessionId,
+      conversationId: epoch.conversationId,
+      generation: epoch.generation,
+      updatedAt: epoch.updatedAt
+    };
+    decodedEpochs.push(normalized);
+    epochBySession.set(normalized.sessionId, normalized);
+  }
+
+  const decodedWork: WorkObligation[] = [];
+  const workBySession = new Map<string, WorkObligation>();
+  const historicalWorkBySession = new Map<string, WorkObligation>();
+  const seenWorkSessions = new Set<string>();
+  for (const candidate of raw.obligations) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+    const work = candidate as Partial<WorkObligation>;
+    if (!validRequiredString(work.id, 200) ||
+        !validSessionId(work.sessionId) || !validConversationId(work.conversationId) ||
+        !validGeneration(work.epochGeneration) ||
+        !['recovery_resume', 'wait_resolved', 'wait_failed'].includes(String(work.reason)) ||
+        !['waiting', 'owed', 'dispatching', 'queued', 'fulfilled', 'cancelled'].includes(String(work.state)) ||
+        !((work.sourceTurnId === null && work.reason === 'recovery_resume') || validRequiredString(work.sourceTurnId, 256)) ||
+        !(work.sourceRequestId === undefined || work.sourceRequestId === null ||
+          validRequiredString(work.sourceRequestId, 200)) ||
+        !validNullableString(work.source, 500) ||
+        !(work.inputId === null || validLongRunInputId(work.inputId)) ||
+        !validNullableString(work.result, 2_000) ||
+        !validPositiveInteger(work.createdAt) || !validPositiveInteger(work.updatedAt) ||
+        Number(work.updatedAt) < Number(work.createdAt) ||
+        !(work.providerBudgetAt === undefined ||
+          (typeof work.providerBudgetAt === 'number' && Number.isFinite(work.providerBudgetAt) && work.providerBudgetAt > 0)) ||
+        !(work.completionCheckClaimedAt === undefined || work.completionCheckClaimedAt === null ||
+          validPositiveInteger(work.completionCheckClaimedAt)) ||
+        !(work.issuedAt === null || validPositiveInteger(work.issuedAt)) ||
+        seenWorkSessions.has(work.sessionId)) return null;
+    seenWorkSessions.add(work.sessionId);
+    if ((work.state === 'dispatching' || work.state === 'queued') && !work.inputId) return null;
+    if (work.reason !== 'wait_resolved' && work.state === 'waiting') return null;
+    const epoch = epochBySession.get(work.sessionId);
+    if (!epoch) return null;
+    const exactLineage =
+      epoch.conversationId === work.conversationId && epoch.generation === work.epochGeneration;
+    // Completed/revoked work is deliberately not rebound when its disposable conversation moves.
+    // The legacy restore path discarded that historical row because only the newer epoch can grant
+    // authority. Accept that exact shape, but never publish the stale work back into live maps.
+    const staleTerminalLineage =
+      (work.state === 'fulfilled' || work.state === 'cancelled') &&
+      work.epochGeneration < epoch.generation && work.updatedAt <= epoch.updatedAt;
+    if (!exactLineage && !staleTerminalLineage) return null;
+
+    const normalized: WorkObligation = {
+      id: work.id,
+      sessionId: work.sessionId,
+      conversationId: work.conversationId,
+      epochGeneration: work.epochGeneration,
+      reason: work.reason as LongRunWorkReason,
+      state: work.state as LongRunWorkState,
+      sourceTurnId: work.sourceTurnId,
+      sourceRequestId: work.sourceRequestId ?? null,
+      source: work.source,
+      inputId: work.inputId,
+      result: work.result,
+      createdAt: work.createdAt,
+      ...(work.providerBudgetAt !== undefined ? { providerBudgetAt: work.providerBudgetAt } : {}),
+      completionCheckClaimedAt: work.completionCheckClaimedAt ?? null,
+      updatedAt: work.updatedAt,
+      issuedAt: work.issuedAt
+    };
+    if (exactLineage) {
+      decodedWork.push(normalized);
+      workBySession.set(normalized.sessionId, normalized);
+    } else {
+      historicalWorkBySession.set(normalized.sessionId, normalized);
+    }
+  }
+
+  const decodedWaits: LongRunWaitContract[] = [];
+  const waitBySession = new Map<string, LongRunWaitContract>();
+  const historicalWaitBySession = new Set<string>();
+  const seenWaitSessions = new Set<string>();
+  for (const candidate of raw.waits) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+    const wait = candidate as Partial<LongRunWaitContract>;
+    if (!validRequiredString(wait.id, 200) ||
+        !validSessionId(wait.sessionId) || !validConversationId(wait.conversationId) ||
+        !validGeneration(wait.epochGeneration) || !validRequiredString(wait.obligationId, 200) ||
+        !validWaitKind(wait.kind) ||
+        !(wait.providerKey === undefined || wait.providerKey === null ||
+          validRequiredString(wait.providerKey, 500)) ||
+        !validProviderData(wait.providerData) ||
+        !validNullableString(wait.repository, 201) ||
+        !(wait.runId === null || validPositiveInteger(wait.runId)) ||
+        !(wait.processId === null || validPositiveInteger(wait.processId)) ||
+        !(wait.dueAt === null || validPositiveInteger(wait.dueAt)) ||
+        !validNullableString(wait.description, 300) ||
+        !['waiting', 'resolved', 'failed', 'cancelled'].includes(String(wait.state)) ||
+        !Number.isSafeInteger(wait.attempts) || Number(wait.attempts) < 0 ||
+        !Number.isSafeInteger(wait.nextCheckAt) || Number(wait.nextCheckAt) < 0 ||
+        !validNullableString(wait.lastError, 500) ||
+        !validNullableString(wait.result, 2_000) ||
+        !validPositiveInteger(wait.createdAt) || !validPositiveInteger(wait.updatedAt) ||
+        Number(wait.updatedAt) < Number(wait.createdAt) ||
+        seenWaitSessions.has(wait.sessionId)) return null;
+    seenWaitSessions.add(wait.sessionId);
+
+    if (wait.kind === 'github_run' &&
+        (!wait.repository || !/^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(wait.repository) ||
+          !validPositiveInteger(wait.runId))) return null;
+    if (wait.kind === 'process' && !validPositiveInteger(wait.processId)) return null;
+    if (wait.kind === 'timer' && !validPositiveInteger(wait.dueAt)) return null;
+    if (!['github_run', 'process', 'timer'].includes(wait.kind) && !wait.providerKey) return null;
+
+    const epoch = epochBySession.get(wait.sessionId);
+    const currentWork = workBySession.get(wait.sessionId);
+    const historicalWork = historicalWorkBySession.get(wait.sessionId);
+    const work = currentWork ?? historicalWork;
+    if (!epoch || !work || work.id !== wait.obligationId) return null;
+    const exactLineage =
+      !!currentWork &&
+      epoch.conversationId === wait.conversationId &&
+      epoch.generation === wait.epochGeneration &&
+      currentWork.conversationId === wait.conversationId &&
+      currentWork.epochGeneration === wait.epochGeneration;
+    const staleTerminalLineage =
+      wait.state !== 'waiting' &&
+      wait.epochGeneration < epoch.generation &&
+      wait.updatedAt <= epoch.updatedAt &&
+      (!!currentWork ||
+        (!!historicalWork && historicalWork.conversationId === wait.conversationId &&
+          historicalWork.epochGeneration === wait.epochGeneration));
+    if (!exactLineage && !staleTerminalLineage) return null;
+    if (wait.state === 'waiting' && work.state !== 'waiting') return null;
+    if (wait.state === 'resolved' && (work.reason !== 'wait_resolved' || work.state === 'waiting')) return null;
+    if (wait.state === 'failed' && (work.reason !== 'wait_failed' || work.state === 'waiting')) return null;
+    if (wait.state === 'cancelled' && work.state !== 'cancelled') return null;
+
+    const normalized: LongRunWaitContract = {
+      id: wait.id,
+      sessionId: wait.sessionId,
+      conversationId: wait.conversationId,
+      epochGeneration: wait.epochGeneration,
+      obligationId: wait.obligationId,
+      kind: wait.kind,
+      providerKey: wait.providerKey ?? null,
+      providerData: wait.providerData ? { ...wait.providerData } : null,
+      repository: wait.repository,
+      runId: wait.runId,
+      processId: wait.processId,
+      dueAt: wait.dueAt,
+      description: wait.description,
+      state: wait.state as LongRunWaitState,
+      attempts: Number(wait.attempts),
+      nextCheckAt: Number(wait.nextCheckAt),
+      lastError: wait.lastError,
+      result: wait.result,
+      createdAt: wait.createdAt,
+      updatedAt: wait.updatedAt
+    };
+    if (exactLineage) {
+      decodedWaits.push(normalized);
+      waitBySession.set(normalized.sessionId, normalized);
+    } else {
+      historicalWaitBySession.add(normalized.sessionId);
+    }
+  }
+
+  for (const work of decodedWork) {
+    const wait = waitBySession.get(work.sessionId);
+    if (work.reason === 'recovery_resume') {
+      if (wait || historicalWaitBySession.has(work.sessionId) || work.state === 'waiting') return null;
+    } else if ((!wait || wait.obligationId !== work.id) && !historicalWaitBySession.has(work.sessionId)) {
+      return null;
+    }
+  }
+  for (const work of historicalWorkBySession.values()) {
+    if (work.reason === 'recovery_resume') {
+      if (historicalWaitBySession.has(work.sessionId)) return null;
+    } else if (!historicalWaitBySession.has(work.sessionId)) {
+      return null;
+    }
+  }
+
+  return {
+    version: 1,
+    savedAt: Number(raw.savedAt),
+    epochs: decodedEpochs,
+    obligations: decodedWork,
+    waits: decodedWaits,
+    ...(raw.transportPausedAt !== undefined ? { transportPausedAt: raw.transportPausedAt as number | null } : {})
+  };
+}
+
+async function inspectLongRunBackupHealth(): Promise<'missing' | 'valid' | 'invalid'> {
+  const result = await readDurableResult<unknown>(LONG_RUN_STATE, 'backup');
+  if (result.kind === 'missing') {
+    resolveDurableRecoveryIncident(LONG_RUN_RECOVERY_DOMAIN, LONG_RUN_STATE, 'backup');
+    return 'missing';
+  }
+  if (result.kind === 'io_error') {
+    noteLongRunRecovery('backup', 'io_error', 'degraded', result.error);
+    return 'invalid';
+  }
+  if (result.kind === 'corrupt') {
+    noteLongRunRecovery('backup', 'json_corrupt', 'degraded', result.error);
+    return 'invalid';
+  }
+  if (!decodeLongRunSnapshot(result.value)) {
+    noteLongRunRecovery('backup', 'schema_invalid', 'degraded', 'backup snapshot failed long-run schema validation');
+    return 'invalid';
+  }
+  resolveDurableRecoveryIncident(LONG_RUN_RECOVERY_DOMAIN, LONG_RUN_STATE, 'backup');
+  return 'valid';
+}
+
 function persistSoon(): void {
   writeDurableSoon(LONG_RUN_STATE, snapshotLongRunState());
 }
@@ -196,7 +511,7 @@ export async function pauseLongRunTransportNow(now = Date.now()): Promise<void> 
   return serial(async () => {
     if (transportPausedAt !== null) return;
     transportPausedAt = now;
-    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    try { await commitLongRunNow(); }
     catch (error) { persistSoon(); throw error; }
   });
 }
@@ -212,7 +527,7 @@ export async function resumeLongRunTransportNow(now = Date.now()): Promise<void>
       const overlap = Math.max(0, now - Math.max(pausedAt, anchor));
       obligations.set(sessionId, { ...work, providerBudgetAt: anchor + overlap });
     }
-    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    try { await commitLongRunNow(); }
     catch (error) { persistSoon(); throw error; }
   });
 }
@@ -222,75 +537,90 @@ export function longRunProviderBudgetAge(work: WorkObligation, now = Date.now())
   return Math.max(0, budgetNow - (work.providerBudgetAt ?? work.createdAt));
 }
 
-export function restoreLongRunState(snapshot: LongRunSnapshot | null): void {
+export function restoreLongRunState(snapshot: LongRunSnapshot | null): boolean {
   epochs.clear();
   obligations.clear();
   waits.clear();
   transportPausedAt = null;
-  if (!snapshot || snapshot.version !== 1) return;
+  if (!snapshot) return true;
+
+  const decoded = decodeLongRunSnapshot(snapshot);
+  if (!decoded) return false;
+
   const now = Date.now();
-  const persistedPauseAt = typeof snapshot.transportPausedAt === 'number' && Number.isFinite(snapshot.transportPausedAt)
-    ? snapshot.transportPausedAt
+  const persistedPauseAt = typeof decoded.transportPausedAt === 'number'
+    ? decoded.transportPausedAt
     : null;
   transportPausedAt = persistedPauseAt === null ? null : now;
 
-  for (const raw of Array.isArray(snapshot.epochs) ? snapshot.epochs : []) {
-    if (!validSessionId(raw?.sessionId) || !validConversationId(raw?.conversationId) ||
-        !validGeneration(raw?.generation) || !Number.isSafeInteger(raw?.updatedAt) || raw.updatedAt <= 0) continue;
-    const current = epochs.get(raw.sessionId);
-    if (!current || raw.generation > current.generation ||
-        (raw.generation === current.generation && raw.updatedAt > current.updatedAt)) {
-      epochs.set(raw.sessionId, cloneEpoch(raw));
-    }
+  for (const epoch of decoded.epochs) {
+    epochs.set(epoch.sessionId, cloneEpoch(epoch));
   }
-
-  for (const raw of Array.isArray(snapshot.obligations) ? snapshot.obligations : []) {
-    if (!raw || !validSessionId(raw.sessionId) || !validConversationId(raw.conversationId) ||
-        !validGeneration(raw.epochGeneration) || typeof raw.id !== 'string' || !raw.id ||
-        !['recovery_resume', 'wait_resolved', 'wait_failed'].includes(raw.reason) ||
-        !['waiting', 'owed', 'dispatching', 'queued', 'fulfilled', 'cancelled'].includes(raw.state) ||
-        !Number.isSafeInteger(raw.createdAt) || raw.createdAt <= 0 ||
-        !Number.isSafeInteger(raw.updatedAt) || raw.updatedAt <= 0) continue;
-    const epoch = epochs.get(raw.sessionId);
-    if (!epoch || epoch.conversationId !== raw.conversationId || epoch.generation !== raw.epochGeneration) continue;
-    const current = obligations.get(raw.sessionId);
-    let providerBudgetAt = Number.isFinite(raw.providerBudgetAt) && Number(raw.providerBudgetAt) > 0
-      ? Number(raw.providerBudgetAt)
-      : raw.createdAt;
+  for (const raw of decoded.obligations) {
+    let providerBudgetAt = raw.providerBudgetAt ?? raw.createdAt;
     if (raw.reason === 'recovery_resume' && raw.state === 'owed' && persistedPauseAt !== null) {
       providerBudgetAt += Math.max(0, now - Math.max(persistedPauseAt, providerBudgetAt));
     }
-    const normalized = cloneWork({
+    obligations.set(raw.sessionId, cloneWork({
       ...raw,
       providerBudgetAt,
-      completionCheckClaimedAt:
-        Number.isSafeInteger(raw.completionCheckClaimedAt) && Number(raw.completionCheckClaimedAt) > 0
-          ? Number(raw.completionCheckClaimedAt)
-          : null,
-      sourceRequestId: typeof raw.sourceRequestId === 'string' && raw.sourceRequestId.length > 0
-        ? raw.sourceRequestId.slice(0, 200)
-        : null
-    });
-    if (!current || raw.updatedAt > current.updatedAt) obligations.set(raw.sessionId, normalized);
+      completionCheckClaimedAt: raw.completionCheckClaimedAt ?? null,
+      sourceRequestId: raw.sourceRequestId ?? null
+    }));
+  }
+  for (const wait of decoded.waits) {
+    waits.set(wait.sessionId, cloneWait(wait));
+  }
+  return true;
+}
+
+/**
+ * Restores the long-run authority ledger from disk without interpreting corruption as emptiness.
+ * Backup state is diagnostic recovery evidence only: a stale wait/dispatch checkpoint can never
+ * be permission to replay an external mutation.
+ */
+export async function restoreLongRunDurableState(): Promise<void> {
+  restoreLongRunState(null);
+  const primary = await readDurableResult<unknown>(LONG_RUN_STATE);
+  if (primary.kind === 'missing') {
+    const backup = await inspectLongRunBackupHealth();
+    if (backup === 'missing') {
+      resolveDurableRecoveryIncident(LONG_RUN_RECOVERY_DOMAIN, LONG_RUN_STATE, 'primary');
+      return;
+    }
+    noteLongRunRecovery(
+      'primary',
+      'orphan_backup',
+      'pause',
+      'primary long-run ledger is missing while recovery evidence still exists'
+    );
+    return;
+  }
+  if (primary.kind === 'io_error') {
+    noteLongRunRecovery('primary', 'io_error', 'pause', primary.error);
+    await inspectLongRunBackupHealth();
+    return;
+  }
+  if (primary.kind === 'corrupt') {
+    noteLongRunRecovery('primary', 'json_corrupt', 'pause', primary.error);
+    await inspectLongRunBackupHealth();
+    return;
   }
 
-  for (const raw of Array.isArray(snapshot.waits) ? snapshot.waits : []) {
-    if (!raw || !validSessionId(raw.sessionId) || !validConversationId(raw.conversationId) ||
-        !validGeneration(raw.epochGeneration) || typeof raw.id !== 'string' || !raw.id ||
-        !validWaitKind(raw.kind) ||
-        (raw.providerKey !== undefined && raw.providerKey !== null &&
-          (typeof raw.providerKey !== 'string' || raw.providerKey.length === 0 || raw.providerKey.length > 500)) ||
-        !validProviderData(raw.providerData) ||
-        !['waiting', 'resolved', 'failed', 'cancelled'].includes(raw.state) ||
-        typeof raw.obligationId !== 'string' || !raw.obligationId ||
-        !Number.isSafeInteger(raw.createdAt) || raw.createdAt <= 0 ||
-        !Number.isSafeInteger(raw.updatedAt) || raw.updatedAt <= 0 ||
-        !Number.isSafeInteger(raw.nextCheckAt) || raw.nextCheckAt < 0) continue;
-    const epoch = epochs.get(raw.sessionId);
-    if (!epoch || epoch.conversationId !== raw.conversationId || epoch.generation !== raw.epochGeneration) continue;
-    const current = waits.get(raw.sessionId);
-    if (!current || raw.updatedAt > current.updatedAt) waits.set(raw.sessionId, cloneWait(raw));
+  const decoded = decodeLongRunSnapshot(primary.value);
+  if (!decoded || !restoreLongRunState(decoded)) {
+    restoreLongRunState(null);
+    noteLongRunRecovery('primary', 'schema_invalid', 'pause', 'primary snapshot failed long-run schema validation');
+    await inspectLongRunBackupHealth();
+    return;
   }
+
+  resolveDurableRecoveryIncident(LONG_RUN_RECOVERY_DOMAIN, LONG_RUN_STATE, 'primary');
+  // Checkpoint the validated, authority-equivalent primary generation. The decoder may drop stale
+  // terminal history that the legacy restore path never republished, but it preserves savedAt and
+  // every live authority row. Restart-only budget normalization stays in memory until a later owner
+  // commit, so the recovery copy never invents a generation that was not primary durable authority.
+  await checkpointAcceptedLongRun(decoded);
 }
 
 function epochForWrite(sessionId: string, conversationId: string, bump: boolean): ExecutionEpoch {
@@ -312,22 +642,26 @@ export function executionEpochFor(sessionId: string): ExecutionEpoch | null {
 }
 
 export function captureExecutionTicket(sessionId: string, conversationId: string): ExecutionTicket | null {
+  if (longRunRecoveryPaused()) return null;
   const row = epochs.get(sessionId);
   if (!row || row.conversationId !== conversationId) return null;
   return { sessionId, conversationId, generation: row.generation };
 }
 
 export function executionTicketCurrent(ticket: ExecutionTicket): boolean {
+  if (longRunRecoveryPaused()) return false;
   const row = epochs.get(ticket.sessionId);
   return !!row && row.conversationId === ticket.conversationId && row.generation === ticket.generation;
 }
 
 export function longRunWorkFor(sessionId: string): WorkObligation | null {
+  if (longRunRecoveryPaused()) return null;
   const row = obligations.get(sessionId);
   return row ? cloneWork(row) : null;
 }
 
 export function longRunWaitFor(sessionId: string): LongRunWaitContract | null {
+  if (longRunRecoveryPaused()) return null;
   const row = waits.get(sessionId);
   return row ? cloneWait(row) : null;
 }
@@ -342,6 +676,7 @@ export function longRunWaitFor(sessionId: string): LongRunWaitContract | null {
  */
 export function longRunSourceRequestFenced(requestId: string | null | undefined): boolean {
   if (!requestId) return false;
+  if (longRunRecoveryPaused()) return true;
   for (const work of obligations.values()) {
     if (work.sourceRequestId !== requestId) continue;
     if (work.reason !== 'wait_resolved' && work.reason !== 'wait_failed') continue;
@@ -364,6 +699,7 @@ export function longRunStatus(sessionId: string): {
 
 /** Whether any durable wait/debt can still fence its original provider turn. */
 export function anyLongRunWaitActive(): boolean {
+  if (longRunRecoveryPaused()) return false;
   for (const work of obligations.values()) {
     const epoch = epochs.get(work.sessionId);
     const wait = waits.get(work.sessionId);
@@ -397,6 +733,7 @@ export function longRunWaitBlocksTools(
   activeTurnId: string | null = null,
   requestId: string | null = null
 ): boolean {
+  if (longRunRecoveryPaused()) return true;
   const epoch = epochs.get(sessionId);
   const work = obligations.get(sessionId);
   const wait = waits.get(sessionId);
@@ -441,6 +778,7 @@ export function longRunMessageAuthority(
 ): LongRunMessageAuthority {
   const longRunId = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(inputId);
   if (!longRunId) return 'unmanaged';
+  if (longRunRecoveryPaused()) return 'stale';
   const work = [...obligations.values()].find((row) => row.inputId === inputId);
   if (!work) return 'stale';
   const epoch = epochs.get(work.sessionId);
@@ -566,7 +904,7 @@ export async function armLongRunWaitNow(input: ArmLongRunWaitInput): Promise<Lon
     obligations.set(input.sessionId, obligation);
     waits.set(input.sessionId, wait);
     try {
-      await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState());
+      await commitLongRunNow();
     } catch (error) {
       if (beforeEpoch) epochs.set(input.sessionId, beforeEpoch); else epochs.delete(input.sessionId);
       if (beforeWork) obligations.set(input.sessionId, beforeWork); else obligations.delete(input.sessionId);
@@ -601,7 +939,7 @@ export async function deferLongRunWaitNow(
       updatedAt: Date.now()
     };
     waits.set(sessionId, next);
-    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    try { await commitLongRunNow(); }
     catch (err) { waits.set(sessionId, before); persistSoon(); throw err; }
     return true;
   });
@@ -637,7 +975,7 @@ export async function resolveLongRunWaitNow(
       result: clip(result, 2_000),
       updatedAt: now
     });
-    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    try { await commitLongRunNow(); }
     catch (err) {
       waits.set(sessionId, beforeWait);
       obligations.set(sessionId, beforeWork);
@@ -674,7 +1012,7 @@ export async function cancelLongRunNow(
       result: clip(reason, 500), updatedAt: now });
     if (wait) waits.set(sessionId, { ...wait, epochGeneration: nextEpoch.generation, state: 'cancelled',
       result: clip(reason, 500), updatedAt: now });
-    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    try { await commitLongRunNow(); }
     catch (err) {
       if (beforeEpoch) epochs.set(sessionId, beforeEpoch); else epochs.delete(sessionId);
       if (beforeWork) obligations.set(sessionId, beforeWork); else obligations.delete(sessionId);
@@ -735,7 +1073,7 @@ export async function ensureRecoveryWorkNow(
       issuedAt: null
     };
     obligations.set(sessionId, next);
-    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    try { await commitLongRunNow(); }
     catch (err) {
       if (beforeEpoch) epochs.set(sessionId, beforeEpoch); else epochs.delete(sessionId);
       if (beforeWork) obligations.set(sessionId, beforeWork); else obligations.delete(sessionId);
@@ -758,7 +1096,7 @@ export async function moveLongRunStateNow(
       // This API is a durability barrier, not merely an in-memory move. A previous attempt may
       // have published B in memory after its fsync failed; an idempotent retry must therefore
       // write the current snapshot now rather than treating "already B" as proof of durability.
-      await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState());
+      await commitLongRunNow();
       return true;
     }
     if (current.conversationId !== fromConversationId) return false;
@@ -777,7 +1115,7 @@ export async function moveLongRunStateNow(
     if (wait && wait.state === 'waiting') {
       waits.set(sessionId, { ...wait, conversationId: toConversationId, epochGeneration: generation, updatedAt: now });
     }
-    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    try { await commitLongRunNow(); }
     catch (err) {
       epochs.set(sessionId, beforeEpoch);
       if (beforeWork) obligations.set(sessionId, beforeWork); else obligations.delete(sessionId);
@@ -795,6 +1133,7 @@ export function moveLongRunState(
   fromConversationId: string,
   toConversationId: string
 ): boolean {
+  if (longRunRecoveryPaused()) return false;
   const current = epochs.get(sessionId);
   if (!current) return true;
   if (current.conversationId === toConversationId) return true;
@@ -815,12 +1154,14 @@ export function moveLongRunState(
 }
 
 export function dueLongRunWaits(now = Date.now()): LongRunWaitContract[] {
+  if (longRunRecoveryPaused()) return [];
   return [...waits.values()]
     .filter((row) => row.state === 'waiting' && row.nextCheckAt <= now)
     .map(cloneWait);
 }
 
 export function dispatchableLongRunWork(): WorkObligation[] {
+  if (longRunRecoveryPaused()) return [];
   return [...obligations.values()]
     .filter((row) => row.state === 'owed' || row.state === 'dispatching')
     .map(cloneWork);
@@ -850,7 +1191,7 @@ export async function claimProjectCompletionCheckNow(
       completionCheckClaimedAt: Date.now(),
       updatedAt: Date.now()
     });
-    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    try { await commitLongRunNow(); }
     catch (err) { obligations.set(sessionId, before); persistSoon(); throw err; }
     return true;
   });
@@ -872,7 +1213,7 @@ export async function fulfillOwedLongRunWorkNow(
         !executionTicketCurrent(ticket) || work.epochGeneration !== ticket.generation) return false;
     const before = cloneWork(work);
     obligations.set(sessionId, { ...work, state: 'fulfilled', updatedAt: Date.now() });
-    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    try { await commitLongRunNow(); }
     catch (err) { obligations.set(sessionId, before); persistSoon(); throw err; }
     return true;
   });
@@ -902,7 +1243,7 @@ export async function leaseLongRunWorkNow(
       updatedAt: Date.now()
     };
     obligations.set(sessionId, next);
-    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    try { await commitLongRunNow(); }
     catch (err) { obligations.set(sessionId, before); persistSoon(); throw err; }
     return {
       work: cloneWork(next),
@@ -924,7 +1265,7 @@ export async function markLongRunWorkQueuedNow(
         work.epochGeneration !== ticket.generation) return false;
     const before = cloneWork(work);
     obligations.set(sessionId, { ...work, state: 'queued', updatedAt: Date.now() });
-    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    try { await commitLongRunNow(); }
     catch (err) { obligations.set(sessionId, before); persistSoon(); throw err; }
     return true;
   });
@@ -964,7 +1305,7 @@ export async function certifyLongRunProgressNow(certificate: ProgressCertificate
 
     const before = cloneWork(work);
     obligations.set(sessionId, { ...work, state: 'fulfilled', updatedAt: Date.now() });
-    try { await writeDurableNow(LONG_RUN_STATE, snapshotLongRunState()); }
+    try { await commitLongRunNow(); }
     catch (err) { obligations.set(sessionId, before); persistSoon(); throw err; }
     return true;
   });

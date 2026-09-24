@@ -154,3 +154,30 @@ coordinator 不直接调用 `restoreGoal*`、`restoreSwarm` 等，也不跨文�
 - `bridge.test.ts`：corrupt command ledger 不投递旧 command；session recovery 仅重建有独立 durable proof 的 recovery command。
 
 完成标准不是“所有坏文件都自动修好”，而是：**没有任何损坏能被误解释成新的执行许可或不存在的任务债。**
+
+
+## 10. 已实现的 owner 策略
+
+当前独立分支已经接入两个 authority owner：
+
+- **blocked-chats / blocked-tools**：primary 必须整份 schema-valid；corrupt、I/O failure、
+  schema-invalid、以及 primary missing + backup surviving 都进入全域工具 recovery pause。
+  backup 只作 evidence，不自动恢复用户撤销过的工具权限。
+- **long-run**：primary 必须完整证明 execution epoch、work obligation、wait contract 的 lineage
+  与 state consistency；损坏时 runtime polling、broker UUID delivery、execution ticket、
+  MCP handler 与所有 mutation 都 fail closed。
+
+Long-Run 明确保留旧字段兼容：缺失 `sourceRequestId`、`providerBudgetAt`、
+`completionCheckClaimedAt`、`providerKey/providerData` 按既有保守语义归一化。
+`wait_resolved/wait_failed` 的 `sourceTurnId` 不允许缺失/为空；`dispatching/queued`
+的 `inputId` 必须是 durable v4 UUID。
+
+合法的 stale terminal history 是例外：fulfilled/cancelled work 或 terminal wait 在 A→B carrier
+迁移后可以留在旧 generation，因为旧实现本就不会把它们重新发布为 authority。
+validator 会验证其时间/lineage 后丢弃这些历史行，而不是把合法快照误判为 corruption。
+
+Stop 仍保持最高优先级：Long-Run recovery pause 不允许新执行，但也不能阻断 session/browser/
+self-healing 的 Stop 撤权链。Long-Run 自身无法持久化取消时只记录告警，并继续保持 recovery pause。
+
+尚未接入 owner schema/pause 的关键账本仍包括 Goal 三账本、swarm/retired-workers、
+continuations、session-input 与 bridge-commands；后续按同一原则逐 owner 推进，不共享 mutation authority。

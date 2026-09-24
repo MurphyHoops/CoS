@@ -37,9 +37,10 @@ import { currentCall } from '../src/main/mcp/call-context.js';
 import { withInboundRequestId } from '../src/main/mcp/inbound.js';
 import { IdentityLostError } from '../src/main/agents.js';
 import { observeRequestCorrelation, requestCorrelation, resetCorrelationRegistryForTests } from '../src/main/session/correlation.js';
+import { noteDurableRecoveryIncident, resetDurableRecoveryForTests } from '../src/main/durable-recovery.js';
 
 beforeEach(() => {
-  vi.clearAllMocks(); resetToolClock(); resetCorrelationRegistryForTests();
+  vi.clearAllMocks(); resetToolClock(); resetCorrelationRegistryForTests(); resetDurableRecoveryForTests();
   fixture.attachment.mockResolvedValue('current'); fixture.record.mockResolvedValue(null);
   fixture.inputAck.mockResolvedValue(undefined); fixture.blocked = false; fixture.recoveryPaused = false;
 });
@@ -79,6 +80,23 @@ it('fails closed during blocked-ledger recovery without running the handler or c
 
   expect(result.isError).toBe(true);
   expect(JSON.stringify(result)).toContain('DURABLE_RECOVERY_PAUSED');
+  expect(run).not.toHaveBeenCalled();
+  expect(fixture.inputAck).not.toHaveBeenCalled();
+});
+
+it('fails closed during long-run ledger recovery before handler or queued-input side effects', async () => {
+  noteDurableRecoveryIncident({
+    domain: 'long-run',
+    ledger: 'long-run',
+    failure: 'schema_invalid',
+    disposition: 'pause'
+  });
+  const run = vi.fn(async () => ok('should-not-run'));
+
+  const result = await invoke('request-a', run);
+
+  expect(result.isError).toBe(true);
+  expect(JSON.stringify(result)).toContain('long-run execution ledger');
   expect(run).not.toHaveBeenCalled();
   expect(fixture.inputAck).not.toHaveBeenCalled();
 });

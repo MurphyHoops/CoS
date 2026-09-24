@@ -35,6 +35,7 @@ import {
   fulfillOwedLongRunWorkNow,
   leaseLongRunWorkNow,
   longRunProviderBudgetAge,
+  longRunRecoveryPaused,
   longRunWorkFor,
   markLongRunWorkQueuedNow,
   resolveLongRunWaitNow,
@@ -338,6 +339,10 @@ async function reconcileRevokedWorkerContinuations(): Promise<void> {
 }
 
 export async function pollLongRunRuntime(now = Date.now()): Promise<void> {
+  // A corrupt authority ledger is not an empty queue. Do not even run broker hygiene while the
+  // owner is paused: deleting a UUID message would itself be a durability decision made without
+  // the ledger that proves whether the message was stale or current.
+  if (longRunRecoveryPaused()) return;
   await reconcileRevokedWorkerContinuations();
   for (const wait of dueLongRunWaits(now)) {
     const ticket = captureExecutionTicket(wait.sessionId, wait.conversationId);

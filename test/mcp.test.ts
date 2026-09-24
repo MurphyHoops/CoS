@@ -3079,6 +3079,27 @@ describe('agent-maintained plans over MCP', () => {
 });
 
 describe('durable wait admission over MCP', () => {
+  beforeEach(() => resetDurableRecoveryForTests());
+  afterAll(() => resetDurableRecoveryForTests());
+
+  it('fails ordinary MCP tools closed while the long-run authority ledger is in recovery pause', async () => {
+    noteDurableRecoveryIncident({
+      domain: 'long-run',
+      ledger: 'long-run',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    const reply = await modern(
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } }
+    );
+
+    expect(failed(reply)).toBe(true);
+    expect(textOf(reply)).toContain('long-run execution ledger');
+    expect(textOf(reply)).not.toContain('/workspace/notes.txt');
+  });
+
   it('fails closed when session_wait cannot prove the source turn yet', async () => {
     ctx.sessionTools = true;
     const conversationId = 'wait-admission-source';

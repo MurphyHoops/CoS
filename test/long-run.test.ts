@@ -2,17 +2,26 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { initDurableStore, readDurable, resetDurableForTests } from '../src/main/durable.js';
+import { initDurableStore, readDurable, readDurableResult, resetDurableForTests } from '../src/main/durable.js';
+import {
+  durableRecoveryIncidents,
+  noteDurableRecoveryIncident,
+  resetDurableRecoveryForTests
+} from '../src/main/durable-recovery.js';
 import {
   anyLongRunWaitActive,
   armLongRunWaitNow,
   cancelLongRunNow,
   captureExecutionTicket,
   deferLongRunWaitNow,
+  dispatchableLongRunWork,
+  dueLongRunWaits,
   ensureRecoveryWorkNow,
   executionEpochFor,
   executionTicketCurrent,
   leaseLongRunWorkNow,
+  longRunMessageAuthority,
+  longRunRecoveryPaused,
   longRunSourceRequestFenced,
   longRunStatus,
   longRunWaitBlocksTools,
@@ -21,6 +30,7 @@ import {
   noteLongRunProgressNow,
   resetLongRunStateForTests,
   resolveLongRunWaitNow,
+  restoreLongRunDurableState,
   restoreLongRunState,
   snapshotLongRunState
 } from '../src/main/session/long-run.js';
@@ -29,9 +39,12 @@ let directory: string;
 const SESSION = 'session-one';
 const CHAT_A = 'conversation-a';
 const CHAT_B = 'conversation-b';
+const primaryPath = (): string => path.join(directory, 'state', 'long-run.json');
+const backupPath = (): string => path.join(directory, 'state', 'long-run.backup.json');
 
 beforeEach(async () => {
   resetLongRunStateForTests();
+  resetDurableRecoveryForTests();
   resetDurableForTests();
   directory = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-long-run-'));
   initDurableStore(directory);
@@ -39,6 +52,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   resetLongRunStateForTests();
+  resetDurableRecoveryForTests();
   resetDurableForTests();
   await fs.rm(directory, { recursive: true, force: true });
 });
@@ -547,6 +561,214 @@ describe('durable long-run authority', () => {
 
     expect(stableInputs).toHaveLength(24);
     expect(executionEpochFor(SESSION)?.conversationId).toBe(conversationId);
+  });
+
+  it('pauses long-run authority on truncated JSON and never auto-restores a valid backup', async () => {
+    await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-corrupt-primary',
+      kind: 'timer',
+      dueAt: Date.now() + 60_000
+    });
+    expect(await readDurableResult('long-run', 'backup')).toMatchObject({ kind: 'valid' });
+
+    resetLongRunStateForTests();
+    resetDurableRecoveryForTests();
+    await fs.writeFile(primaryPath(), '{"version":', 'utf8');
+    await restoreLongRunDurableState();
+
+    expect(longRunRecoveryPaused()).toBe(true);
+    expect(longRunStatus(SESSION)).toEqual({ epoch: null, work: null, wait: null });
+    expect(durableRecoveryIncidents('long-run')).toContainEqual(
+      expect.objectContaining({ copy: 'primary', failure: 'json_corrupt', disposition: 'pause' })
+    );
+    await expect(cancelLongRunNow(SESSION, CHAT_A)).rejects.toThrow('long_run_durable_recovery_required');
+  });
+
+  it('rejects the entire snapshot when one long-run authority row is schema-invalid', async () => {
+    await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-schema-invalid',
+      kind: 'timer',
+      dueAt: Date.now() + 60_000
+    });
+    const snapshot = structuredClone(snapshotLongRunState()) as any;
+    snapshot.epochs.push({
+      sessionId: 'session-two',
+      conversationId: 'bad!',
+      generation: 1,
+      updatedAt: Date.now()
+    });
+
+    resetLongRunStateForTests();
+    resetDurableRecoveryForTests();
+    await fs.writeFile(primaryPath(), JSON.stringify(snapshot), 'utf8');
+    await restoreLongRunDurableState();
+
+    expect(longRunRecoveryPaused()).toBe(true);
+    expect(executionEpochFor(SESSION)).toBeNull();
+    expect(durableRecoveryIncidents('long-run')).toContainEqual(
+      expect.objectContaining({ copy: 'primary', failure: 'schema_invalid', disposition: 'pause' })
+    );
+  });
+
+  it('treats a missing primary with surviving long-run backup as recovery-required', async () => {
+    await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-orphan-backup',
+      kind: 'timer',
+      dueAt: Date.now() + 60_000
+    });
+
+    resetLongRunStateForTests();
+    resetDurableRecoveryForTests();
+    await fs.rm(primaryPath(), { force: true });
+    await restoreLongRunDurableState();
+
+    expect(longRunRecoveryPaused()).toBe(true);
+    expect(longRunStatus(SESSION)).toEqual({ epoch: null, work: null, wait: null });
+    expect(durableRecoveryIncidents('long-run')).toContainEqual(
+      expect.objectContaining({ copy: 'primary', failure: 'orphan_backup', disposition: 'pause' })
+    );
+  });
+
+  it('keeps long-run paused when both primary and backup are corrupt', async () => {
+    await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-double-corrupt',
+      kind: 'timer',
+      dueAt: Date.now() + 60_000
+    });
+
+    resetLongRunStateForTests();
+    resetDurableRecoveryForTests();
+    await fs.writeFile(primaryPath(), '{"version":', 'utf8');
+    await fs.writeFile(backupPath(), '{"version":', 'utf8');
+    await restoreLongRunDurableState();
+
+    expect(longRunRecoveryPaused()).toBe(true);
+    expect(durableRecoveryIncidents('long-run')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ copy: 'primary', failure: 'json_corrupt', disposition: 'pause' }),
+      expect.objectContaining({ copy: 'backup', failure: 'json_corrupt', disposition: 'degraded' })
+    ]));
+  });
+
+  it('rejects dispatching work that lost its durable input identity', async () => {
+    const wait = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-missing-input-id',
+      kind: 'timer',
+      dueAt: Date.now() + 60_000
+    });
+    const ticket = captureExecutionTicket(SESSION, CHAT_A)!;
+    await resolveLongRunWaitNow(SESSION, wait.id, ticket, 'timer resolved');
+    expect((await leaseLongRunWorkNow(SESSION, CHAT_A))?.work.state).toBe('dispatching');
+
+    const snapshot = structuredClone(snapshotLongRunState()) as any;
+    snapshot.obligations[0].inputId = null;
+    resetLongRunStateForTests();
+    resetDurableRecoveryForTests();
+    await fs.writeFile(primaryPath(), JSON.stringify(snapshot), 'utf8');
+    await restoreLongRunDurableState();
+
+    expect(longRunRecoveryPaused()).toBe(true);
+    expect(longRunStatus(SESSION)).toEqual({ epoch: null, work: null, wait: null });
+    expect(durableRecoveryIncidents('long-run')).toContainEqual(
+      expect.objectContaining({ failure: 'schema_invalid', disposition: 'pause' })
+    );
+  });
+
+  it('accepts stale terminal history after A to B migration but never republishes it as authority', async () => {
+    const wait = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-terminal-history',
+      kind: 'timer',
+      dueAt: Date.now() + 60_000
+    });
+    const ticket = captureExecutionTicket(SESSION, CHAT_A)!;
+    await resolveLongRunWaitNow(SESSION, wait.id, ticket, 'timer resolved');
+    const work = longRunStatus(SESSION).work!;
+    expect(await noteLongRunProgressNow(
+      SESSION,
+      CHAT_A,
+      work.createdAt + 1_000,
+      'turn-terminal-continuation',
+      'mcp'
+    )).toBe(true);
+    expect(longRunStatus(SESSION).work?.state).toBe('fulfilled');
+    expect(await moveLongRunStateNow(SESSION, CHAT_A, CHAT_B)).toBe(true);
+
+    resetLongRunStateForTests();
+    resetDurableRecoveryForTests();
+    await restoreLongRunDurableState();
+
+    expect(longRunRecoveryPaused()).toBe(false);
+    expect(executionEpochFor(SESSION)).toMatchObject({ conversationId: CHAT_B, generation: 2 });
+    expect(longRunStatus(SESSION).work).toBeNull();
+    expect(longRunStatus(SESSION).wait).toBeNull();
+  });
+
+  it('preserves explicitly supported legacy fields without widening authority', async () => {
+    await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-legacy-compatible',
+      kind: 'timer',
+      dueAt: Date.now() + 60_000
+    });
+    const legacy = structuredClone(snapshotLongRunState()) as any;
+    delete legacy.obligations[0].sourceRequestId;
+    delete legacy.obligations[0].providerBudgetAt;
+    delete legacy.obligations[0].completionCheckClaimedAt;
+    delete legacy.waits[0].providerKey;
+    delete legacy.waits[0].providerData;
+
+    resetLongRunStateForTests();
+    expect(restoreLongRunState(legacy)).toBe(true);
+
+    expect(longRunStatus(SESSION).work).toMatchObject({
+      sourceRequestId: null,
+      completionCheckClaimedAt: null
+    });
+    expect(longRunStatus(SESSION).work?.providerBudgetAt).toBe(longRunStatus(SESSION).work?.createdAt);
+    expect(longRunStatus(SESSION).wait).toMatchObject({ providerKey: null, providerData: null });
+  });
+
+  it('revokes every live long-run authority surface immediately when recovery pause appears', async () => {
+    const wait = await armLongRunWaitNow({
+      sessionId: SESSION,
+      conversationId: CHAT_A,
+      sourceTurnId: 'turn-live-pause',
+      sourceRequestId: 'wfr-live-pause-source',
+      kind: 'timer',
+      dueAt: Date.now() + 60_000
+    });
+    const ticket = captureExecutionTicket(SESSION, CHAT_A)!;
+    await resolveLongRunWaitNow(SESSION, wait.id, ticket, 'timer resolved');
+    const leased = await leaseLongRunWorkNow(SESSION, CHAT_A);
+    expect(leased?.work.inputId).toEqual(expect.any(String));
+
+    noteDurableRecoveryIncident({
+      domain: 'long-run',
+      ledger: 'long-run',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    expect(captureExecutionTicket(SESSION, CHAT_A)).toBeNull();
+    expect(executionTicketCurrent(ticket)).toBe(false);
+    expect(dueLongRunWaits(Date.now() + 120_000)).toEqual([]);
+    expect(dispatchableLongRunWork()).toEqual([]);
+    expect(longRunMessageAuthority(leased!.work.inputId!, CHAT_A)).toBe('stale');
+    expect(longRunSourceRequestFenced('wfr-live-pause-source')).toBe(true);
+    expect(longRunWaitBlocksTools(SESSION, CHAT_A)).toBe(true);
+    expect(longRunStatus(SESSION).work).toBeNull();
   });
 
   it('Stop revokes wait and continuation authority by advancing the epoch', async () => {
