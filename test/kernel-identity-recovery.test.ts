@@ -153,6 +153,23 @@ it('fails closed during session-input recovery before handler or input-receipt s
   expect(fixture.inputAck).not.toHaveBeenCalled();
 });
 
+it('fails closed during request-correlation recovery before handler or input-receipt side effects', async () => {
+  noteDurableRecoveryIncident({
+    domain: 'correlation',
+    ledger: 'request-correlations',
+    failure: 'schema_invalid',
+    disposition: 'pause'
+  });
+  const run = vi.fn(async () => ok('should-not-run'));
+
+  const result = await invoke('request-a', run);
+
+  expect(result.isError).toBe(true);
+  expect(JSON.stringify(result)).toContain('durable request ownership registry');
+  expect(run).not.toHaveBeenCalled();
+  expect(fixture.inputAck).not.toHaveBeenCalled();
+});
+
 it('requires exact proof of both the refused request and the recipient, even across turns', async () => {
   await refused('old-request');
   prove('request-a');

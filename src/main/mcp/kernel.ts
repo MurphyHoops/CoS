@@ -87,7 +87,11 @@ import {
   recordAgentMessage,
   recordToolCall
 } from '../session/recorder.js';
-import { requestCorrelation } from '../session/correlation.js';
+import {
+  CORRELATION_RECOVERY_REFUSAL,
+  correlationRecoveryPaused,
+  requestCorrelation
+} from '../session/correlation.js';
 import {
   BLOCKED_CHAT_RECOVERY_REFUSAL,
   BLOCKED_CHAT_REFUSAL,
@@ -590,7 +594,8 @@ async function dispatchTracked(
   const continuationLedgerRecovery = continuationRecoveryPaused();
   const agentsLedgerRecovery = agentsRecoveryPaused();
   const inputLedgerRecovery = inputRecoveryPaused();
-  const durableControlRecovery = blockedLedgerRecovery || longRunLedgerRecovery || continuationLedgerRecovery || agentsLedgerRecovery || inputLedgerRecovery;
+  const correlationLedgerRecovery = correlationRecoveryPaused();
+  const durableControlRecovery = blockedLedgerRecovery || longRunLedgerRecovery || continuationLedgerRecovery || agentsLedgerRecovery || inputLedgerRecovery || correlationLedgerRecovery;
   const startedAt = context.startedAt;
   // Cheap, non-blocking ingress identity. When the page has already reported this exact
   // request id, identity-sensitive handlers (workspace/session/agents) see it before they
@@ -828,6 +833,8 @@ async function dispatchTracked(
         ? Promise.resolve(fail(AGENTS_RECOVERY_REFUSAL))
         : inputLedgerRecovery
         ? Promise.resolve(fail(INPUT_RECOVERY_REFUSAL))
+        : correlationLedgerRecovery
+        ? Promise.resolve(fail(CORRELATION_RECOVERY_REFUSAL))
         : blockedChat
         ? Promise.resolve(fail(BLOCKED_CHAT_REFUSAL))
         : recoveringConversation

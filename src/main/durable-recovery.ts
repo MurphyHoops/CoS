@@ -13,7 +13,8 @@ export const DURABLE_RECOVERY_DOMAINS = [
   'long-run',
   'blocked-tools',
   'input',
-  'browser-command'
+  'browser-command',
+  'correlation'
 ] as const;
 
 export type DurableRecoveryDomain = typeof DURABLE_RECOVERY_DOMAINS[number];
