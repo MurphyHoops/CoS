@@ -128,6 +128,7 @@ import { briefShortfall, handoffPlanNotice, resumeBootstrapText } from './sessio
 import {
   PRIME_ID,
   agentConversation,
+  agentsRecoveryPaused,
   agentForConversation,
   agentInfoForOwnedConversation,
   primeForOwnedConversation,
@@ -1672,9 +1673,24 @@ export async function setSessionAutomation(sessionId: string, automation: Sessio
   if (automation !== 'off') scheduleDeliver();
   return sessionControlsFor(sessionId);
 }
+function providerReplacementRecoveryError(): 'continuation_recovery_required' | 'agents_recovery_required' | null {
+  if (continuationRecoveryPaused()) return 'continuation_recovery_required';
+  if (agentsRecoveryPaused()) return 'agents_recovery_required';
+  return null;
+}
+
+function providerReplacementRecoveryPaused(): boolean {
+  return providerReplacementRecoveryError() !== null;
+}
+
+function assertProviderReplacementWritable(): void {
+  if (continuationRecoveryPaused()) throw new Error('continuation_durable_recovery_required');
+  if (agentsRecoveryPaused()) throw new Error('agents_durable_recovery_required');
+}
+
 /** One ticket publication boundary shared by browser and app controls. */
 async function fileCompactionTicket(sessionId: string, id: string, automatic = false) {
-  if (continuationRecoveryPaused()) throw new Error('continuation_durable_recovery_required');
+  assertProviderReplacementWritable();
   if (await controlledConversation(sessionId) !== id) throw new Error('conversation_changed');
   if (goalWorkerChat(id)) throw new Error('worker_compaction_disabled');
   if (isChatBlocked(id)) throw new Error('chat_blocked');
@@ -1705,7 +1721,7 @@ export async function cancelSessionCompaction(sessionId: string): Promise<Sessio
 
 /** A chat the loop may not drive — by role, or by the user's block. */
 function goalFencedChat(id: string): boolean {
-  return continuationRecoveryPaused() || goalBlockReason(id) !== '';
+  return continuationRecoveryPaused() || agentsRecoveryPaused() || goalBlockReason(id) !== '';
 }
 
 function goalEnabledFor(id: string): boolean {
@@ -2855,8 +2871,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
       return json(res, 400, { error: 'bad_request' }, origin);
     }
-    if (continuationRecoveryPaused()) {
-      return json(res, 503, { error: 'continuation_recovery_required', retryable: true }, origin);
+    const providerRecoveryError = providerReplacementRecoveryError();
+    if (providerRecoveryError) {
+      return json(res, 503, { error: providerRecoveryError, retryable: true }, origin);
     }
     const checkpointToken = typeof body['token'] === 'string' ? body['token'] : '';
     const checkpoint = continuationByToken(checkpointToken);
@@ -3998,6 +4015,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // no command text and acquires no owner/lease: it is only a freshness fence for recovery
   // markers that can outlive the command they once referred to.
   if (route === '/commands/revivals/pending' && req.method === 'POST') {
+    if (agentsRecoveryPaused()) return json(res, 503, { error: 'agents_recovery_required', retryable: true }, origin);
     let body: Record<string, unknown>;
     try {
       body = (await readBody(req)) as Record<string, unknown>;
@@ -4060,8 +4078,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // Current extension supplies a transaction owner stable across document reloads. A content
     // script from the immediately previous protocol may omit it; its one-document client remains
     // usable until that document dies, and a later stable marker still has to pass the WAL CAS.
-    if ((command.spec.type === 'resume' || command.spec.type === 'recovery') && continuationRecoveryPaused()) {
-      return json(res, 503, { error: 'continuation_recovery_required', retryable: true }, origin);
+    if (command.spec.type === 'resume' || command.spec.type === 'recovery') {
+      const providerRecoveryError = providerReplacementRecoveryError();
+      if (providerRecoveryError) {
+        return json(res, 503, { error: providerRecoveryError, retryable: true }, origin);
+      }
+    }
+    if ((command.spec.type === 'worker' || command.spec.type === 'revive') && agentsRecoveryPaused()) {
+      return json(res, 503, { error: 'agents_recovery_required', retryable: true }, origin);
     }
     const leaseOwner = command.spec.type === 'recovery' ? (recoveryOwner || client) : client;
     if (command.spec.type === 'recovery' && !(await recoveryCommandCurrent(command.spec))) {
@@ -4267,9 +4291,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return json(res, 200, receiptReply(priorReceipt), origin);
     }
     const ownedCommand = commands.find((command) => command.id === id) ?? null;
-    if ((ownedCommand?.spec.type === 'resume' || ownedCommand?.spec.type === 'recovery') &&
-        continuationRecoveryPaused()) {
-      return json(res, 503, { error: 'continuation_recovery_required', retryable: true }, origin);
+    if (ownedCommand?.spec.type === 'resume' || ownedCommand?.spec.type === 'recovery') {
+      const providerRecoveryError = providerReplacementRecoveryError();
+      if (providerRecoveryError) {
+        return json(res, 503, { error: providerRecoveryError, retryable: true }, origin);
+      }
+    }
+    if ((ownedCommand?.spec.type === 'worker' || ownedCommand?.spec.type === 'revive') && agentsRecoveryPaused()) {
+      return json(res, 503, { error: 'agents_recovery_required', retryable: true }, origin);
     }
     // Every current page echoes its per-document client. If its command has already expired,
     // been cancelled or been superseded, accepting the late ACK as success strands a real
@@ -4898,7 +4927,7 @@ async function startEmergencyRecoveryForSpent(
   spent: readonly string[],
   now: number,
 ): Promise<{ recovering: string[]; fallback: string[] }> {
-  if (continuationRecoveryPaused()) return { recovering: [...spent], fallback: [] };
+  if (continuationRecoveryPaused() || agentsRecoveryPaused()) return { recovering: [...spent], fallback: [] };
   if (!getConfig().multiAgent.selfHealingSessions) return { recovering: [], fallback: [...spent] };
   const recovering: string[] = [];
   const fallback: string[] = [];
@@ -6149,6 +6178,7 @@ async function cancelAutomaticResumesNow(sessionId?: string): Promise<number> {
  * recovery key exists only if the user asks the app for one after that has failed.
  */
 export function queueWorkerBootstrap(agent: string, task: string, model: string | null, reasoningEffort: ReasoningEffort | null, runId: string): BridgeCommand | null {
+  if (agentsRecoveryPaused()) return null;
   // A worker bootstrap is authority for one concrete broker incarnation. There is no safe
   // meaning for one outside a run, and manufacturing an unscoped command here is exactly how
   // stale durable work later becomes somebody else's `worker-1`.
@@ -6176,6 +6206,7 @@ export function queueWorkerRevival(
   wake: readonly string[],
   runId: string
 ): BridgeCommand | null {
+  if (agentsRecoveryPaused()) return null;
   // Same rule as a bootstrap: authority for one concrete broker incarnation, or nothing.
   if (!runId || !conversationId || !swarmRunning(runId)) return null;
   // An empty wake is not a wake. The broker republishes its whole `waking` list on every
@@ -6205,7 +6236,7 @@ export function queueWorkerRevival(
  * claiming a continuation, and a second command for the same session folds into this one.
  */
 export function queueResume(sessionId: string, token: string): BridgeCommand | null {
-  if (continuationRecoveryPaused()) return null;
+  if (providerReplacementRecoveryPaused()) return null;
   const command = queueResumeCommand(sessionId, token);
   void deliver();
   return describe(command, null);
@@ -6222,7 +6253,7 @@ export async function queueEmergencyResume(
   fromConversationId: string,
   episodeId: string
 ): Promise<BridgeCommand | null> {
-  if (continuationRecoveryPaused() || !getConfig().multiAgent.selfHealingSessions || providerTransportUnavailable()) return null;
+  if (providerReplacementRecoveryPaused() || !getConfig().multiAgent.selfHealingSessions || providerTransportUnavailable()) return null;
   if (runningToolCalls(fromConversationId) > 0 || settlingToolCalls(fromConversationId) > 0) return null;
   // Close the zero-inflight race synchronously. From this point A cannot begin another local
   // operation while the durable hard-recovery transition and browser command are prepared.
@@ -6249,7 +6280,7 @@ async function emergencyResumeCommandSpec(
   fromConversationId: string,
   episodeId: string
 ): Promise<Extract<CommandSpec, { type: 'recovery' }> | null> {
-  if (continuationRecoveryPaused()) return null;
+  if (providerReplacementRecoveryPaused()) return null;
   const prepared = await prepareEmergencyResume(sessionId, fromConversationId, episodeId);
   if (!prepared) return null;
   const session = await getSession(sessionId);
@@ -6324,7 +6355,7 @@ async function failRecoveryCommand(
 }
 
 function queueResumeCommand(sessionId: string, token: string): Command {
-  if (continuationRecoveryPaused()) throw new Error('continuation_durable_recovery_required');
+  assertProviderReplacementWritable();
   rememberToken(sessionId, token);
   const command = queue({ type: 'resume', sessionId, token });
   changed();
@@ -6517,7 +6548,7 @@ function pendingBrowserPlacement(conversationId: string | null): {
   const command = commands.find(entry => entry.owner === null && entry.placement &&
     (entry.placement.conversationId === conversationId || (conversationId === null && entry.spec.type === 'worker')));
   if (!command?.placement) return null;
-  if ((command.spec.type === 'resume' || command.spec.type === 'recovery') && continuationRecoveryPaused()) return null;
+  if ((command.spec.type === 'resume' || command.spec.type === 'recovery') && providerReplacementRecoveryPaused()) return null;
   const placement = command.placement;
   delete command.placement;
   const spec = command.spec;
@@ -6774,7 +6805,7 @@ async function chatStillWorking(conversationId: string, turnId: string, sessionI
  * carrying a continuation is not given a second.
  */
 async function considerAutomaticCompaction(conversationId: string, sessionId: string): Promise<void> {
-  if (continuationRecoveryPaused() || !getConfig().compaction.auto || compactionFilings.has(conversationId)) return;
+  if (providerReplacementRecoveryPaused() || !getConfig().compaction.auto || compactionFilings.has(conversationId)) return;
   if (goalFencedChat(conversationId) || continuationForSession(sessionId) || !chatIsWorking(conversationId)) return;
   compactionFilings.add(conversationId);
   try {
@@ -7210,7 +7241,7 @@ function queueBrowserRecovery(
   now = Date.now(),
   assistantSource?: Repair['assistantSource']
 ): boolean {
-  if (continuationRecoveryPaused()) return false;
+  if (continuationRecoveryPaused() || agentsRecoveryPaused()) return false;
   // A blocked chat is one the user took this app's hands off, and every repair here is a hand
   // going back on: a reload restarts the rogue page's turn machinery, and a reopen gives a
   // conversation whose every tool call is already being refused a brand-new tab to try from.
@@ -7583,7 +7614,7 @@ function nonDiscardableAgentConversations(): string[] {
  * The extension still proves the exact document has no draft or generation before closing.
  */
 async function browserTabPolicy(openConversations: Set<string>) {
-  if (continuationRecoveryPaused()) {
+  if (continuationRecoveryPaused() || agentsRecoveryPaused()) {
     // The continuation WAL may be the only proof that an apparently idle page is chat A, chat B,
     // or a superseded source. Until that authority is readable, automatic reuse/close has no
     // safe target set. Conservatively retain every currently open page; explicit user actions
@@ -8081,7 +8112,7 @@ async function owedPickups(now: number): Promise<Map<string, { conversationId: s
 }
 
 async function inspectOwedGoals(now: number): Promise<boolean> {
-  if (continuationRecoveryPaused() || providerTransportUnavailable()) return false;
+  if (continuationRecoveryPaused() || agentsRecoveryPaused() || providerTransportUnavailable()) return false;
   const floor = goalWatchFloor;
   if (floor === null) return false;
   const owed = await owedPickups(now);
@@ -8156,7 +8187,7 @@ async function inspectOwedGoals(now: number): Promise<boolean> {
  * Auto Off additionally cancels threshold-created tickets, never manual requests.
  */
 async function inspectOwedCompactions(now: number): Promise<boolean> {
-  if (continuationRecoveryPaused() || providerTransportUnavailable()) return false;
+  if (continuationRecoveryPaused() || agentsRecoveryPaused() || providerTransportUnavailable()) return false;
   if (compactionWatchFloor === null) return false;
   const owed = new Map(pendingContinuations().map((entry) => [entry.from, entry]));
   for (const [conversationId, watch] of compactionWatch) {
@@ -8594,7 +8625,7 @@ async function tickUnattributedIncident(): Promise<void> {
 async function takePendingRepairs(
   now = Date.now()
 ): Promise<Array<{ conversationId: string; token: string; reason: Repair['reason']; focus: boolean }>> {
-  if (continuationRecoveryPaused()) return [];
+  if (continuationRecoveryPaused() || agentsRecoveryPaused()) return [];
   retireSpentRepairs();
   const pickupFloor = goalWatchFloor;
   const owed = await owedPickups(now);
@@ -9151,6 +9182,10 @@ function expire(command: Command): void {
     return;
   }
   const spec = command.spec;
+  if ((spec.type === 'worker' || spec.type === 'revive') && agentsRecoveryPaused()) {
+    armDeadline(command, 30_000);
+    return;
+  }
   // A wake's deadline moves once when its delivery is proven, and the timer armed at the wake
   // does not know that. Re-arm for the remainder rather than end a worker that is reading.
   if (spec.type === 'revive') {
@@ -9161,7 +9196,7 @@ function expire(command: Command): void {
     }
   }
   if (spec.type === 'resume') {
-    if (continuationRecoveryPaused()) {
+    if (providerReplacementRecoveryPaused()) {
       armDeadline(command, 30_000);
       return;
     }
@@ -9352,8 +9387,8 @@ function describe(command: Command, client: string | null, claimedSummary?: stri
 
 function drop(command: Command, why: string): boolean {
   if (!commands.includes(command)) return false;
-  if ((command.spec.type === 'resume' || command.spec.type === 'recovery') && continuationRecoveryPaused()) {
-    command.lastError = 'Provider replacement is paused until the Compact & Resume transaction ledger is recovered.';
+  if ((command.spec.type === 'resume' || command.spec.type === 'recovery') && providerReplacementRecoveryPaused()) {
+    command.lastError = 'Provider replacement is paused until its durable transaction and agent authority are recoverable.';
     armDeadline(command, 30_000);
     return true;
   }
@@ -9521,7 +9556,8 @@ function tidyCommands(): void {
   const pendingWorkers = new Set(pendingWorkerSpawns().map(worker => `${worker.runId}:${worker.id}`));
   const wakingWorkers = new Set(pendingWorkerRevivals().map(revival => `${revival.runId}:${revival.id}`));
   for (const command of [...commands]) {
-    if ((command.spec.type === 'resume' || command.spec.type === 'recovery') && continuationRecoveryPaused()) continue;
+    if ((command.spec.type === 'resume' || command.spec.type === 'recovery') && providerReplacementRecoveryPaused()) continue;
+    if ((command.spec.type === 'worker' || command.spec.type === 'revive') && agentsRecoveryPaused()) continue;
     const workerAgent = command.spec.type === 'worker' ? command.spec.agent : null;
     if ((command.spec.type === 'worker' || command.spec.type === 'revive') && !swarmRunning(command.spec.runId)) {
       // Run turnover is an identity boundary. A command from the retired incarnation is not
@@ -9558,7 +9594,8 @@ function tidyCommands(): void {
 /** Whether a page is already working on this command, with time still on its deadline. */
 const isLeased = (command: Command): boolean => {
   if (command.claimedAt === null) return false;
-  if ((command.spec.type === 'resume' || command.spec.type === 'recovery') && continuationRecoveryPaused()) return true;
+  if ((command.spec.type === 'resume' || command.spec.type === 'recovery') && providerReplacementRecoveryPaused()) return true;
+  if ((command.spec.type === 'worker' || command.spec.type === 'revive') && agentsRecoveryPaused()) return true;
   if (commandDeadlineDelay(command) > 0) return true;
   if (command.spec.type !== 'resume') return false;
   const state = continuationByToken(command.spec.token)?.state;
@@ -9572,13 +9609,14 @@ const isLeased = (command: Command): boolean => {
  */
 function nextDeliverable(): Command | null {
   if (commandWrites.size > 0) return null;
-  const continuationPaused = continuationRecoveryPaused();
+  const providerReplacementPaused = providerReplacementRecoveryPaused();
+  const agentsPaused = agentsRecoveryPaused();
   // A spent lease stays spent even after its deadline; only expiry settles it. Both resume and
   // Emergency Resume are provider-replacement transports and stay inert while continuation
   // ownership is unknown.
   return commands.find((command) => command.claimedAt === null &&
-    (command.spec.type === 'worker' ||
-      (!continuationPaused && (command.spec.type === 'resume' || command.spec.type === 'recovery')))) ?? null;
+    ((!agentsPaused && command.spec.type === 'worker') ||
+      (!providerReplacementPaused && (command.spec.type === 'resume' || command.spec.type === 'recovery')))) ?? null;
 }
 
 /**
@@ -9625,7 +9663,7 @@ async function reconcileOpeningCommand(
   if (!command || command.claimedAt === null) return { status: 'none' };
 
   if (command.spec.type === 'resume') {
-    if (continuationRecoveryPaused()) return { status: 'retryable', error: 'opening_resume_recovery_paused' };
+    if (providerReplacementRecoveryPaused()) return { status: 'retryable', error: 'opening_resume_recovery_paused' };
     if (command.owner !== client) return { status: 'terminal', error: 'opening_command_owner_changed' };
     const continuation = continuationByToken(command.spec.token);
     if (!continuation || continuation.sessionId !== command.spec.sessionId ||
@@ -9853,6 +9891,16 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
     typeof (raw as Partial<Extract<CommandSpec, { type: 'worker' }>>).runId === 'string'
   ) {
     const worker = raw as Extract<CommandSpec, { type: 'worker' }>;
+    if (agentsRecoveryPaused()) {
+      return {
+        type: 'worker',
+        agent: worker.agent,
+        task: worker.task.slice(0, 512 * 1024),
+        model: isModelSlug(worker.model) ? worker.model : null,
+        reasoningEffort: isReasoningEffort(worker.reasoningEffort) ? worker.reasoningEffort : null,
+        runId: worker.runId
+      };
+    }
     if (!swarmRunning(worker.runId)) return null;
     // A retained transport may deliberately outlive its live queue entry while broker failure
     // is being fsynced. If restart sees the *newer* broker side first, a terminal/sleeping row is
@@ -9882,6 +9930,16 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
     typeof (raw as Partial<Extract<CommandSpec, { type: 'revive' }>>).runId === 'string'
   ) {
     const revive = raw as Extract<CommandSpec, { type: 'revive' }>;
+    if (!conversationId(revive.conversationId)) return null;
+    if (agentsRecoveryPaused()) {
+      return {
+        type: 'revive',
+        agent: revive.agent,
+        conversationId: revive.conversationId,
+        runId: revive.runId,
+        wake: typeof revive.wake === 'string' ? revive.wake : ''
+      };
+    }
     if (!swarmRunning(revive.runId)) return null;
     if (agentConversation(revive.agent, revive.runId) !== revive.conversationId) return null;
     const revivalState = swarmState(revive.runId).agents.find((entry) => entry.id === revive.agent && entry.role === 'worker')?.state;
@@ -9930,7 +9988,7 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
     // A paused continuation WAL cannot authorize retirement. Preserve a structurally valid
     // browser carrier as inert custody until the owner ledger is readable again; live delivery,
     // redeem and ACK paths are separately fenced while recovery is paused.
-    if (continuationRecoveryPaused()) {
+    if (providerReplacementRecoveryPaused()) {
       return { type: 'resume', sessionId: resume.sessionId, token: resume.token };
     }
     const continuation = continuationByToken(resume.token);
@@ -9971,7 +10029,8 @@ function planCommandRestore(
 ): CommandRestorePlan | null {
   const version = saved.version;
   if (version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 || !Array.isArray(saved.commands)) return null;
-  const continuationPaused = continuationRecoveryPaused();
+  const providerReplacementPaused = providerReplacementRecoveryPaused();
+  const agentsPaused = agentsRecoveryPaused();
   const persistedPauseAt =
     typeof saved.transportPausedAt === 'number' && Number.isFinite(saved.transportPausedAt)
       ? saved.transportPausedAt
@@ -10047,7 +10106,8 @@ function planCommandRestore(
     // The broker cannot yet say whether a restored wake was delivered, so disk rows get the
     // longer budget here; the deadline re-armed below applies the exact one.
     if (freezeTransportAge) deadlineCreatedAt += restartSuspensionMs;
-    const stale = spec.type === 'resume' && continuationPaused
+    const stale = ((spec.type === 'resume' || spec.type === 'recovery') && providerReplacementPaused) ||
+      ((spec.type === 'worker' || spec.type === 'revive') && agentsPaused)
       ? false
       : spec.type === 'revive'
         ? now >= deadlineCreatedAt + REVIVAL_ACTIVITY_MS
@@ -10057,9 +10117,9 @@ function planCommandRestore(
       continue;
     }
 
-    const continuation = spec.type === 'resume' && !continuationPaused ? continuationByToken(spec.token) : null;
+    const continuation = spec.type === 'resume' && !providerReplacementPaused ? continuationByToken(spec.token) : null;
     const legacyAlreadyClaimed =
-      version === 1 && spec.type === 'resume' && continuationPaused
+      version === 1 && spec.type === 'resume' && providerReplacementPaused
         ? true
         : version === 1 && continuation !== null &&
           (continuation.state === 'claimed' || continuation.state === 'committing' || continuation.state === 'committed');
@@ -10092,7 +10152,7 @@ function planCommandRestore(
   // for its key were discarded above before expiry was considered.
   const expiredRetainedRevivalIds = new Set<string>();
   for (const command of plannedCommands) {
-    if (command.spec.type !== 'revive' || now < revivalDeadlineAt(command)) continue;
+    if (command.spec.type !== 'revive' || agentsPaused || now < revivalDeadlineAt(command)) continue;
     expiredRevivals.push({ id: command.id, spec: command.spec });
     expiredRetainedRevivalIds.add(command.id);
   }
@@ -10264,9 +10324,10 @@ async function restoreMissingEmergencyResumes(plan: CommandRestorePlan, now: num
  * 1 is migrated conservatively, including resume commands whose continuation WAL survived.
  */
 export async function restoreCommands(): Promise<void> {
-  // Session metadata is the A→B authority. When continuation WAL authority is readable, repair
-  // self-healing first; otherwise provider replacement stays frozen until that WAL is recovered.
-  if (!continuationRecoveryPaused()) await reconcileSelfHealingAfterRestart();
+  // Provider replacement depends on both its own transaction/session evidence and the broker
+  // identity owner it may have to move. If either owner is paused, preserve carriers as inert
+  // custody and do not manufacture or reconcile replacement execution on startup.
+  if (!providerReplacementRecoveryPaused()) await reconcileSelfHealingAfterRestart();
   const saved = await readDurable<{
     version?: number;
     commands?: unknown;
@@ -10285,8 +10346,9 @@ export async function restoreCommands(): Promise<void> {
   // allowed to open a browser. A stale durable marker may remain on disk after the A→B commit or
   // after a terminal recovery failure; neither state is permission to create another executor.
   const currentCommands: Command[] = [];
+  const providerReplacementPaused = providerReplacementRecoveryPaused();
   for (const command of plan.commands) {
-    if (command.spec.type === 'recovery' && !(await recoveryCommandCurrent(command.spec))) {
+    if (!providerReplacementPaused && command.spec.type === 'recovery' && !(await recoveryCommandCurrent(command.spec))) {
       if (command.timer) clearTimeout(command.timer);
       command.timer = null;
       continue;
@@ -10294,7 +10356,7 @@ export async function restoreCommands(): Promise<void> {
     currentCommands.push(command);
   }
   plan.commands = currentCommands;
-  if (!continuationRecoveryPaused()) await restoreMissingEmergencyResumes(plan, now);
+  if (!providerReplacementPaused) await restoreMissingEmergencyResumes(plan, now);
 
   // Rebuild the replacement-chat recorder gate from durable recovery authority before the
   // bridge publishes any restored browser work. `startBridgeOnce()` keeps every browser route
@@ -10302,10 +10364,10 @@ export async function restoreCommands(): Promise<void> {
   // cannot race `/events` into minting a shadow session after an app crash. The ACK/terminal
   // recovery path clears this exact episode id through endResumeClaim().
   for (const command of plan.commands) {
-    if (command.spec.type === 'recovery') noteResumeOpening(command.spec.episodeId);
+    if (!providerReplacementPaused && command.spec.type === 'recovery') noteResumeOpening(command.spec.episodeId);
   }
 
-  if (plan.expiredRevivals.length > 0) {
+  if (!agentsRecoveryPaused() && plan.expiredRevivals.length > 0) {
     let brokerRelevant = false;
     for (const expired of plan.expiredRevivals) {
       const revive = expired.spec;

@@ -118,6 +118,23 @@ it('fails closed during continuation WAL recovery before handler or queued-input
   expect(fixture.inputAck).not.toHaveBeenCalled();
 });
 
+it('fails closed during agents authority recovery before handler or queued-input side effects', async () => {
+  noteDurableRecoveryIncident({
+    domain: 'agents',
+    ledger: 'swarm',
+    failure: 'schema_invalid',
+    disposition: 'pause'
+  });
+  const run = vi.fn(async () => ok('should-not-run'));
+
+  const result = await invoke('request-a', run);
+
+  expect(result.isError).toBe(true);
+  expect(JSON.stringify(result)).toContain('multi-agent authority ledgers');
+  expect(run).not.toHaveBeenCalled();
+  expect(fixture.inputAck).not.toHaveBeenCalled();
+});
+
 it('requires exact proof of both the refused request and the recipient, even across turns', async () => {
   await refused('old-request');
   prove('request-a');

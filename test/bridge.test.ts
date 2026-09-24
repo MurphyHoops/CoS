@@ -61,6 +61,8 @@ const {
   pendingCommands,
   queueEmergencyResume,
   queueResume,
+  queueWorkerBootstrap,
+  queueWorkerRevival,
   resetBridgeForTests,
   restoreCommands,
   resumeJobFor,
@@ -124,6 +126,7 @@ const {
 const {
   acknowledgeOffers,
   agentInfoForOwnedConversation,
+  agentsRecoveryPaused,
   PRIME_ID,
   beginPrimeTransfer,
   commitPrimeTransfer,
@@ -565,6 +568,84 @@ describe('continuation durable recovery bridge fence', () => {
     expect(redeemPaused.body).toMatchObject({ error: 'continuation_recovery_required', retryable: true });
     expect(pendingCommands()).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: commandId, what: `resume:${session.id}` })
+    ]));
+  });
+});
+
+describe('agents durable recovery bridge fence', () => {
+  it('does not create new worker bootstrap or revival carriers while agent authority is paused', () => {
+    const prime = { conversationId: 'agent-pause-prime' };
+    const started = spawn({ caller: prime, workers: [{ task: 'first assignment' }] });
+    expect(bindConversation('worker-1', 'agent-pause-worker', started.runId)).toBe(true);
+    finishAgent({ conversationId: 'agent-pause-worker' }, 'first assignment done');
+    stageMessages(prime, [{ to: 'worker-1', text: 'second assignment' }]).commit();
+    const revival = pendingWorkerRevivals()[0]!;
+    expect(revival).toBeTruthy();
+    const beforePause = pendingCommands().map((entry) => entry.id).sort();
+
+    noteDurableRecoveryIncident({
+      domain: 'agents',
+      ledger: 'swarm',
+      failure: 'schema_invalid',
+      disposition: 'pause'
+    });
+
+    expect(queueWorkerBootstrap('worker-1', 'must not open', null, null, started.runId)).toBeNull();
+    expect(queueWorkerRevival(
+      revival.id,
+      revival.conversationId,
+      revival.messageIds,
+      revival.runId
+    )).toBeNull();
+    expect(agentsRecoveryPaused()).toBe(true);
+    expect(pendingCommands().map((entry) => entry.id).sort()).toEqual(beforePause);
+  });
+
+  it('keeps an existing worker carrier inert across restart and refuses redeem while paused', async () => {
+    await pair();
+    const prime = { conversationId: 'agent-custody-prime' };
+    const started = spawn({ caller: prime, workers: [{ task: 'durable bootstrap custody' }] });
+
+    publishProviderTransportStatus({
+      ...connectedTransport,
+      state: 'offline',
+      detail: 'fixture outage',
+      handshakeAt: null
+    });
+    const queued = queueWorkerBootstrap('worker-1', 'durable bootstrap custody', null, null, started.runId);
+    expect(queued).not.toBeNull();
+    await flushDurable();
+    const commandId = queued!.id;
+
+    resetBridgeForTests();
+    opened.length = 0;
+    setBrowserOpener(async (url) => { opened.push(url); });
+    noteDurableRecoveryIncident({
+      domain: 'agents',
+      ledger: 'swarm',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    expect(agentsRecoveryPaused()).toBe(true);
+    await restoreCommands();
+    expect(agentsRecoveryPaused()).toBe(true);
+    expect(opened).toEqual([]);
+    expect(pendingCommands()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: commandId })
+    ]));
+
+    publishProviderTransportStatus({ ...connectedTransport, handshakeAt: Date.now() });
+    await flushBridgeTransportRecoveryForTests();
+    expect(opened).toEqual([]);
+
+    const redeemPaused = await request('POST', '/commands/redeem', {
+      body: { id: commandId, client: 'paused-worker-page' }
+    });
+    expect(redeemPaused.status).toBe(503);
+    expect(redeemPaused.body).toMatchObject({ error: 'agents_recovery_required', retryable: true });
+    expect(pendingCommands()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: commandId })
     ]));
   });
 });

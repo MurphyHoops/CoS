@@ -58,6 +58,7 @@ import { logInfo, logWarn } from '../logger.js';
 import {
   PRIME_ID,
   agentForOwnedConversation,
+  agentsRecoveryPaused,
   beginPrimeTransfer,
   cancelPrimeTransfer,
   commitPrimeTransferNow,
@@ -1094,6 +1095,7 @@ export async function openContinuationNow(
   automatic = false,
   project: string | null = null
 ): Promise<ContinuationView> {
+  if (agentsRecoveryPaused()) throw new Error('agents_durable_recovery_required');
   assertContinuationWritable();
   sweep();
   const existing = [...byToken.values()].find((entry) => entry.sessionId === sessionId && isOpen(entry));
@@ -1838,6 +1840,9 @@ export async function commitContinuationResult(
   token: string,
   toConversationId: string
 ): Promise<ContinuationCommitResult> {
+  if (agentsRecoveryPaused()) {
+    return { status: 'retryable', reason: 'multi-agent authority recovery is required before A→B commit' };
+  }
   if (continuationRecoveryPaused()) {
     return { status: 'retryable', reason: 'continuation durable recovery is required before commit' };
   }
@@ -2182,6 +2187,14 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
 }
 
 export async function restoreContinuationsDurableState(): Promise<void> {
+  if (agentsRecoveryPaused()) {
+    // Continuation WAL may be perfectly healthy while its A→B swarm dependency is not. Do not
+    // reinterpret the missing live swarm as "this chat is not a Prime" and do not mark this
+    // owner corrupt. Leave the WAL untouched for the next startup after agents recovery.
+    byToken.clear();
+    transportPausedAt = null;
+    return;
+  }
   const primary = await readDurableResult<unknown>(CONTINUATIONS_STATE);
   if (primary.kind === 'missing') {
     await restoreContinuations(null);

@@ -45,8 +45,10 @@ import { ExecError } from '../exec.js';
 import { ComputerError } from '../computer/index.js';
 import { getConfig } from '../config.js';
 import {
+  AGENTS_RECOVERY_REFUSAL,
   AgentError,
   IdentityLostError,
+  agentsRecoveryPaused,
   currentRunId,
   acknowledgeOffersForConversation,
   dormantWorkerNotice,
@@ -586,7 +588,8 @@ async function dispatchTracked(
   const blockedLedgerRecovery = blockedChatRecoveryPaused();
   const longRunLedgerRecovery = longRunRecoveryPaused();
   const continuationLedgerRecovery = continuationRecoveryPaused();
-  const durableControlRecovery = blockedLedgerRecovery || longRunLedgerRecovery || continuationLedgerRecovery;
+  const agentsLedgerRecovery = agentsRecoveryPaused();
+  const durableControlRecovery = blockedLedgerRecovery || longRunLedgerRecovery || continuationLedgerRecovery || agentsLedgerRecovery;
   const startedAt = context.startedAt;
   // Cheap, non-blocking ingress identity. When the page has already reported this exact
   // request id, identity-sensitive handlers (workspace/session/agents) see it before they
@@ -820,6 +823,8 @@ async function dispatchTracked(
         ? Promise.resolve(fail(LONG_RUN_RECOVERY_REFUSAL))
         : continuationLedgerRecovery
         ? Promise.resolve(fail(CONTINUATION_RECOVERY_REFUSAL))
+        : agentsLedgerRecovery
+        ? Promise.resolve(fail(AGENTS_RECOVERY_REFUSAL))
         : blockedChat
         ? Promise.resolve(fail(BLOCKED_CHAT_REFUSAL))
         : recoveringConversation

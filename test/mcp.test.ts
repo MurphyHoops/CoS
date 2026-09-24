@@ -3118,6 +3118,24 @@ describe('durable wait admission over MCP', () => {
     expect(textOf(reply)).not.toContain('/workspace/notes.txt');
   });
 
+  it('fails ordinary MCP tools closed while multi-agent authority is in recovery pause', async () => {
+    noteDurableRecoveryIncident({
+      domain: 'agents',
+      ledger: 'swarm',
+      failure: 'schema_invalid',
+      disposition: 'pause'
+    });
+
+    const reply = await modern(
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } }
+    );
+
+    expect(failed(reply)).toBe(true);
+    expect(textOf(reply)).toContain('multi-agent authority ledgers');
+    expect(textOf(reply)).not.toContain('/workspace/notes.txt');
+  });
+
   it('fails closed when session_wait cannot prove the source turn yet', async () => {
     ctx.sessionTools = true;
     const conversationId = 'wait-admission-source';
