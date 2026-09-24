@@ -18,7 +18,12 @@ export const DURABLE_RECOVERY_DOMAINS = [
 
 export type DurableRecoveryDomain = typeof DURABLE_RECOVERY_DOMAINS[number];
 export type DurableRecoveryCopy = 'primary' | 'backup';
-export type DurableRecoveryFailure = 'json_corrupt' | 'schema_invalid' | 'io_error' | 'checkpoint_degraded';
+export type DurableRecoveryFailure =
+  | 'json_corrupt'
+  | 'schema_invalid'
+  | 'io_error'
+  | 'checkpoint_degraded'
+  | 'orphan_backup';
 export type DurableRecoveryDisposition = 'pause' | 'degraded';
 
 export interface DurableRecoveryIncident {

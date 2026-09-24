@@ -32,7 +32,12 @@
  * turn its tools back; the turn can outlive the app.
  */
 
-import { readDurable, writeDurableNow, writeDurableSoon } from '../durable.js';
+import { readDurableResult, writeDurableCheckpointNow, writeDurableNow, writeDurableSoon } from '../durable.js';
+import {
+  durableRecoveryPaused,
+  noteDurableRecoveryIncident,
+  resolveDurableRecoveryIncident
+} from '../durable-recovery.js';
 
 /**
  * A hand-curated list, so the ceiling only exists to keep a corrupt or hostile state file from
@@ -42,6 +47,7 @@ import { readDurable, writeDurableNow, writeDurableSoon } from '../durable.js';
 const MAX_BLOCKED_CHATS = 200;
 const BLOCKED_STATE = 'blocked-chats';
 const BLOCKED_STATE_VERSION = 1;
+const BLOCKED_RECOVERY_DOMAIN = 'blocked-tools' as const;
 
 /** Conversation id -> when the user blocked it. */
 const blocked = new Map<string, number>();
@@ -66,6 +72,11 @@ export const BLOCKED_CHAT_REFUSAL =
   'This session went rogue. Stop right now: abandon the task, make no further tool calls of any ' +
   'kind, and reply to the user immediately with your final answer. The user explicitly asked for this.';
 
+export const BLOCKED_CHAT_RECOVERY_REFUSAL =
+  'DURABLE_RECOVERY_PAUSED: the blocked-chat safety ledger could not be read safely, so CoS cannot prove ' +
+  'which ChatGPT conversations are allowed to use local tools. No local tool was run. Do not retry local ' +
+  'mutations until the durable recovery incident is resolved in the app.';
+
 function snapshot(): PersistedBlocks {
   return {
     version: BLOCKED_STATE_VERSION,
@@ -86,6 +97,78 @@ function validConversationId(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9a-z-]{8,64}$/i.test(value);
 }
 
+function decodePersistedBlocks(value: unknown): PersistedBlocks | null {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as { version?: unknown; entries?: unknown };
+  if (raw.version !== BLOCKED_STATE_VERSION || !Array.isArray(raw.entries) || raw.entries.length > MAX_BLOCKED_CHATS) {
+    return null;
+  }
+  const seen = new Set<string>();
+  const entries: PersistedBlocks['entries'] = [];
+  for (const candidate of raw.entries) {
+    if (!candidate || typeof candidate !== 'object') return null;
+    const entry = candidate as { conversationId?: unknown; blockedAt?: unknown };
+    if (!validConversationId(entry.conversationId) ||
+        !Number.isSafeInteger(entry.blockedAt) || Number(entry.blockedAt) <= 0 ||
+        seen.has(entry.conversationId)) return null;
+    seen.add(entry.conversationId);
+    entries.push({ conversationId: entry.conversationId, blockedAt: Number(entry.blockedAt) });
+  }
+  return { version: BLOCKED_STATE_VERSION, entries };
+}
+
+function noteRecovery(
+  copy: 'primary' | 'backup',
+  failure: 'json_corrupt' | 'schema_invalid' | 'io_error' | 'checkpoint_degraded' | 'orphan_backup',
+  disposition: 'pause' | 'degraded',
+  detail?: string
+): void {
+  noteDurableRecoveryIncident({
+    domain: BLOCKED_RECOVERY_DOMAIN,
+    ledger: BLOCKED_STATE,
+    copy,
+    failure,
+    disposition,
+    detail
+  });
+}
+
+async function inspectBackupHealth(): Promise<'missing' | 'valid' | 'invalid'> {
+  const result = await readDurableResult<unknown>(BLOCKED_STATE, 'backup');
+  if (result.kind === 'missing') {
+    resolveDurableRecoveryIncident(BLOCKED_RECOVERY_DOMAIN, BLOCKED_STATE, 'backup');
+    return 'missing';
+  }
+  if (result.kind === 'io_error') {
+    noteRecovery('backup', 'io_error', 'degraded', result.error);
+    return 'invalid';
+  }
+  if (result.kind === 'corrupt') {
+    noteRecovery('backup', 'json_corrupt', 'degraded', result.error);
+    return 'invalid';
+  }
+  if (!decodePersistedBlocks(result.value)) {
+    noteRecovery('backup', 'schema_invalid', 'degraded', 'backup snapshot failed blocked-chat schema validation');
+    return 'invalid';
+  }
+  resolveDurableRecoveryIncident(BLOCKED_RECOVERY_DOMAIN, BLOCKED_STATE, 'backup');
+  return 'valid';
+}
+
+async function checkpointAccepted(value: PersistedBlocks): Promise<void> {
+  try {
+    await writeDurableCheckpointNow(BLOCKED_STATE, value);
+    resolveDurableRecoveryIncident(BLOCKED_RECOVERY_DOMAIN, BLOCKED_STATE, 'backup');
+  } catch (error) {
+    noteRecovery(
+      'backup',
+      'checkpoint_degraded',
+      'degraded',
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+}
+
 /**
  * Loads the blocked set before the MCP endpoint can accept a call.
  *
@@ -94,15 +177,49 @@ function validConversationId(value: unknown): value is string {
  */
 export async function restoreBlockedChats(): Promise<void> {
   if (restored) return;
-  restored = true;
-  const saved = await readDurable<PersistedBlocks>(BLOCKED_STATE);
-  if (!saved || saved.version !== BLOCKED_STATE_VERSION || !Array.isArray(saved.entries)) return;
-  for (const entry of saved.entries.slice(0, MAX_BLOCKED_CHATS)) {
-    if (!entry || typeof entry !== 'object') continue;
-    const { conversationId, blockedAt } = entry as { conversationId?: unknown; blockedAt?: unknown };
-    if (!validConversationId(conversationId)) continue;
-    blocked.set(conversationId, typeof blockedAt === 'number' && Number.isFinite(blockedAt) ? blockedAt : Date.now());
+  blocked.clear();
+  const primary = await readDurableResult<unknown>(BLOCKED_STATE);
+  if (primary.kind === 'missing') {
+    const backup = await inspectBackupHealth();
+    if (backup === 'missing') {
+      resolveDurableRecoveryIncident(BLOCKED_RECOVERY_DOMAIN, BLOCKED_STATE, 'primary');
+      restored = true;
+      return;
+    }
+    noteRecovery(
+      'primary',
+      'orphan_backup',
+      'pause',
+      'primary blocked-chat ledger is missing while recovery evidence still exists'
+    );
+    return;
   }
+  if (primary.kind === 'io_error') {
+    noteRecovery('primary', 'io_error', 'pause', primary.error);
+    await inspectBackupHealth();
+    return;
+  }
+  if (primary.kind === 'corrupt') {
+    noteRecovery('primary', 'json_corrupt', 'pause', primary.error);
+    await inspectBackupHealth();
+    return;
+  }
+  const saved = decodePersistedBlocks(primary.value);
+  if (!saved) {
+    noteRecovery('primary', 'schema_invalid', 'pause', 'primary snapshot failed blocked-chat schema validation');
+    await inspectBackupHealth();
+    return;
+  }
+
+  for (const entry of saved.entries) blocked.set(entry.conversationId, entry.blockedAt);
+  resolveDurableRecoveryIncident(BLOCKED_RECOVERY_DOMAIN, BLOCKED_STATE, 'primary');
+  restored = true;
+  await checkpointAccepted(saved);
+}
+
+/** Whether blocked-chat authority is paused because its durable ledger is not trustworthy. */
+export function blockedChatRecoveryPaused(): boolean {
+  return durableRecoveryPaused(BLOCKED_RECOVERY_DOMAIN);
 }
 
 /**
@@ -145,6 +262,9 @@ export function chatBlockedAt(conversationId: string): number | null {
 export function setChatBlocked(conversationId: string, next: boolean): Promise<void> {
   if (!validConversationId(conversationId)) throw new Error('Not a ChatGPT conversation id');
   const operation = mutations.then(async () => {
+    if (blockedChatRecoveryPaused()) {
+      throw new Error('Blocked-chat durable recovery must be resolved before changing tool access');
+    }
     const alreadyBlocked = blocked.has(conversationId);
     if (next) {
       if (!alreadyBlocked) {
@@ -155,13 +275,16 @@ export function setChatBlocked(conversationId: string, next: boolean): Promise<v
       }
       // Even an idempotent retry crosses the barrier again: the previous Block attempt may have
       // left the safe live fence installed after its durable write rejected.
-      await writeDurableNow(BLOCKED_STATE, snapshot());
+      const accepted = snapshot();
+      await writeDurableNow(BLOCKED_STATE, accepted);
+      await checkpointAccepted(accepted);
       return;
     }
 
     if (!alreadyBlocked) return;
+    const accepted = snapshotWithout(conversationId);
     try {
-      await writeDurableNow(BLOCKED_STATE, snapshotWithout(conversationId));
+      await writeDurableNow(BLOCKED_STATE, accepted);
     } catch (error) {
       // writeDurableNow retains a failed generation for retry. Supersede a rejected Release with
       // the still-authoritative blocked snapshot so a background retry cannot later unblock it.
@@ -169,6 +292,7 @@ export function setChatBlocked(conversationId: string, next: boolean): Promise<v
       throw error;
     }
     blocked.delete(conversationId);
+    await checkpointAccepted(accepted);
   });
   mutations = operation.catch(() => undefined);
   return operation;

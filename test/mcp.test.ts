@@ -40,6 +40,7 @@ import { observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { WINDOWS_COMPUTER_METHODS, WINDOWS_COMPUTER_READ_METHODS } from '../src/shared/windows-computer.js';
 import { BROWSER_TOOLS, BROWSER_READ_TOOLS } from '../src/shared/browser-control.js';
 import { resetBlockedChatsForTests, setChatBlocked } from '../src/main/session/blocked-chats.js';
+import { noteDurableRecoveryIncident, resetDurableRecoveryForTests } from '../src/main/durable-recovery.js';
 import {
   abortContinuation,
   attachSummary,
@@ -4023,8 +4024,14 @@ describe('blocked chats', () => {
       requestId ? { 'x-request-id': `${requestId}/att1` } : {}
     );
 
-  beforeEach(() => resetBlockedChatsForTests());
-  afterAll(() => resetBlockedChatsForTests());
+  beforeEach(() => {
+    resetBlockedChatsForTests();
+    resetDurableRecoveryForTests();
+  });
+  afterAll(() => {
+    resetBlockedChatsForTests();
+    resetDurableRecoveryForTests();
+  });
 
   it('refuses a blocked chat’s call and tells the model to stop instead of retrying', async () => {
     await setChatBlocked(ROGUE, true);
@@ -4070,6 +4077,22 @@ describe('blocked chats', () => {
     const unproven = await readAs(null);
     expect(failed(unproven)).toBe(false);
     expect(textOf(unproven)).toContain('/workspace/notes.txt');
+  });
+
+  it('fails every MCP tool closed while blocked-chat durable recovery is paused, even without caller identity', async () => {
+    noteDurableRecoveryIncident({
+      domain: 'blocked-tools',
+      ledger: 'blocked-chats',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    const reply = await readAs(null);
+    const text = textOf(reply);
+
+    expect(failed(reply)).toBe(true);
+    expect(text).toContain('DURABLE_RECOVERY_PAUSED');
+    expect(text).not.toContain('/workspace/notes.txt');
   });
 
   it('refuses the call whose page evidence proves the blocked chat only after it arrives', async () => {

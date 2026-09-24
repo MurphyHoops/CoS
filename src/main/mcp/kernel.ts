@@ -86,7 +86,13 @@ import {
   recordToolCall
 } from '../session/recorder.js';
 import { requestCorrelation } from '../session/correlation.js';
-import { BLOCKED_CHAT_REFUSAL, anyChatBlocked, isChatBlocked } from '../session/blocked-chats.js';
+import {
+  BLOCKED_CHAT_RECOVERY_REFUSAL,
+  BLOCKED_CHAT_REFUSAL,
+  anyChatBlocked,
+  blockedChatRecoveryPaused,
+  isChatBlocked
+} from '../session/blocked-chats.js';
 import { anyContinuationOpen, compactingConversation } from '../session/continuation.js';
 import {
   anyLongRunWaitActive,
@@ -570,6 +576,7 @@ async function dispatchTracked(
   // question the setup screen has to answer honestly.
   surfaceToolCallAt.set(surface, Date.now());
   const isFinish = isFinishCall(name, args);
+  const blockedLedgerRecovery = blockedChatRecoveryPaused();
   const startedAt = context.startedAt;
   // Cheap, non-blocking ingress identity. When the page has already reported this exact
   // request id, identity-sensitive handlers (workspace/session/agents) see it before they
@@ -690,11 +697,11 @@ async function dispatchTracked(
   // thought asleep takes the free execution slot back for that family, so the liveness
   // bookkeeping below sees the same run it would have seen had the parking not happened. A
   // chat the user stopped from the app is refused below anyway and reclaims nothing.
-  if (!supersededConversation && !recoveringConversation && !longRunBoundaryBefore &&
+  if (!blockedLedgerRecovery && !supersededConversation && !recoveringConversation && !longRunBoundaryBefore &&
       !isFinish && !isChatBlocked(context.caller.conversationId)) {
     reactivateDormantRunForConversation(context.caller.conversationId);
   }
-  const quietWorkers = supersededConversation || recoveringConversation || longRunBoundaryBefore
+  const quietWorkers = blockedLedgerRecovery || supersededConversation || recoveringConversation || longRunBoundaryBefore
     ? []
     : sleepSilentDetachedWorkers();
   for (const quiet of quietWorkers) {
@@ -703,7 +710,7 @@ async function dispatchTracked(
   // And this call is itself first-hand evidence that its own conversation is alive. That is
   // what undoes a worker given up on because its tab went away — the turn never stopped, so
   // the call arrives from a chat the app had written off, and the write-off was wrong.
-  const alive = supersededConversation || recoveringConversation || longRunBoundaryBefore
+  const alive = blockedLedgerRecovery || supersededConversation || recoveringConversation || longRunBoundaryBefore
     ? null
     : noteAgentAlive(context.caller.conversationId);
   if (alive?.report) await recordAgentMessage(alive.report, 'sent', context.caller.conversationId);
@@ -780,11 +787,11 @@ async function dispatchTracked(
   // Refuse and let the model retry once page evidence is healthy instead.
   // The arrival of this exact call acknowledges earlier injected input before the
   // handler reads the queue. New queued input is still offered only with its result.
-  if (!nested && !longRunBoundaryBefore) {
+  if (!nested && !blockedLedgerRecovery && !longRunBoundaryBefore) {
     await acknowledgeToolInput(context.caller.sessionId, context.caller.conversationId, requestId, startedAt)
       .catch(() => logWarn('Prior user input receipt could not be saved; its existing claim is preserved'));
   }
-  if (!nested && requestId && !blockedChat && !supersededConversation && !recoveringConversation &&
+  if (!nested && requestId && !blockedLedgerRecovery && !blockedChat && !supersededConversation && !recoveringConversation &&
       !longRunBoundaryBefore && !compacting) {
     const explicitPoll = name === 'write_stdin' && args && typeof args === 'object'
       ? (args as { session_id?: number }).session_id : undefined;
@@ -797,7 +804,9 @@ async function dispatchTracked(
     return run();
   };
   const result = await runInCallContext(context, () =>
-      blockedChat
+      blockedLedgerRecovery
+        ? Promise.resolve(fail(BLOCKED_CHAT_RECOVERY_REFUSAL))
+        : blockedChat
         ? Promise.resolve(fail(BLOCKED_CHAT_REFUSAL))
         : recoveringConversation
         ? Promise.resolve(
@@ -890,7 +899,7 @@ async function dispatchTracked(
   // retry after a lost result. The SDK exposes the JSON-RPC id, but a model-issued retry is
   // a new MCP request with a new id, so that id cannot prove the previous finish result was
   // seen. The broker therefore re-offers rather than assuming; see acknowledgeOffers.
-  const acknowledgedForConversation = supersededConversation || recoveringConversation || longRunBoundaryAfter || nested
+  const acknowledgedForConversation = blockedLedgerRecovery || supersededConversation || recoveringConversation || longRunBoundaryAfter || nested
     ? null
     : acknowledgeOffersForConversation(
         context.caller.conversationId,
@@ -915,7 +924,7 @@ async function dispatchTracked(
     context.caller.conversationId,
     withInbox(
       context.caller.conversationId,
-      recoveringConversation || longRunBoundaryAfter ? null : context.agent,
+      blockedLedgerRecovery || recoveringConversation || longRunBoundaryAfter ? null : context.agent,
       baseResult,
       isFinish
     ),
@@ -923,7 +932,7 @@ async function dispatchTracked(
   );
   // Ordinary tools carry direct user input, but only the explicit finish signal
   // advances a planned stage. Successful work is not evidence that a stage is done.
-  const userInput = nested || recoveringConversation || longRunBoundaryAfter
+  const userInput = nested || blockedLedgerRecovery || recoveringConversation || longRunBoundaryAfter
     ? { messages: [], reminder: '' }
     : await offerToolInput(context.caller.sessionId, context.caller.conversationId, context.caller.requestId, startedAt, name === 'session_finish' && !result.isError).catch(() => {
     logWarn('User input could not be attached; the completed tool result is preserved');
@@ -938,7 +947,7 @@ async function dispatchTracked(
     if (userInput.reminder) attachments.push({ type: 'text', text: '\n\n' + userInput.reminder });
     delivered = { ...delivered, content: [...delivered.content, ...attachments] };
   }
-  if (!nested && handlerRan && !blockedChat && !supersededConversation && !recoveringConversation &&
+  if (!nested && handlerRan && !blockedLedgerRecovery && !blockedChat && !supersededConversation && !recoveringConversation &&
       !longRunBoundaryAfter && !compacting) {
     delivered = await withBackgroundExecRecovery(context, delivered);
   }
@@ -994,7 +1003,7 @@ async function dispatchTracked(
   // receive its inbox. Doing it inside acknowledgeOffers would let `agents status` destroy
   // the run halfway through identifying itself; here the handler and result are already done.
   const callerRunId = context.caller.conversationId ? currentRunId(context.caller.conversationId) : null;
-  if (callerRunId) releaseQuiescentRun({}, callerRunId);
+  if (callerRunId && !blockedLedgerRecovery) releaseQuiescentRun({}, callerRunId);
   markTiming('recorder', true);
   return delivered;
 }
