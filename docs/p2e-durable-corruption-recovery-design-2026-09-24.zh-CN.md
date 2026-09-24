@@ -160,7 +160,7 @@ coordinator 不直接调用 `restoreGoal*`、`restoreSwarm` 等，也不跨文�
 
 ## 10. 已实现的 owner 策略
 
-当前独立分支已经接入三个 authority owner：
+当前独立分支已经接入四组 authority owner：
 
 - **blocked-chats / blocked-tools**：primary 必须整份 schema-valid；corrupt、I/O failure、
   schema-invalid、以及 primary missing + backup surviving 都进入全域工具 recovery pause。
@@ -172,6 +172,13 @@ coordinator 不直接调用 `restoreGoal*`、`restoreSwarm` 等，也不跨文�
   primary missing + surviving backup、I/O failure 都进入 `continuation` recovery pause，backup 只作
   evidence，不自动复活 A→B transaction。`awaiting-chat/claimed/committing/committed` 必须保有
   durable handoff id 与非空 brief；不可能的 Send identity、重复 open session/source authority 整份拒绝。
+- **agents / swarm + retired-workers**：两个 ledger 先分别分类并完整校验，在二者都安全前不发布任何
+  live Prime/Worker authority。损坏、I/O failure、schema-invalid 不再逐行丢弃后继续；v4 短 run id、
+  bound+invited、finished+revivable、旧 model/reasoning 等已有明确 migration 仍保留。broker queue 必须
+  保持同 owner 的 Prime↔Worker 星形拓扑，重复 conversation/run/agent authority 整份拒绝。
+  `retired-workers` 的 missing + surviving backup 进入 pause；`swarm` 则有 owner-specific 例外：
+  Clear swarm 的规范表示就是 primary 不存在，因此 missing primary 是 authoritative empty，旧 backup
+  必须删除而不是复活历史 swarm。
 
 Long-Run 明确保留旧字段兼容：缺失 `sourceRequestId`、`providerBudgetAt`、
 `completionCheckClaimedAt`、`providerKey/providerData` 按既有保守语义归一化。
@@ -190,5 +197,14 @@ Continuation recovery pause 同时冻结 owner mutation、MCP handler、Compact/
 已存在的 resume browser command 只作为 inert custody 保留：restart/TTL 不删除，恢复前也不打开、
 不 redeem、不 ACK、不重新 Send。普通 Stop 和与 continuation 无关的显式撤权仍保持可执行。
 
-尚未接入 owner schema/pause 的关键账本仍包括 Goal 三账本、swarm/retired-workers、
-session-input 与 bridge-commands；后续按同一原则逐 owner 推进，不共享 mutation authority。
+Agents recovery pause 采用同样的 fail-closed admission，但**不把纯读取状态伪装成 empty**：旧 Worker/Prime
+无法通过 MCP 获得本机 mutation authority，新的 worker bootstrap/revival 不投递，既有 browser carrier
+只保留 inert custody。Compact/Resume 与 Emergency Resume 还显式依赖 agents identity：agents ledger
+不可判定时，健康的 continuation WAL 不被标成 corrupt、不被改写，只延迟 live restore 与 A→B side effect。
+这保持了 owner 边界：一个 owner 的损坏可以暂停依赖它的动作，但不能篡改另一个 owner 的事实。
+
+恢复策略本身保留在 owner 边界（例如 `agents-recovery.ts`）；启动层只负责 wiring，coordinator 只维护
+incident/pause。后续 owner 不再采用“unknown → empty → 再用更多 guard 补洞”的模式。
+
+尚未接入 owner schema/pause 的关键账本仍包括 Goal 三账本、session-input 与 bridge-commands；
+后续按同一原则逐 owner 推进，不共享 mutation authority。

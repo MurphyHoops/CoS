@@ -4244,7 +4244,8 @@ function validSerializedAgent(value: unknown, savedAt: number): value is Seriali
       !(info.reasoningEffort === undefined || info.reasoningEffort === null || typeof info.reasoningEffort === 'string')) return false;
 
   if (info.id === PRIME_ID) {
-    if (info.role !== 'prime' || !info.conversationId) return false;
+    if (info.role !== 'prime' || !info.conversationId ||
+        (info.state !== 'active' && info.state !== 'detached') || info.revivable !== false) return false;
   } else if (info.role !== 'worker') {
     return false;
   }
@@ -4290,7 +4291,17 @@ function validAgentOwnerRows(entries: unknown, savedAt: number): entries is Seri
       conversations.add(entry.info.conversationId);
     }
   }
-  return primes === 1;
+  if (primes !== 1) return false;
+  for (const entry of entries) {
+    for (const message of entry.queue) {
+      if (entry.info.id === PRIME_ID) {
+        if (message.from === PRIME_ID || !ids.has(message.from)) return false;
+      } else if (message.from !== PRIME_ID) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 export function validateSwarmSnapshot(value: unknown): value is SwarmSnapshot {

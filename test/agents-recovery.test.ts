@@ -166,6 +166,44 @@ describe('agents durable corruption recovery', () => {
     );
   });
 
+  it('accepts the legitimate detached-Prime lifecycle while rejecting forged broker topology', async () => {
+    const snapshot = makeSwarmSnapshot() as any;
+    const prime = snapshot.activeRuns[0].agents.find((entry: any) => entry.info.id === 'prime');
+    prime.info.state = 'detached';
+    prime.info.detachedAt = Date.now();
+
+    resetAgentsForTests();
+    await writeDurableNow(SWARM_STATE, snapshot);
+    expect(await restoreAgentAuthorityState()).toBe(true);
+    expect(agentsRecoveryPaused()).toBe(false);
+    expect(currentRunId('prime-recovery')).toBe(snapshot.activeRuns[0].runId);
+
+    const forged = structuredClone(snapshot);
+    const worker = forged.activeRuns[0].agents.find((entry: any) => entry.info.id === 'worker-1');
+    worker.queue = [{
+      id: 'forged-worker-message',
+      from: 'worker-99',
+      to: 'worker-1',
+      time: Date.now(),
+      text: 'this row never crossed the broker star-topology check',
+      offeredAt: null,
+      offers: 0,
+      offeredOnFinish: false,
+      offeredViaRevival: false,
+      ackedAt: null
+    }];
+
+    resetAgentsForTests();
+    resetDurableRecoveryForTests();
+    await writeDurableNow(SWARM_STATE, forged);
+    expect(await restoreAgentAuthorityState()).toBe(false);
+    expect(agentsRecoveryPaused()).toBe(true);
+    expect(swarmRunning()).toBe(false);
+    expect(durableRecoveryIncidents('agents')).toContainEqual(
+      expect.objectContaining({ ledger: SWARM_STATE, failure: 'schema_invalid', disposition: 'pause' })
+    );
+  });
+
   it('keeps agents paused when both swarm copies are malformed', async () => {
     await fs.mkdir(path.dirname(primary(SWARM_STATE)), { recursive: true });
     await fs.writeFile(primary(SWARM_STATE), '{"version":', 'utf8');
