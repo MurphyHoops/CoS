@@ -74,7 +74,17 @@ import {
   repairGoalObjectiveProjectionNow,
   repairGoalSwitchProjectionNow,
 } from '../goal.js';
-import { writeDurableNow, writeDurableSoon } from '../durable.js';
+import {
+  readDurableResult,
+  writeDurableCheckpointNow,
+  writeDurableNow,
+  writeDurableSoon
+} from '../durable.js';
+import {
+  durableRecoveryPaused,
+  noteDurableRecoveryIncident,
+  resolveDurableRecoveryIncident
+} from '../durable-recovery.js';
 import { prepareHandoff, resumeBootstrapMatches } from './handoff.js';
 import { ensureHandoffRecorded, recordHandoff, recordNote } from './recorder.js';
 import { publishSessionRebindProjection } from './rebind.js';
@@ -163,6 +173,13 @@ export interface ContinuationDestinationCheckpoint extends ContinuationSendCheck
   /** Chat B, learned from the page that contains the marked bootstrap message. */
   conversationId: string | null;
 }
+
+const SEND_STATES = new Set<ContinuationSendState>([
+  'not-attempted',
+  'attempted-unresolved',
+  'dispatched-unresolved',
+  'sent'
+]);
 
 /**
  * True while the fence still proves no prompt was submitted, so the prompt may be handed to
@@ -273,6 +290,11 @@ const openingBySession = new Map<string, Promise<ContinuationView>>();
 const commitLocks = new Map<string, { to: string; promise: Promise<ContinuationCommitResult> }>();
 const checkpointLocks = new Map<string, Promise<unknown>>();
 export const CONTINUATIONS_STATE = 'continuations';
+const CONTINUATION_RECOVERY_DOMAIN = 'continuation' as const;
+export const CONTINUATION_RECOVERY_REFUSAL =
+  'DURABLE_RECOVERY_PAUSED: the Compact & Resume transaction ledger could not be read safely, so CoS ' +
+  'cannot prove whether a source chat, replacement claim, or Send checkpoint still owns the handoff. ' +
+  'No local tool was run. Resolve the durable recovery incident before continuing this transition.';
 const RESUME_SHADOW_COLLISION = 'the replacement chat already belongs to another local session';
 
 interface ContinuationRecord {
@@ -319,6 +341,63 @@ export interface ContinuationSnapshot {
 
 /** Start of the current provider-unavailable interval for continuation waiting budgets. */
 let transportPausedAt: ContinuationSnapshot['transportPausedAt'] = null;
+
+export function continuationRecoveryPaused(): boolean {
+  return durableRecoveryPaused(CONTINUATION_RECOVERY_DOMAIN);
+}
+
+function assertContinuationWritable(): void {
+  if (continuationRecoveryPaused()) throw new Error('continuation_durable_recovery_required');
+}
+
+function validStoredConversation(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 256;
+}
+
+function validStoredId(value: unknown, max: number): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= max;
+}
+
+function validOptionalFinite(value: unknown): boolean {
+  return value === undefined || (typeof value === 'number' && Number.isFinite(value));
+}
+
+function validOptionalNullableFinite(value: unknown): boolean {
+  return value === undefined || value === null || (typeof value === 'number' && Number.isFinite(value));
+}
+
+function validSendCheckpoint(value: unknown, destination: boolean, from: string): boolean {
+  if (value === undefined) return true;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as { state?: unknown; messageId?: unknown; conversationId?: unknown };
+  if (!SEND_STATES.has(raw.state as ContinuationSendState)) return false;
+  const state = raw.state as ContinuationSendState;
+  const messageOk = state === 'sent'
+    ? validStoredId(raw.messageId, 200)
+    : raw.messageId === null;
+  if (!messageOk) return false;
+  if (!destination) return raw.conversationId === undefined;
+  if (state === 'sent') {
+    return validStoredConversation(raw.conversationId) && raw.conversationId !== from;
+  }
+  return raw.conversationId === null;
+}
+
+function noteContinuationRecovery(
+  copy: 'primary' | 'backup',
+  failure: 'json_corrupt' | 'schema_invalid' | 'io_error' | 'checkpoint_degraded' | 'orphan_backup',
+  disposition: 'pause' | 'degraded',
+  detail?: string
+): void {
+  noteDurableRecoveryIncident({
+    domain: CONTINUATION_RECOVERY_DOMAIN,
+    ledger: CONTINUATIONS_STATE,
+    copy,
+    failure,
+    disposition,
+    detail
+  });
+}
 
 function durableRecord(entry: Continuation): ContinuationRecord {
   return {
@@ -368,12 +447,137 @@ export function snapshotContinuations(): ContinuationSnapshot {
   return snapshotWith();
 }
 
+function decodeContinuationSnapshot(value: unknown): ContinuationSnapshot | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as {
+    version?: unknown;
+    savedAt?: unknown;
+    entries?: unknown;
+    transportPausedAt?: unknown;
+  };
+  if (raw.version !== 1 ||
+      typeof raw.savedAt !== 'number' || !Number.isFinite(raw.savedAt) ||
+      !Array.isArray(raw.entries) ||
+      !validOptionalNullableFinite(raw.transportPausedAt)) return null;
+
+  const tokens = new Set<string>();
+  const openSessions = new Set<string>();
+  const openSources = new Set<string>();
+  for (const candidate of raw.entries) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+    const row = candidate as Record<string, unknown>;
+    const token = row.token;
+    const sessionId = row.sessionId;
+    const from = row.from;
+    const state = row.state;
+    const terminal = state === 'committed' || state === 'aborted';
+    if (!validStoredId(token, 64) || !/^[A-Za-z0-9_-]{16,64}$/.test(token) ||
+        !validStoredId(sessionId, 64) || !/^[0-9a-z-]{8,64}$/i.test(sessionId) ||
+        !validStoredConversation(from) ||
+        !['awaiting-summary', 'awaiting-chat', 'claimed', 'committing', 'committed', 'aborted'].includes(String(state)) ||
+        typeof row.openedAt !== 'number' || !Number.isFinite(row.openedAt) ||
+        typeof row.summary !== 'string' || row.summary.length > 512 * 1024 ||
+        !(row.handoffId === null || validStoredId(row.handoffId, 200)) ||
+        !(row.claimedBy === null || validStoredId(row.claimedBy, 500)) ||
+        !(row.error === null || typeof row.error === 'string') ||
+        !(row.sourceTurnId === undefined || row.sourceTurnId === null || validStoredId(row.sourceTurnId, 256)) ||
+        !validOptionalFinite(row.touchedAt) ||
+        !validOptionalFinite(row.deadlineTouchedAt) ||
+        !(row.sourceProgress === undefined ||
+          (Number.isSafeInteger(row.sourceProgress) && Number(row.sourceProgress) >= 0 && Number(row.sourceProgress) <= 4_000_000)) ||
+        !(row.automatic === undefined || typeof row.automatic === 'boolean') ||
+        !validOptionalNullableFinite(row.askedAt) ||
+        !validOptionalNullableFinite(row.deadlineAskedAt) ||
+        !(row.project === undefined || row.project === null || typeof row.project === 'string') ||
+        !(row.armed === undefined || typeof row.armed === 'boolean') ||
+        !validSendCheckpoint(row.sourceSend, false, from) ||
+        !validSendCheckpoint(row.destinationSend, true, from)) {
+      return null;
+    }
+
+    const to = row.to;
+    if (state === 'committing' || state === 'committed') {
+      if (!validStoredConversation(to) || to === from) return null;
+    } else if (state !== 'aborted' && to !== null) {
+      return null;
+    } else if (state === 'aborted' && !(to === null || (validStoredConversation(to) && to !== from))) {
+      return null;
+    }
+
+    // The handoff payload and id were part of the state machine from its first durable version:
+    // capturing the brief publishes both before state leaves awaiting-summary. Losing either one
+    // in a later phase is not a legacy omission; it destroys the transaction's B-side payload or
+    // provenance and must pause the whole ledger instead of restoring a hollow authority row.
+    if (state === 'awaiting-summary') {
+      if (row.handoffId !== null || row.summary !== '') return null;
+    } else if (state !== 'aborted') {
+      if (!validStoredId(row.handoffId, 200) || typeof row.summary !== 'string' || row.summary.trim() === '') return null;
+    }
+
+    const destination = row.destinationSend as ContinuationDestinationCheckpoint | undefined;
+    if (state === 'awaiting-summary' && destination && destination.state !== 'not-attempted') return null;
+    if (destination?.state === 'sent' && validStoredConversation(to) && destination.conversationId !== to) return null;
+    if (tokens.has(token)) return null;
+    tokens.add(token);
+
+    if (!terminal) {
+      if (openSessions.has(sessionId) || openSources.has(from)) return null;
+      openSessions.add(sessionId);
+      openSources.add(from);
+    }
+  }
+
+  return raw as ContinuationSnapshot;
+}
+
+async function inspectContinuationBackupHealth(): Promise<'missing' | 'valid' | 'invalid'> {
+  const result = await readDurableResult<unknown>(CONTINUATIONS_STATE, 'backup');
+  if (result.kind === 'missing') {
+    resolveDurableRecoveryIncident(CONTINUATION_RECOVERY_DOMAIN, CONTINUATIONS_STATE, 'backup');
+    return 'missing';
+  }
+  if (result.kind === 'io_error') {
+    noteContinuationRecovery('backup', 'io_error', 'degraded', result.error);
+    return 'invalid';
+  }
+  if (result.kind === 'corrupt') {
+    noteContinuationRecovery('backup', 'json_corrupt', 'degraded', result.error);
+    return 'invalid';
+  }
+  if (!decodeContinuationSnapshot(result.value)) {
+    noteContinuationRecovery('backup', 'schema_invalid', 'degraded',
+      'backup snapshot failed continuation WAL schema validation');
+    return 'invalid';
+  }
+  resolveDurableRecoveryIncident(CONTINUATION_RECOVERY_DOMAIN, CONTINUATIONS_STATE, 'backup');
+  return 'valid';
+}
+
+async function checkpointAcceptedContinuation(value: ContinuationSnapshot): Promise<void> {
+  try {
+    await writeDurableCheckpointNow(CONTINUATIONS_STATE, value);
+    resolveDurableRecoveryIncident(CONTINUATION_RECOVERY_DOMAIN, CONTINUATIONS_STATE, 'backup');
+  } catch (error) {
+    noteContinuationRecovery(
+      'backup',
+      'checkpoint_degraded',
+      'degraded',
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+}
+
+async function commitContinuationSnapshotNow(value: ContinuationSnapshot): Promise<void> {
+  await writeDurableNow(CONTINUATIONS_STATE, value);
+  await checkpointAcceptedContinuation(value);
+}
+
 function changed(): void {
   writeDurableSoon(CONTINUATIONS_STATE, snapshotContinuations());
 }
 
 async function changedNow(): Promise<void> {
-  await writeDurableNow(CONTINUATIONS_STATE, snapshotContinuations());
+  await commitContinuationSnapshotNow(snapshotContinuations());
 }
 
 function transportBudgetNow(now = Date.now()): number {
@@ -381,12 +585,14 @@ function transportBudgetNow(now = Date.now()): number {
 }
 
 export async function pauseContinuationTransportNow(now = Date.now()): Promise<void> {
+  if (continuationRecoveryPaused()) return;
   if (typeof transportPausedAt === 'number') return;
   transportPausedAt = now;
   await changedNow();
 }
 
 export async function resumeContinuationTransportNow(now = Date.now()): Promise<void> {
+  if (continuationRecoveryPaused()) return;
   if (typeof transportPausedAt !== 'number') return;
   const pausedAt = transportPausedAt;
   transportPausedAt = null;
@@ -449,6 +655,7 @@ async function transitionNow(
   entry: Continuation,
   derive: (current: ContinuationRecord) => ContinuationRecord
 ): Promise<ContinuationRecord> {
+  assertContinuationWritable();
   const current = durableRecord(entry);
   const next = derive(current);
   // Any semantic transition is forward progress, so it renews the waiting deadline. Without this
@@ -463,7 +670,7 @@ async function transitionNow(
     // Persist the proposed semantic state before publishing it into the live transaction.
     // If the durable boundary rejects, callers still see the previous state and can retry or
     // abort safely instead of inheriting a half-published `committing`/handoff transition.
-    await writeDurableNow(CONTINUATIONS_STATE, snapshotWith(entry.token, next));
+    await commitContinuationSnapshotNow(snapshotWith(entry.token, next));
   } catch (err) {
     // writeDurableNow deliberately preserves a failed generation for retry. This staged
     // transaction rejected that generation, so supersede it with the still-authoritative
@@ -583,6 +790,7 @@ const isOpen = (entry: Continuation): boolean =>
 
 /** Provider-ready source-writing deadline; captured manual handoffs are durable opening debt. */
 export function continuationProviderDeadlineAt(token: string): number | null {
+  if (continuationRecoveryPaused()) return null;
   const entry = byToken.get(token);
   if (!entry || entry.state === 'committed' || entry.state === 'aborted') return null;
   if (entry.automatic) {
@@ -594,10 +802,12 @@ export function continuationProviderDeadlineAt(token: string): number | null {
 
 /** Provider-ready anchor for the durable source-send phase, used only by browser pickup scheduling. */
 export function continuationProviderAskedAt(token: string): number | null {
+  if (continuationRecoveryPaused()) return null;
   return byToken.get(token)?.deadlineAskedAt ?? null;
 }
 
 function sweep(): void {
+  if (continuationRecoveryPaused()) return;
   for (const entry of [...byToken.values()]) {
     // A commit in flight is never swept. It holds a frozen prime handover and an in-flight
     // durable write, and expiring it here would let any passing lookup abort a transaction
@@ -622,6 +832,7 @@ function sweep(): void {
 
 /** The open continuation for a session, if there is one. */
 export function continuationForSession(sessionId: string): ContinuationView | null {
+  if (continuationRecoveryPaused()) return null;
   sweep();
   for (const entry of byToken.values()) {
     if (entry.sessionId === sessionId && isOpen(entry)) return view(entry);
@@ -630,6 +841,7 @@ export function continuationForSession(sessionId: string): ContinuationView | nu
 }
 
 export function continuationByToken(token: string): ContinuationView | null {
+  if (continuationRecoveryPaused()) return null;
   sweep();
   const entry = byToken.get(token);
   return entry ? view(entry) : null;
@@ -647,7 +859,7 @@ export function continuationByToken(token: string): ContinuationView | null {
  * waits on the WAL for its next pickup with the chat working normally in between.
  */
 export function compactingConversation(conversationId: string | null | undefined): ContinuationView | null {
-  if (!conversationId) return null;
+  if (continuationRecoveryPaused() || !conversationId) return null;
   sweep();
   for (const entry of byToken.values()) {
     if (entry.from !== conversationId || !isOpen(entry)) continue;
@@ -658,6 +870,7 @@ export function compactingConversation(conversationId: string | null | undefined
 
 /** Whether any chat is currently being compacted — the cheap gate in front of the above. */
 export function anyContinuationOpen(): boolean {
+  if (continuationRecoveryPaused()) return false;
   for (const entry of byToken.values()) {
     if (isOpen(entry)) return true;
   }
@@ -673,6 +886,7 @@ export function anyContinuationOpen(): boolean {
  * a chat the user reopens later on purpose is left alone.
  */
 export function supersededSourceConversations(): string[] {
+  if (continuationRecoveryPaused()) return [];
   sweep();
   const out = new Set<string>();
   for (const entry of byToken.values()) {
@@ -683,6 +897,7 @@ export function supersededSourceConversations(): string[] {
 
 /** Compaction tickets still owed a real A -> B commit. */
 export function pendingContinuations(): ContinuationView[] {
+  if (continuationRecoveryPaused()) return [];
   sweep();
   return [...byToken.values()].filter(isOpen).map(view);
 }
@@ -706,7 +921,7 @@ export function pendingContinuations(): ContinuationView[] {
  * the user made after landing here.
  */
 export async function repairPrimeFromResumeShadow(conversationId: string): Promise<boolean> {
-  if (!conversationId) return false;
+  if (continuationRecoveryPaused() || !conversationId) return false;
   // A resume shadow is prime/solo history. Even otherwise convincing old provenance must never
   // move Goal/workspace into a conversation the broker knows belongs to a worker.
   const targetOwner = agentForOwnedConversation(conversationId);
@@ -879,6 +1094,7 @@ export async function openContinuationNow(
   automatic = false,
   project: string | null = null
 ): Promise<ContinuationView> {
+  assertContinuationWritable();
   sweep();
   const existing = [...byToken.values()].find((entry) => entry.sessionId === sessionId && isOpen(entry));
   if (existing) return view(existing);
@@ -895,7 +1111,7 @@ export async function openContinuationNow(
       entry.requestedModel = requestedModel(source.selectedModel);
     }
     try {
-      await writeDurableNow(CONTINUATIONS_STATE, snapshotWith(entry.token, durableRecord(entry)));
+      await commitContinuationSnapshotNow(snapshotWith(entry.token, durableRecord(entry)));
     } catch (err) {
       // Rejecting the staged open must supersede durable.ts's retained failed generation,
       // otherwise its retry could resurrect a token the bridge never returned to the page.
@@ -907,7 +1123,7 @@ export async function openContinuationNow(
       // trying to own replacement. A losing claim is erased before this function returns and,
       // most importantly, before any caller may open/focus a browser replacement.
       try {
-        await writeDurableNow(CONTINUATIONS_STATE, snapshotContinuations());
+        await commitContinuationSnapshotNow(snapshotContinuations());
       } catch {
         writeDurableSoon(CONTINUATIONS_STATE, snapshotContinuations());
       }
@@ -927,6 +1143,7 @@ export async function openContinuationNow(
 }
 
 async function withCheckpointLock<T>(token: string, work: () => Promise<T>): Promise<T> {
+  assertContinuationWritable();
   const prior = checkpointLocks.get(token);
   if (prior) await prior.catch(() => undefined);
   const current = work();
@@ -1093,6 +1310,7 @@ export async function dispatchContinuationDestinationSendNow(token: string): Pro
  * message or a cancel resolves it. Released, the brief may be offered to a fresh chat again.
  */
 export function continuationClaimedBy(token: string, claimant: string): boolean {
+  if (continuationRecoveryPaused()) return false;
   return byToken.get(token)?.claimedBy === claimant;
 }
 
@@ -1194,6 +1412,7 @@ async function capture(
   text: string,
   produce: (entry: Continuation) => Promise<Handoff>
 ): Promise<Handoff | null> {
+  assertContinuationWritable();
   sweep();
   const entry = byToken.get(token);
   if (!entry) return null;
@@ -1293,6 +1512,7 @@ async function settle(entry: Continuation, capture: Promise<Handoff>): Promise<H
  * document until the WAL records which claimant owns it.
  */
 export async function claimContinuationNow(token: string, claimant: string): Promise<{ summary: string } | null> {
+  assertContinuationWritable();
   sweep();
   const entry = byToken.get(token);
   if (!entry || !isOpen(entry)) return null;
@@ -1618,6 +1838,9 @@ export async function commitContinuationResult(
   token: string,
   toConversationId: string
 ): Promise<ContinuationCommitResult> {
+  if (continuationRecoveryPaused()) {
+    return { status: 'retryable', reason: 'continuation durable recovery is required before commit' };
+  }
   sweep();
   const entry = byToken.get(token);
   if (!entry) return { status: 'rejected', reason: 'the continuation no longer exists' };
@@ -1655,6 +1878,7 @@ export async function commitContinuation(token: string, toConversationId: string
  * commit either succeeds, or restores a claimable state itself and can be aborted then.
  */
 export function abortContinuation(token: string, reason: string): boolean {
+  if (continuationRecoveryPaused()) return false;
   const entry = byToken.get(token);
   if (!entry || entry.state === 'committing') return false;
   if (entry.state === 'committed' || entry.state === 'aborted') return false;
@@ -1697,14 +1921,6 @@ export async function abortContinuationNow(token: string, reason: string): Promi
   return true;
 }
 
-const SEND_STATES = new Set<ContinuationSendState>([
-  'not-attempted',
-  'attempted-unresolved',
-  'dispatched-unresolved',
-  'sent'
-]);
-
-
 /**
  * Restores open continuation transactions after the agent/session projections are loaded.
  *
@@ -1713,9 +1929,13 @@ const SEND_STATES = new Set<ContinuationSendState>([
  * names A, the move did not land and the transaction becomes claimable again. Any third
  * identity is quarantined as aborted rather than guessed across chats.
  */
-export async function restoreContinuations(snapshot: ContinuationSnapshot | null): Promise<void> {
+export async function restoreContinuations(snapshot: ContinuationSnapshot | null): Promise<boolean> {
   byToken.clear();
-  if (!snapshot || snapshot.version !== 1 || !Array.isArray(snapshot.entries)) return;
+  transportPausedAt = null;
+  if (!snapshot) return true;
+  const decoded = decodeContinuationSnapshot(snapshot);
+  if (!decoded) return false;
+  snapshot = decoded;
   const now = Date.now();
   const persistedPauseAt = typeof snapshot.transportPausedAt === 'number' && Number.isFinite(snapshot.transportPausedAt)
     ? snapshot.transportPausedAt
@@ -1730,7 +1950,7 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
     'committed',
     'aborted'
   ]);
-  for (const raw of snapshot.entries.slice(0, 32)) {
+  for (const raw of snapshot.entries) {
     if (!raw) continue;
     // Source-writing retention scales with the same deadline as the live sweep. Captured
     // manual handoffs are different: they are durable opening debt and therefore have no
@@ -1953,10 +2173,70 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
   try {
     await changedNow();
   } catch (err) {
-    // Broken recovery state must not prevent the whole app from opening. New commits still
-    // require an immediate durable write and therefore continue to fail closed.
-    logWarn(`continuation recovery could not persist its repaired snapshot: ${err instanceof Error ? err.message : String(err)}`);
+    const detail = err instanceof Error ? err.message : String(err);
+    noteContinuationRecovery('primary', 'io_error', 'pause', detail);
+    logWarn(`continuation recovery could not persist its repaired snapshot: ${detail}`);
+    return false;
   }
+  return true;
+}
+
+export async function restoreContinuationsDurableState(): Promise<void> {
+  const primary = await readDurableResult<unknown>(CONTINUATIONS_STATE);
+  if (primary.kind === 'missing') {
+    await restoreContinuations(null);
+    const backup = await inspectContinuationBackupHealth();
+    if (backup === 'missing') {
+      resolveDurableRecoveryIncident(CONTINUATION_RECOVERY_DOMAIN, CONTINUATIONS_STATE, 'primary');
+      return;
+    }
+    noteContinuationRecovery(
+      'primary',
+      'orphan_backup',
+      'pause',
+      'primary continuation WAL is missing while recovery evidence still exists'
+    );
+    return;
+  }
+  if (primary.kind === 'io_error') {
+    await restoreContinuations(null);
+    noteContinuationRecovery('primary', 'io_error', 'pause', primary.error);
+    await inspectContinuationBackupHealth();
+    return;
+  }
+  if (primary.kind === 'corrupt') {
+    await restoreContinuations(null);
+    noteContinuationRecovery('primary', 'json_corrupt', 'pause', primary.error);
+    await inspectContinuationBackupHealth();
+    return;
+  }
+
+  const decoded = decodeContinuationSnapshot(primary.value);
+  if (!decoded) {
+    await restoreContinuations(null);
+    noteContinuationRecovery(
+      'primary',
+      'schema_invalid',
+      'pause',
+      'primary snapshot failed continuation WAL schema validation'
+    );
+    await inspectContinuationBackupHealth();
+    return;
+  }
+
+  if (!(await restoreContinuations(decoded))) {
+    if (!continuationRecoveryPaused()) {
+      noteContinuationRecovery(
+        'primary',
+        'schema_invalid',
+        'pause',
+        'validated continuation WAL could not complete owner recovery'
+      );
+    }
+    await inspectContinuationBackupHealth();
+    return;
+  }
+  resolveDurableRecoveryIncident(CONTINUATION_RECOVERY_DOMAIN, CONTINUATIONS_STATE, 'primary');
 }
 
 /** Test seam. */

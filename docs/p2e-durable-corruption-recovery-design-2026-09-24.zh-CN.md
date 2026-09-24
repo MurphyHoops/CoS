@@ -104,7 +104,9 @@ coordinator 不直接调用 `restoreGoal*`、`restoreSwarm` 等，也不跨文�
 5. 恢复成功后先把安全 candidate 重新 durable，再发布 live state。
 
 不能满足上述条件时：保持 primary 原样作为 forensic evidence，owner 进入 recovery pause。
-用户可以看到原因，但系统不得自行“清空并继续”。## 6. Failure matrix
+用户可以看到原因，但系统不得自行“清空并继续”。
+
+## 6. Failure matrix
 
 | Failure | Rebuildable cache | Authority ledger | Backup handling | Required outcome |
 | --- | --- | --- | --- | --- |
@@ -158,7 +160,7 @@ coordinator 不直接调用 `restoreGoal*`、`restoreSwarm` 等，也不跨文�
 
 ## 10. 已实现的 owner 策略
 
-当前独立分支已经接入两个 authority owner：
+当前独立分支已经接入三个 authority owner：
 
 - **blocked-chats / blocked-tools**：primary 必须整份 schema-valid；corrupt、I/O failure、
   schema-invalid、以及 primary missing + backup surviving 都进入全域工具 recovery pause。
@@ -166,6 +168,10 @@ coordinator 不直接调用 `restoreGoal*`、`restoreSwarm` 等，也不跨文�
 - **long-run**：primary 必须完整证明 execution epoch、work obligation、wait contract 的 lineage
   与 state consistency；损坏时 runtime polling、broker UUID delivery、execution ticket、
   MCP handler 与所有 mutation 都 fail closed。
+- **continuation**：Compact & Resume WAL 先整份校验再发布；truncated/malformed、schema-invalid、
+  primary missing + surviving backup、I/O failure 都进入 `continuation` recovery pause，backup 只作
+  evidence，不自动复活 A→B transaction。`awaiting-chat/claimed/committing/committed` 必须保有
+  durable handoff id 与非空 brief；不可能的 Send identity、重复 open session/source authority 整份拒绝。
 
 Long-Run 明确保留旧字段兼容：缺失 `sourceRequestId`、`providerBudgetAt`、
 `completionCheckClaimedAt`、`providerKey/providerData` 按既有保守语义归一化。
@@ -179,5 +185,10 @@ validator 会验证其时间/lineage 后丢弃这些历史行，而不是把合�
 Stop 仍保持最高优先级：Long-Run recovery pause 不允许新执行，但也不能阻断 session/browser/
 self-healing 的 Stop 撤权链。Long-Run 自身无法持久化取消时只记录告警，并继续保持 recovery pause。
 
+Continuation recovery pause 同时冻结 owner mutation、MCP handler、Compact/Resume browser redeem/ACK、
+自动 compaction、Goal/silence browser repair、Emergency Resume、tab reuse/close 与 attribution retry budget。
+已存在的 resume browser command 只作为 inert custody 保留：restart/TTL 不删除，恢复前也不打开、
+不 redeem、不 ACK、不重新 Send。普通 Stop 和与 continuation 无关的显式撤权仍保持可执行。
+
 尚未接入 owner schema/pause 的关键账本仍包括 Goal 三账本、swarm/retired-workers、
-continuations、session-input 与 bridge-commands；后续按同一原则逐 owner 推进，不共享 mutation authority。
+session-input 与 bridge-commands；后续按同一原则逐 owner 推进，不共享 mutation authority。

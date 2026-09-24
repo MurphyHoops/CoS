@@ -57,10 +57,9 @@ import {
   type GoalSwitchesSnapshot
 } from './goal.js';
 import {
-  CONTINUATIONS_STATE,
-  restoreContinuations,
-  setContinuationRecoveryHooks,
-  type ContinuationSnapshot
+  continuationRecoveryPaused,
+  restoreContinuationsDurableState,
+  setContinuationRecoveryHooks
 } from './session/continuation.js';
 import { reconcileSelfHealingAfterRestart } from './session/self-healing.js';
 import { restoreLongRunDurableState } from './session/long-run.js';
@@ -395,9 +394,7 @@ void app.whenReady().then(async () => {
   setContinuationRecoveryHooks({
     repairPrimeTransfer: repairPrimeConversationAfterRecoveryNow
   });
-  const savedContinuations = await readDurable<ContinuationSnapshot>(CONTINUATIONS_STATE);
-  if (windowActivation.isDisabled()) return;
-  await restoreContinuations(savedContinuations);
+  await restoreContinuationsDurableState();
   if (windowActivation.isDisabled()) return;
 
   // Self-healing recovery owns MCP admission as well as browser delivery. Rebuild every durable
@@ -405,7 +402,7 @@ void app.whenReady().then(async () => {
   // Connect action or auto-connect can start the Core server. Doing this only inside bridge
   // command restore leaves a startup window where old chat A is still the durable attachment and
   // can issue one more local mutation before its recovery fence exists.
-  await reconcileSelfHealingAfterRestart();
+  if (!continuationRecoveryPaused()) await reconcileSelfHealingAfterRestart();
   if (windowActivation.isDisabled()) return;
 
   // Strict CSP for our own page. There is no remote content and no inline script.

@@ -93,7 +93,12 @@ import {
   blockedChatRecoveryPaused,
   isChatBlocked
 } from '../session/blocked-chats.js';
-import { anyContinuationOpen, compactingConversation } from '../session/continuation.js';
+import {
+  CONTINUATION_RECOVERY_REFUSAL,
+  anyContinuationOpen,
+  compactingConversation,
+  continuationRecoveryPaused
+} from '../session/continuation.js';
 import {
   LONG_RUN_RECOVERY_REFUSAL,
   anyLongRunWaitActive,
@@ -580,7 +585,8 @@ async function dispatchTracked(
   const isFinish = isFinishCall(name, args);
   const blockedLedgerRecovery = blockedChatRecoveryPaused();
   const longRunLedgerRecovery = longRunRecoveryPaused();
-  const durableControlRecovery = blockedLedgerRecovery || longRunLedgerRecovery;
+  const continuationLedgerRecovery = continuationRecoveryPaused();
+  const durableControlRecovery = blockedLedgerRecovery || longRunLedgerRecovery || continuationLedgerRecovery;
   const startedAt = context.startedAt;
   // Cheap, non-blocking ingress identity. When the page has already reported this exact
   // request id, identity-sensitive handlers (workspace/session/agents) see it before they
@@ -812,6 +818,8 @@ async function dispatchTracked(
         ? Promise.resolve(fail(BLOCKED_CHAT_RECOVERY_REFUSAL))
         : longRunLedgerRecovery
         ? Promise.resolve(fail(LONG_RUN_RECOVERY_REFUSAL))
+        : continuationLedgerRecovery
+        ? Promise.resolve(fail(CONTINUATION_RECOVERY_REFUSAL))
         : blockedChat
         ? Promise.resolve(fail(BLOCKED_CHAT_REFUSAL))
         : recoveringConversation

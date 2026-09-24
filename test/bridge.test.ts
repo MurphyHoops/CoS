@@ -479,6 +479,96 @@ beforeEach(async () => {
   token = null;
 });
 
+describe('continuation durable recovery bridge fence', () => {
+  it('does not create a new Compact, resume carrier, or Emergency Resume while continuation WAL authority is paused', async () => {
+    const compactChat = 'd0d00001-1111-4111-8111-111111111111';
+    const resumeChat = 'd0d00002-1111-4111-8111-111111111111';
+    const compact = await createSession({ title: 'paused compact', conversationId: compactChat });
+    const resume = await createSession({ title: 'paused resume', conversationId: resumeChat });
+    const resumeToken = await readyContinuation(resume.id, 'carry this handoff', resumeChat);
+
+    noteDurableRecoveryIncident({
+      domain: 'continuation',
+      ledger: 'continuations',
+      failure: 'schema_invalid',
+      disposition: 'pause'
+    });
+
+    await expect(compactSession(compact.id)).rejects.toThrow('continuation_durable_recovery_required');
+    expect(queueResume(resume.id, resumeToken)).toBeNull();
+    expect(await queueEmergencyResume(compact.id, compactChat, 'episode-paused-continuation')).toBeNull();
+    expect(pendingCommands().filter((entry) => entry.what.startsWith('resume:'))).toEqual([]);
+    expect(opened).toEqual([]);
+  });
+
+  it('makes every reported open page non-discardable while continuation authority is unreadable', async () => {
+    await pair();
+    const chats = [
+      'd0d00004-1111-4111-8111-111111111111',
+      'd0d00005-1111-4111-8111-111111111111'
+    ];
+    noteDurableRecoveryIncident({
+      domain: 'continuation',
+      ledger: 'continuations',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    const status = (await request('POST', '/status', { body: { openConversations: chats } })).body;
+
+    expect(status.managedConversations).toEqual(chats);
+    expect(status.nonDiscardableConversations).toEqual(chats);
+    expect(status.reusableConversations).toEqual([]);
+    expect(status.retiredConversations).toEqual([]);
+    expect(status.closableConversations).toEqual([]);
+  });
+
+  it('restores an existing resume carrier as inert custody and does not open or redeem it while paused', async () => {
+    await pair();
+    const conversationId = 'd0d00003-1111-4111-8111-111111111111';
+    const session = await createSession({ title: 'queued resume before pause', conversationId });
+    const resumeToken = await readyContinuation(session.id, 'resume custody survives restart', conversationId);
+
+    publishProviderTransportStatus({
+      ...connectedTransport,
+      state: 'offline',
+      detail: 'fixture outage',
+      handshakeAt: null
+    });
+    const queued = queueResume(session.id, resumeToken);
+    expect(queued).not.toBeNull();
+    await flushDurable();
+    const commandId = queued!.id;
+
+    resetBridgeForTests();
+    setBrowserOpener(async (url) => { opened.push(url); });
+    noteDurableRecoveryIncident({
+      domain: 'continuation',
+      ledger: 'continuations',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    await restoreCommands();
+    expect(pendingCommands()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: commandId, what: `resume:${session.id}` })
+    ]));
+
+    publishProviderTransportStatus({ ...connectedTransport, handshakeAt: Date.now() });
+    await flushBridgeTransportRecoveryForTests();
+    expect(opened).toEqual([]);
+
+    const redeemPaused = await request('POST', '/commands/redeem', {
+      body: { id: commandId, client: 'paused-resume-page' }
+    });
+    expect(redeemPaused.status).toBe(503);
+    expect(redeemPaused.body).toMatchObject({ error: 'continuation_recovery_required', retryable: true });
+    expect(pendingCommands()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: commandId, what: `resume:${session.id}` })
+    ]));
+  });
+});
+
 // ------------------------------------------------------------------ origin
 
 describe('direct browser control over the paired bridge', () => {
