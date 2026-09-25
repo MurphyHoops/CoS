@@ -5996,8 +5996,13 @@
     }
     for (const [key, record] of streamRootsByKey) {
       if (seenStreamKeys.has(key)) continue;
-      if (Date.now() - record.completeAt >= REPLACEMENT_GRACE_MS ||
-          ![...record.chunks.values(), ...record.anchors].some(node => node.isConnected)) releaseRoot(key);
+      // React can detach the entire assistant section one mutation before mounting its
+      // completion replacement. During that gap every chunk/anchor is disconnected, but the
+      // exact call-id remount bridge above still needs this record in order to preserve native
+      // disclosure identity/open state. Keep unseen records only for the existing bounded
+      // replacement grace; strict call/website identity gates any reclaim, and expiry still
+      // retires both connected and detached stale presentation.
+      if (Date.now() - record.completeAt >= REPLACEMENT_GRACE_MS) releaseRoot(key);
     }
     renderRepairNotices(sourceTurns);
     restorePresentationViewport(viewportAnchor);

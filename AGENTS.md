@@ -21,7 +21,7 @@ changed lines before applying an older patch. Document the work and its actual v
 the code currently does it. Known implementation gaps are collected in §21 instead of being
 mixed into the happy path as features.
 
-Canonical source: **MurphyHoops/CoS**, independent runtime line, **2026-09-21**. App/extension **3.1.3**,
+Canonical source: **MurphyHoops/CoS**, independent runtime line, **2026-09-21**. App/extension **3.1.4**,
 bridge protocol **15** in the checked declarations (`package.json`, `src/main/version.ts`,
 `extension/manifest.json`). This does not prove release, installation or live Chrome behavior.
 
