@@ -14,6 +14,7 @@ vi.mock('electron', () => ({
 }));
 
 const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
+const { initDurableStore, resetDurableForTests } = await import('../src/main/durable.js');
 const { initSecretsPath, setSecret } = await import('../src/main/secrets.js');
 const {
   appendEvent,
@@ -52,6 +53,7 @@ beforeAll(async () => {
   initConfigPath(dir);
   initSecretsPath(dir);
   initSessionStore(dir);
+  initDurableStore(dir);
 });
 
 beforeEach(async () => {
@@ -73,6 +75,7 @@ afterEach(() => {
 
 afterAll(async () => {
   resetSessionStoreForTests();
+  resetDurableForTests();
   await removeTempDir(dir);
   globalThis.fetch = realFetch;
 });

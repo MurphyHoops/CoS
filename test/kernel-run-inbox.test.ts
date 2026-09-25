@@ -18,7 +18,13 @@ vi.mock('../src/main/session/recorder.js', async (original) => ({
 vi.mock('../src/main/session/store.js', async (original) => ({
   ...await original<typeof import('../src/main/session/store.js')>(), conversationAttachment: async () => 'current'
 }));
-vi.mock('../src/main/session/input.js', () => ({ offerToolInput: async () => ({ messages: [], reminder: '' }), acknowledgeToolInput: async () => undefined, TOOL_INPUT_HEADER: '\n--- New instructions from the user ---\n' }));
+vi.mock('../src/main/session/input.js', () => ({
+  INPUT_RECOVERY_REFUSAL: 'input recovery paused',
+  inputRecoveryPaused: () => false,
+  offerToolInput: async () => ({ messages: [], reminder: '' }),
+  acknowledgeToolInput: async () => undefined,
+  TOOL_INPUT_HEADER: '\n--- New instructions from the user ---\n'
+}));
 import { createRegistrar, dispatch, ok } from '../src/main/mcp/kernel.js';
 import { currentCall } from '../src/main/mcp/call-context.js';
 import { withInboundRequestId } from '../src/main/mcp/inbound.js';
