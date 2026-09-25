@@ -22,6 +22,7 @@ import path from 'node:path';
 import sharp from 'sharp';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { effectiveCapabilities, defaultConfig } from '../src/main/config.js';
+import { initDurableStore } from '../src/main/durable.js';
 import { lastRequestAt, selfTestHeaders, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from '../src/main/mcp/server.js';
 import { lastToolCallAt, type ToolContext } from '../src/main/mcp/tools.js';
 import { friendlyError } from '../src/main/mcp/kernel.js';
@@ -251,6 +252,7 @@ beforeAll(async () => {
   // default now, so without a directory of its own the recorder wrote session folders
   // into the process's working directory — which for a test run is the repository.
   initSessionStore(base);
+  initDurableStore(base);
   approved = path.join(base, 'workspace');
   outside = path.join(base, 'private');
   await writeTree(approved, {
