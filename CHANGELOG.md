@@ -15,6 +15,17 @@ self-reloads once when it sees a newer expected build. Existing ChatGPT tabs are
 that reload; a normal page refresh is sufficient if a tab still shows stale UI. Manual
 chrome://extensions reload remains the fallback only for an intentionally different unpacked path.
 
+## [3.1.5] — 2026-09-26
+
+### Packaging integrity and Windows ARM release stability
+
+- Prevented locally packaged apps from silently omitting MCP runtime dependencies when `node_modules` is a symlinked tree: release packaging now requires a real checkout-local dependency tree produced by `npm ci`.
+- Added `@modelcontextprotocol/core` as an explicit runtime dependency and extended the native packaged-runtime smoke to load `@modelcontextprotocol/server`, catching the exact `Cannot find module '@modelcontextprotocol/core/internal'` startup failure before installation or publication.
+- Fixed the Windows ARM publish verification flake exposed by the failed 3.1.4 candidate: the background-focus test now tolerates only the hosted runner's exact stale-window disappearance between enumeration and capture, while preserving failure for every other error.
+- Bumped app and companion to **3.1.5**; bridge protocol remains **15**.
+
+See [the 3.1.5 release notes](docs/release-notes/v3.1.5.md).
+
 ## [3.1.4] — 2026-09-25
 
 ### Cross-platform release hardening

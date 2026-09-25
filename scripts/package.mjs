@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { lstatSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeArch, normalizePlatform, PLATFORM_INFO } from './packaging-targets.mjs';
@@ -11,6 +12,18 @@ function value(name, fallback) {
   if (direct) return direct.slice(name.length + 3);
   const index = args.indexOf(`--${name}`);
   return index >= 0 ? args[index + 1] : fallback;
+}
+
+const nodeModules = path.join(root, 'node_modules');
+let nodeModulesStat;
+try {
+  nodeModulesStat = lstatSync(nodeModules);
+} catch (error) {
+  if (error?.code === 'ENOENT') throw new Error('Packaging requires a local node_modules tree. Run npm ci in this checkout first.');
+  throw error;
+}
+if (nodeModulesStat.isSymbolicLink()) {
+  throw new Error('Packaging refuses a symlinked node_modules tree because electron-builder can omit transitive runtime dependencies. Run npm ci in this checkout first.');
 }
 
 const platform = normalizePlatform(value('platform', process.platform));

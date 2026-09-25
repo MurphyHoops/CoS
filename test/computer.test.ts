@@ -82,7 +82,17 @@ describe.runIf(IS_WINDOWS)('desktop helper', () => {
     const background = windows.find((window) => window.id !== before.id && window.state !== 'minimized');
     if (!background) return;
 
-    const shot = await screenshot({ window: background.id, maxWidth: 320 });
+    let shot;
+    try {
+      shot = await screenshot({ window: background.id, maxWidth: 320 });
+    } catch (error) {
+      // Hosted Windows runners can close transient shell windows between enumeration and
+      // capture. Production is correct to reject that stale HWND; this case only asserts that a
+      // still-live background capture never steals foreground focus.
+      const message = error instanceof Error ? error.message : String(error);
+      if (/WINDOW_NOT_FOUND|No window with that id is open/i.test(message)) return;
+      throw error;
+    }
     expect(['window', 'screen_fallback']).toContain(shot.captureMode);
     expect((await activeWindow()).window?.id).toBe(before.id);
   });

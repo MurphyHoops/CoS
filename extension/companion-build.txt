@@ -1,1 +1,1 @@
-cos-3.1.4-companion-autorefresh-v1
+cos-3.1.5-companion-autorefresh-v1
