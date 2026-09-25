@@ -44,7 +44,7 @@ const TIMED_OUT = 'the app took too long to answer';
 /** Bumped only when the request/response shape changes; the app compares it. */
 const BRIDGE_PROTOCOL = 15;
 /** Must match companion-build.txt; packaging/tests enforce this release identity. */
-const COMPANION_BUILD_ID = 'cos-3.1.1-companion-diagnostics-v1';
+const COMPANION_BUILD_ID = 'cos-3.1.2-companion-diagnostics-v1';
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a

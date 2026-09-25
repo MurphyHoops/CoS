@@ -6,6 +6,7 @@ import type { LongRunSnapshot } from '../src/main/session/long-run.js';
 
 const mocks = vi.hoisted(() => ({
   runCommand: vi.fn(),
+  locateGitHubCli: vi.fn(),
   getConfig: vi.fn(),
   effectiveCapabilities: vi.fn(),
   loadSessionProjectRuntimeProfile: vi.fn(),
@@ -27,6 +28,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('../src/main/exec.js', () => ({ runCommand: mocks.runCommand }));
+vi.mock('../src/main/github-cli.js', () => ({ locateGitHubCli: mocks.locateGitHubCli }));
 vi.mock('../src/main/config.js', () => ({
   getConfig: mocks.getConfig,
   effectiveCapabilities: mocks.effectiveCapabilities
@@ -107,6 +109,7 @@ beforeEach(async () => {
   initDurableStore(directory);
 
   mocks.transportReady = true;
+  mocks.locateGitHubCli.mockReturnValue('/opt/homebrew/bin/gh');
   mocks.getConfig.mockReturnValue({ multiAgent: { enabled: true } });
   mocks.effectiveCapabilities.mockReturnValue({ command: true, read: true, metadata: true });
   mocks.loadSessionProjectRuntimeProfile.mockResolvedValue(null);
@@ -413,7 +416,7 @@ describe('local long-run supervisor', () => {
     await pollLongRunRuntime(wait.nextCheckAt + 1);
 
     expect(mocks.runCommand).toHaveBeenCalledWith(
-      'gh',
+      '/opt/homebrew/bin/gh',
       ['run', 'view', '123456', '--repo', 'MurphyHoops/UEOT', '--json', 'status,conclusion'],
       expect.any(String),
       10_000

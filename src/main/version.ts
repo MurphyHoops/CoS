@@ -12,9 +12,9 @@
  * extension does nothing" into a diagnosable mismatch.
  */
 
-export const APP_VERSION = '3.1.1';
+export const APP_VERSION = '3.1.2';
 /** Opaque companion release identity. Must match extension/background.js and companion-build.txt. */
-export const COMPANION_BUILD_ID = 'cos-3.1.1-companion-diagnostics-v1';
+export const COMPANION_BUILD_ID = 'cos-3.1.2-companion-diagnostics-v1';
 
 /**
  * Standalone extension recovery must stay on the app's own release. Using GitHub's moving
