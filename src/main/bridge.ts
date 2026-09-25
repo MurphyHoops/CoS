@@ -9042,6 +9042,21 @@ async function deliverOne(): Promise<void> {
   }
   const claimedAt = Date.now();
   if (!(await persistCommandLease(command, null, claimedAt))) return;
+  // Persisting the lease is an await boundary. A bridge reset/restart, transport suspension, or
+  // recovery pause can become authoritative while that fsync is in flight. Re-check the live
+  // owner before the first browser side effect so an old delivery continuation cannot outlive
+  // the command set or authority generation that selected it.
+  const deliveryStillCurrent = (): boolean =>
+    commands.includes(command) &&
+    !browserCommandRecoveryPaused() &&
+    !providerTransportUnavailable() &&
+    !((command.spec.type === 'worker' || command.spec.type === 'revive') && agentsRecoveryPaused()) &&
+    !((command.spec.type === 'resume' || command.spec.type === 'recovery') && providerReplacementRecoveryPaused());
+  if (!deliveryStillCurrent()) return;
+  // Recovery validity itself crosses durable session state, so close the same TOCTOU window once
+  // more after that await before opening a replacement executor.
+  if (command.spec.type === 'recovery' && !(await recoveryCommandCurrent(command.spec))) return;
+  if (!deliveryStillCurrent()) return;
   armDeadline(command);
   changed();
   // The recorder can see a brand-new ChatGPT conversation before that page's content script has

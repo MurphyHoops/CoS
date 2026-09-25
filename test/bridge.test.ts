@@ -465,11 +465,15 @@ beforeEach(async () => {
   // The swarm goes first: ending a run queues stop notices into the chats of any workers
   // still live, and those would otherwise be dropped into the queue the bridge reset had
   // just emptied — the previous test's cleanup showing up as the next test's first command.
+  // Clear test-only recovery incidents before that cleanup. `resetSwarm()` is deliberately
+  // fail-closed while agents authority is paused, so leaving the prior case's synthetic pause
+  // installed here would make the fixture cleanup itself a no-op and leak broker authority into
+  // the next case.
+  resetDurableRecoveryForTests();
   resetSwarm();
   resetBridgeForTests();
   publishProviderTransportStatus(connectedTransport);
   resetLongRunStateForTests();
-  resetDurableRecoveryForTests();
   opened.length = 0;
   anonymousRedeemIndex = 0;
   // The app opens the chat itself, always: there is no queue for a tab to come and ask.
@@ -576,6 +580,54 @@ describe('continuation durable recovery bridge fence', () => {
 });
 
 describe('agents durable recovery bridge fence', () => {
+  it('does not open a worker if agent authority pauses while its browser lease fsync is in flight', async () => {
+    await pair();
+    const durable = await import('../src/main/durable.js');
+    const originalWrite = durable.writeDurableNow;
+    const gate = faultGate();
+    let heldLease = false;
+    let leasePersisted!: () => void;
+    const persisted = new Promise<void>((resolve) => { leasePersisted = resolve; });
+    const write = vi.spyOn(durable, 'writeDurableNow').mockImplementation(async (name, value) => {
+      const leasedWorker = name === BRIDGE_COMMANDS_STATE &&
+        (value as any)?.commands?.some((row: any) => row?.spec?.type === 'worker' && row?.phase === 'leased');
+      if (!heldLease && leasedWorker) {
+        heldLease = true;
+        await gate.hold();
+        try { return await originalWrite(name, value); }
+        finally { leasePersisted(); }
+      }
+      return originalWrite(name, value);
+    });
+
+    try {
+      const started = spawn({ caller: { conversationId: 'agent-lease-race-prime' }, workers: [{ task: 'lease race custody' }] });
+      await gate.entered;
+      expect(opened).toEqual([]);
+
+      noteDurableRecoveryIncident({
+        domain: 'agents',
+        ledger: 'swarm',
+        failure: 'json_corrupt',
+        disposition: 'pause'
+      });
+      expect(agentsRecoveryPaused()).toBe(true);
+
+      gate.release();
+      await persisted;
+      await flushDurable();
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      expect(opened).toEqual([]);
+      expect(pendingCommands()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ what: `worker:${started.runId}:worker-1` })
+      ]));
+    } finally {
+      gate.release();
+      write.mockRestore();
+    }
+  });
+
   it('does not create new worker bootstrap or revival carriers while agent authority is paused', () => {
     const prime = { conversationId: 'agent-pause-prime' };
     const started = spawn({ caller: prime, workers: [{ task: 'first assignment' }] });
