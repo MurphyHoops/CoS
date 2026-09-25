@@ -7,21 +7,24 @@ const repo = process.cwd();
 describe('runtime multi-agent enable regression', () => {
   it('wires persistence before unconditional restore and preserves history while disabled', async () => {
     const source = await readFile(path.join(repo, 'src/main/index.ts'), 'utf8');
-    const persistSink = source.indexOf('onSwarmPersistNow((snapshot) => writeDurableNow(SWARM_STATE, snapshot))');
-    const restoreRead = source.indexOf('const savedSwarm = await readDurable<SwarmSnapshot>(SWARM_STATE)');
+    const persistSink = source.indexOf('onSwarmPersistNow(async (snapshot) => {');
+    const persistWrite = source.indexOf('await writeDurableNow(SWARM_STATE, snapshot);', persistSink);
+    const restoreRead = source.indexOf('const agentsRestored = await restoreAgentAuthorityState()');
+    const checkpoint = source.indexOf('await checkpointAgentLedger(SWARM_STATE, snapshot);', persistSink);
     const shutdownFence = source.indexOf('if (windowActivation.isDisabled()) return;', restoreRead);
-    const restore = source.indexOf('restoreSwarm(savedSwarm)', restoreRead);
     const disabledPause = source.indexOf("pauseSwarmForDisable('multi-agent mode is disabled')");
 
     expect(persistSink).toBeGreaterThanOrEqual(0);
+    expect(persistWrite).toBeGreaterThanOrEqual(0);
     expect(restoreRead).toBeGreaterThanOrEqual(0);
+    expect(checkpoint).toBeGreaterThanOrEqual(0);
     expect(shutdownFence).toBeGreaterThanOrEqual(0);
-    expect(restore).toBeGreaterThanOrEqual(0);
     expect(disabledPause).toBeGreaterThanOrEqual(0);
-    expect(persistSink).toBeLessThan(restoreRead);
+    expect(persistSink).toBeLessThan(persistWrite);
+    expect(persistWrite).toBeLessThan(checkpoint);
+    expect(checkpoint).toBeLessThan(restoreRead);
     expect(restoreRead).toBeLessThan(shutdownFence);
-    expect(shutdownFence).toBeLessThan(restore);
-    expect(restore).toBeLessThan(disabledPause);
+    expect(shutdownFence).toBeLessThan(disabledPause);
     expect(source).not.toContain('await writeDurableNow(SWARM_STATE, null)');
   });
 });

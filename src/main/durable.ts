@@ -21,6 +21,15 @@ const WRITE_DELAY_MS = 300;
 const RETRY_MAX_MS = 5_000;
 
 let root = '';
+
+export type DurableCopy = 'primary' | 'backup';
+
+export type DurableReadResult<T> =
+  | { kind: 'missing' }
+  | { kind: 'valid'; value: T }
+  | { kind: 'corrupt'; reason: 'json'; error: string }
+  | { kind: 'io_error'; error: string; code?: string };
+
 interface PendingWrite {
   generation: number;
   value: unknown;
@@ -43,23 +52,38 @@ export function durableStoreReady(): boolean {
   return root !== '';
 }
 
-function fileFor(name: string): string {
+function fileFor(name: string, copy: DurableCopy = 'primary'): string {
   if (!/^[a-z0-9-]{1,40}$/.test(name)) throw new Error(`Invalid durable state name: ${name}`);
-  return path.join(root, `${name}.json`);
+  return path.join(root, `${name}${copy === 'backup' ? '.backup' : ''}.json`);
 }
 
-export async function readDurable<T>(name: string): Promise<T | null> {
-  if (!root) return null;
+/** Reads one durable copy without interpreting storage failure as authoritative emptiness. */
+export async function readDurableResult<T>(name: string, copy: DurableCopy = 'primary'): Promise<DurableReadResult<T>> {
+  if (!root) return { kind: 'io_error', error: 'durable store is not initialized' };
+  let raw: string;
   try {
-    const raw = await fs.readFile(fileFor(name), 'utf8');
-    return JSON.parse(raw) as T;
+    raw = await fs.readFile(fileFor(name, copy), 'utf8');
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    if (code && code !== 'ENOENT') {
-      logWarn(`could not read ${name} state: ${(err as Error).message}`);
-    }
-    return null;
+    if (code === 'ENOENT') return { kind: 'missing' };
+    const error = err instanceof Error ? err.message : String(err);
+    logWarn(`could not read ${name} ${copy} state: ${error}`);
+    return { kind: 'io_error', error, ...(code ? { code } : {}) };
   }
+  try {
+    return { kind: 'valid', value: JSON.parse(raw) as T };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logWarn(`could not parse ${name} ${copy} state: ${error}`);
+    return { kind: 'corrupt', reason: 'json', error };
+  }
+}
+
+/** Legacy nullable read for explicitly rebuildable/compatibility callers. */
+export async function readDurable<T>(name: string): Promise<T | null> {
+  if (!root) return null;
+  const result = await readDurableResult<T>(name);
+  return result.kind === 'valid' ? result.value : null;
 }
 
 function nextWrite(value: unknown): PendingWrite {
@@ -179,6 +203,33 @@ export async function writeDurableNow(name: string, value: unknown): Promise<voi
     scheduleRetry(name);
     throw err;
   }
+}
+
+/**
+ * Stores recovery evidence for a state generation whose primary commit already succeeded.
+ *
+ * This is deliberately not part of the control-transition ACK barrier. A checkpoint failure
+ * must not turn an already accepted primary mutation into a rejected one. Owners may retry the
+ * checkpoint independently; restore code must still treat it as evidence, never as authority.
+ */
+export async function writeDurableCheckpointNow(name: string, value: unknown): Promise<void> {
+  if (!root) return;
+  await enqueue(name, async () => {
+    const target = fileFor(name, 'backup');
+    const tmp = `${target}.tmp`;
+    try {
+      await fs.mkdir(root, { recursive: true });
+      if (value === null) {
+        await fs.rm(target, { force: true });
+      } else {
+        await fs.writeFile(tmp, JSON.stringify(value), 'utf8');
+        await fs.rename(tmp, target);
+      }
+    } catch (err) {
+      logWarn(`could not checkpoint ${name} state: ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
+  });
 }
 
 /** Writes everything queued right now. Called before the app quits, and by tests. */

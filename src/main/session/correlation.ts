@@ -24,7 +24,12 @@
  * landed in Unattributed activity. First proof wins, and it keeps winning.
  */
 
-import { readDurable, writeDurableSnapshotSoon } from '../durable.js';
+import { readDurableResult, writeDurableSnapshotSoon } from '../durable.js';
+import {
+  durableRecoveryPaused,
+  noteDurableRecoveryIncident,
+  resolveDurableRecoveryIncident
+} from '../durable-recovery.js';
 import { indexedSessions, readRecentEvents } from './store.js';
 
 export interface RequestCorrelation {
@@ -38,7 +43,12 @@ export interface RequestCorrelation {
 }
 
 const MAX_CORRELATIONS = 50_000;
-const CORRELATIONS_STATE = 'request-correlations';
+export const CORRELATIONS_STATE = 'request-correlations';
+export const CORRELATION_RECOVERY_REFUSAL =
+  'CORRELATION_DURABLE_RECOVERY_PAUSED: the durable request ownership registry could not be read safely, so CoS cannot prove which conversation/session owns this MCP request. No local tool was run.';
+export function correlationRecoveryPaused(): boolean {
+  return durableRecoveryPaused('correlation');
+}
 /**
  * 5 stores owners and nothing else, because an owner is now the only verdict there is.
  *
@@ -93,6 +103,7 @@ function snapshot(): PersistedCorrelations {
 }
 
 function persist(): void {
+  if (correlationRecoveryPaused()) return;
   writeDurableSnapshotSoon(CORRELATIONS_STATE, snapshot);
 }
 
@@ -126,17 +137,45 @@ function validCorrelation(value: unknown): value is RequestCorrelation {
   );
 }
 
-/**
- * The owner in a persisted row, whatever shape the version that wrote it used.
- *
- * Versions 3 and 4 wrapped it as `{ requestId, value, conflicted }`, where a row with no value
- * was a sticky contradiction. Version 5 stores the owner itself. A wrapper with no usable value
- * carries no owner and is simply dropped, which is all that forgetting an old conflict takes.
- */
-function storedOwner(raw: unknown): RequestCorrelation | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const value = 'value' in (raw as Record<string, unknown>) ? (raw as { value: unknown }).value : raw;
-  return validCorrelation(value) ? { ...value } : null;
+interface DecodedCorrelations {
+  version: number;
+  owners: RequestCorrelation[];
+}
+
+function decodePersistedCorrelations(value: unknown): DecodedCorrelations | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Partial<PersistedCorrelations>;
+  if (!Number.isSafeInteger(raw.version) || Number(raw.version) < 3 ||
+      Number(raw.version) > CORRELATIONS_STATE_VERSION || !Array.isArray(raw.entries)) return null;
+  if (raw.entries.length > MAX_CORRELATIONS) return null;
+
+  const requestIds = new Set<string>();
+  const owners: RequestCorrelation[] = [];
+  for (const entry of raw.entries) {
+    if (raw.version === 5) {
+      if (!validCorrelation(entry) || requestIds.has(entry.requestId)) return null;
+      requestIds.add(entry.requestId);
+      owners.push({ ...entry });
+      continue;
+    }
+
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+    const wrapper = entry as { requestId?: unknown; value?: unknown; conflicted?: unknown };
+    if (typeof wrapper.requestId !== 'string' || wrapper.requestId.length === 0 ||
+        wrapper.requestId.length > 200 || requestIds.has(wrapper.requestId) ||
+        typeof wrapper.conflicted !== 'boolean') return null;
+    requestIds.add(wrapper.requestId);
+
+    // v3/v4 explicitly persisted sticky conflict tombstones as value:null.
+    if (wrapper.value === null) continue;
+    if (!validCorrelation(wrapper.value) || wrapper.value.requestId !== wrapper.requestId) return null;
+    owners.push({ ...wrapper.value });
+  }
+  return { version: Number(raw.version), owners };
+}
+
+export function validateRequestCorrelationsSnapshot(value: unknown): boolean {
+  return decodePersistedCorrelations(value) !== null;
 }
 
 /**
@@ -197,17 +236,53 @@ export async function restoreRequestCorrelations(): Promise<void> {
 }
 
 async function restoreRequestCorrelationsOnce(): Promise<void> {
-
-  const saved = await readDurable<PersistedCorrelations>(CORRELATIONS_STATE);
+  const primary = await readDurableResult<unknown>(CORRELATIONS_STATE);
   let loaded = false;
-  if (saved && saved.version >= 3 && saved.version <= CORRELATIONS_STATE_VERSION && Array.isArray(saved.entries)) {
-    for (const raw of saved.entries.slice(-MAX_CORRELATIONS)) {
-      const owner = storedOwner(raw);
-      if (!owner) continue;
+  let savedVersion = CORRELATIONS_STATE_VERSION;
+
+  if (primary.kind === 'io_error') {
+    noteDurableRecoveryIncident({
+      domain: 'correlation',
+      ledger: CORRELATIONS_STATE,
+      failure: 'io_error',
+      disposition: 'pause',
+      detail: primary.error
+    });
+    return;
+  }
+  if (primary.kind === 'corrupt') {
+    noteDurableRecoveryIncident({
+      domain: 'correlation',
+      ledger: CORRELATIONS_STATE,
+      failure: 'json_corrupt',
+      disposition: 'pause',
+      detail: primary.error
+    });
+    return;
+  }
+  if (primary.kind === 'valid') {
+    const decoded = decodePersistedCorrelations(primary.value);
+    if (!decoded) {
+      noteDurableRecoveryIncident({
+        domain: 'correlation',
+        ledger: CORRELATIONS_STATE,
+        failure: 'schema_invalid',
+        disposition: 'pause',
+        detail: 'request-correlation primary failed owner schema validation'
+      });
+      return;
+    }
+    resolveDurableRecoveryIncident('correlation', CORRELATIONS_STATE, 'primary');
+    savedVersion = decoded.version;
+    for (const owner of decoded.owners) {
       merge(owner);
       loaded = true;
     }
     trim();
+  } else {
+    // First-run/legacy absence has no hidden owner row to preserve. Recorded exact request-id
+    // tool history is an independent proof source and may safely seed the new index.
+    resolveDurableRecoveryIncident('correlation', CORRELATIONS_STATE, 'primary');
   }
 
   // The durable index is a debounced snapshot, while attributed tool-call JSONL is appended
@@ -254,7 +329,7 @@ async function restoreRequestCorrelationsOnce(): Promise<void> {
   // Also when the snapshot on disk is an older version that held nothing usable: rewriting it
   // is what actually removes its conflict rows, and leaving them there would make every
   // later launch re-read a verdict this registry no longer has.
-  if (byRequest.size > 0 || loaded || (saved?.version ?? CORRELATIONS_STATE_VERSION) !== CORRELATIONS_STATE_VERSION) persist();
+  if (byRequest.size > 0 || loaded || savedVersion !== CORRELATIONS_STATE_VERSION) persist();
 }
 
 /**

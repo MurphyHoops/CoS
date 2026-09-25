@@ -27,6 +27,7 @@ import {
 } from './session/recorder.js';
 import {
   agentConversation,
+  agentsRecoveryPaused,
   bindConversation,
   onRetiredWorkersPersist,
   onRetiredWorkersPersistNow,
@@ -34,36 +35,24 @@ import {
   onSwarmPersistNow,
   pauseSwarmForDisable,
   repairPrimeConversationAfterRecoveryNow,
-  restoreRetiredWorkers,
-  restoreSwarm,
+  RETIRED_WORKERS_STATE,
   snapshotRetiredWorkers,
   snapshotSwarm,
-  type RetiredWorkersSnapshot,
-  type SwarmSnapshot
+  SWARM_STATE
 } from './agents.js';
-import { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
+import { checkpointAgentLedger, restoreAgentAuthorityState } from './agents-recovery.js';
+import { flushDurable, initDurableStore, writeDurableNow, writeDurableSoon } from './durable.js';
 import { restoreRequestCorrelations } from './session/correlation.js';
 import { restoreBlockedChats } from './session/blocked-chats.js';
 import { stopComputerHelper } from './computer/index.js';
+import { restoreGoalAuthorityState } from './goal-recovery.js';
 import {
-  GOAL_OBJECTIVES_STATE,
-  GOAL_REPLIES_STATE,
-  GOAL_SWITCHES_STATE,
-  restoreGoalObjectives,
-  restoreGoalReplies,
-  restoreGoalSwitches,
-  type GoalObjectivesSnapshot,
-  type GoalRepliesSnapshot,
-  type GoalSwitchesSnapshot
-} from './goal.js';
-import {
-  CONTINUATIONS_STATE,
-  restoreContinuations,
-  setContinuationRecoveryHooks,
-  type ContinuationSnapshot
+  continuationRecoveryPaused,
+  restoreContinuationsDurableState,
+  setContinuationRecoveryHooks
 } from './session/continuation.js';
 import { reconcileSelfHealingAfterRestart } from './session/self-healing.js';
-import { LONG_RUN_STATE, restoreLongRunState, type LongRunSnapshot } from './session/long-run.js';
+import { restoreLongRunDurableState } from './session/long-run.js';
 import { startLongRunRuntime, stopLongRunRuntime } from './session/long-run-runtime.js';
 import { runShutdownSequence } from './shutdown.js';
 import { applyStagedUpdate, startUpdateChecks } from './update.js';
@@ -82,9 +71,6 @@ import { trayGuidArgsForPlatform, trayImageSpec } from './tray-image.js';
 import { browserWindowIconPath } from './window-icon.js';
 import { editContextMenuTemplate } from './edit-context-menu.js';
 
-/** Durable state file holding the multi-agent run. Hashes only, never credentials. */
-const SWARM_STATE = 'swarm';
-const RETIRED_WORKERS_STATE = 'retired-workers';
 
 let window: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -321,18 +307,10 @@ void app.whenReady().then(async () => {
   // user choice instead of Electron's default `system` theme. On macOS this controls the window
   // frame, application menus and OS dialogs; on Linux/Windows it covers Electron-native UI.
   nativeTheme.themeSource = getConfig().ui.theme;
-  const savedGoalObjectives = await readDurable<GoalObjectivesSnapshot>(GOAL_OBJECTIVES_STATE);
+  await restoreGoalAuthorityState();
   if (windowActivation.isDisabled()) return;
-  restoreGoalObjectives(savedGoalObjectives);
-  const savedGoalSwitches = await readDurable<GoalSwitchesSnapshot>(GOAL_SWITCHES_STATE);
+  await restoreLongRunDurableState();
   if (windowActivation.isDisabled()) return;
-  restoreGoalSwitches(savedGoalSwitches);
-  const savedGoalReplies = await readDurable<GoalRepliesSnapshot>(GOAL_REPLIES_STATE);
-  if (windowActivation.isDisabled()) return;
-  restoreGoalReplies(savedGoalReplies);
-  const savedLongRun = await readDurable<LongRunSnapshot>(LONG_RUN_STATE);
-  if (windowActivation.isDisabled()) return;
-  restoreLongRunState(savedLongRun);
   // Request ownership must exist before either side of the bridge can race in. A request id
   // that was proved yesterday remains the same workflow today even if its ChatGPT tab closed.
   await restoreRequestCorrelations();
@@ -368,27 +346,37 @@ void app.whenReady().then(async () => {
   // dependency. Multi-agent can be enabled from Settings without restarting the process;
   // keeping both sinks wired from startup guarantees the first spawn can cross its durable
   // acceptance barrier even when this launch began with multi-agent disabled.
-  onSwarmPersist(() => writeDurableSoon(SWARM_STATE, snapshotSwarm()));
-  onSwarmPersistNow((snapshot) => writeDurableNow(SWARM_STATE, snapshot));
+  onSwarmPersist(() => {
+    if (!agentsRecoveryPaused()) writeDurableSoon(SWARM_STATE, snapshotSwarm());
+  });
+  onSwarmPersistNow(async (snapshot) => {
+    if (agentsRecoveryPaused()) throw new Error('agents_durable_recovery_required');
+    await writeDurableNow(SWARM_STATE, snapshot);
+    await checkpointAgentLedger(SWARM_STATE, snapshot);
+  });
 
   // A multi-agent run outlives this process. Restoring it before the bridge starts
   // means a worker that never joined gets its chat re-requested through the same queue
   // as a fresh one, rather than being stranded with a key nobody has.
-  onRetiredWorkersPersist(() => writeDurableSoon(RETIRED_WORKERS_STATE, snapshotRetiredWorkers()));
-  onRetiredWorkersPersistNow((snapshot) => writeDurableNow(RETIRED_WORKERS_STATE, snapshot));
-  const retiredWorkers = await readDurable<RetiredWorkersSnapshot>(RETIRED_WORKERS_STATE);
+  onRetiredWorkersPersist(() => {
+    if (!agentsRecoveryPaused()) writeDurableSoon(RETIRED_WORKERS_STATE, snapshotRetiredWorkers());
+  });
+  onRetiredWorkersPersistNow(async (snapshot) => {
+    if (agentsRecoveryPaused()) throw new Error('agents_durable_recovery_required');
+    await writeDurableNow(RETIRED_WORKERS_STATE, snapshot);
+    await checkpointAgentLedger(RETIRED_WORKERS_STATE, snapshot);
+  });
+  const agentsRestored = await restoreAgentAuthorityState();
   if (windowActivation.isDisabled()) return;
-  restoreRetiredWorkers(retiredWorkers);
-  const savedSwarm = await readDurable<SwarmSnapshot>(SWARM_STATE);
-  if (windowActivation.isDisabled()) return;
-  restoreSwarm(savedSwarm);
-  if (!getConfig().multiAgent.enabled) {
+  if (agentsRestored && !getConfig().multiAgent.enabled) {
     // A feature toggle is a pause, not Clear swarm. Canonicalize any active incarnation left by
     // a crash into stopped prime-owned history before the bridge exists, then make that safer
     // projection durable. Re-enabling later in this process or after another restart recovers the
     // same exact worker conversations without letting disabled workers consume execution slots.
     pauseSwarmForDisable('multi-agent mode is disabled');
-    await writeDurableNow(SWARM_STATE, snapshotSwarm());
+    const pausedSnapshot = snapshotSwarm();
+    await writeDurableNow(SWARM_STATE, pausedSnapshot);
+    await checkpointAgentLedger(SWARM_STATE, pausedSnapshot);
     if (windowActivation.isDisabled()) return;
   }
   // Continuation recovery is after swarm restore because an interrupted durable rebind may
@@ -396,9 +384,7 @@ void app.whenReady().then(async () => {
   setContinuationRecoveryHooks({
     repairPrimeTransfer: repairPrimeConversationAfterRecoveryNow
   });
-  const savedContinuations = await readDurable<ContinuationSnapshot>(CONTINUATIONS_STATE);
-  if (windowActivation.isDisabled()) return;
-  await restoreContinuations(savedContinuations);
+  await restoreContinuationsDurableState();
   if (windowActivation.isDisabled()) return;
 
   // Self-healing recovery owns MCP admission as well as browser delivery. Rebuild every durable
@@ -406,7 +392,7 @@ void app.whenReady().then(async () => {
   // Connect action or auto-connect can start the Core server. Doing this only inside bridge
   // command restore leaves a startup window where old chat A is still the durable attachment and
   // can issue one more local mutation before its recovery fence exists.
-  await reconcileSelfHealingAfterRestart();
+  if (!continuationRecoveryPaused()) await reconcileSelfHealingAfterRestart();
   if (windowActivation.isDisabled()) return;
 
   // Strict CSP for our own page. There is no remote content and no inline script.

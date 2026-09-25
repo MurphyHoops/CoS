@@ -48,6 +48,8 @@ const { safeStorage } = await import('electron');
 const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath, resetSecretsCacheForTests, setSecret } = await import('../src/main/secrets.js');
 const {
+  BRIDGE_COMMANDS_STATE,
+  browserCommandRecoveryPaused,
   bridgePort,
   bridgeStatus,
   flushBridgeTransportRecoveryForTests,
@@ -61,6 +63,8 @@ const {
   pendingCommands,
   queueEmergencyResume,
   queueResume,
+  queueWorkerBootstrap,
+  queueWorkerRevival,
   resetBridgeForTests,
   restoreCommands,
   resumeJobFor,
@@ -85,7 +89,8 @@ const {
   sweepStaleSwarm,
   unpair
 } = await import('../src/main/bridge.js');
-const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
+const { flushDurable, initDurableStore, readDurable, readDurableResult, writeDurableCheckpointNow, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
+const { durableRecoveryIncidents, noteDurableRecoveryIncident, resetDurableRecoveryForTests } = await import('../src/main/durable-recovery.js');
 const {
   GOAL_OBJECTIVES_STATE,
   GOAL_REPLIES_STATE,
@@ -123,6 +128,7 @@ const {
 const {
   acknowledgeOffers,
   agentInfoForOwnedConversation,
+  agentsRecoveryPaused,
   PRIME_ID,
   beginPrimeTransfer,
   commitPrimeTransfer,
@@ -459,6 +465,11 @@ beforeEach(async () => {
   // The swarm goes first: ending a run queues stop notices into the chats of any workers
   // still live, and those would otherwise be dropped into the queue the bridge reset had
   // just emptied — the previous test's cleanup showing up as the next test's first command.
+  // Clear test-only recovery incidents before that cleanup. `resetSwarm()` is deliberately
+  // fail-closed while agents authority is paused, so leaving the prior case's synthetic pause
+  // installed here would make the fixture cleanup itself a no-op and leak broker authority into
+  // the next case.
+  resetDurableRecoveryForTests();
   resetSwarm();
   resetBridgeForTests();
   publishProviderTransportStatus(connectedTransport);
@@ -473,8 +484,451 @@ beforeEach(async () => {
   resetRecorderForTests();
   writeDurableSoon('bridge-commands', null);
   await flushDurable();
+  await writeDurableCheckpointNow('bridge-commands', null);
   await setSecret('bridgeToken', '');
   token = null;
+});
+
+describe('continuation durable recovery bridge fence', () => {
+  it('does not create a new Compact, resume carrier, or Emergency Resume while continuation WAL authority is paused', async () => {
+    const compactChat = 'd0d00001-1111-4111-8111-111111111111';
+    const resumeChat = 'd0d00002-1111-4111-8111-111111111111';
+    const compact = await createSession({ title: 'paused compact', conversationId: compactChat });
+    const resume = await createSession({ title: 'paused resume', conversationId: resumeChat });
+    const resumeToken = await readyContinuation(resume.id, 'carry this handoff', resumeChat);
+
+    noteDurableRecoveryIncident({
+      domain: 'continuation',
+      ledger: 'continuations',
+      failure: 'schema_invalid',
+      disposition: 'pause'
+    });
+
+    await expect(compactSession(compact.id)).rejects.toThrow('continuation_durable_recovery_required');
+    expect(queueResume(resume.id, resumeToken)).toBeNull();
+    expect(await queueEmergencyResume(compact.id, compactChat, 'episode-paused-continuation')).toBeNull();
+    expect(pendingCommands().filter((entry) => entry.what.startsWith('resume:'))).toEqual([]);
+    expect(opened).toEqual([]);
+  });
+
+  it('makes every reported open page non-discardable while continuation authority is unreadable', async () => {
+    await pair();
+    const chats = [
+      'd0d00004-1111-4111-8111-111111111111',
+      'd0d00005-1111-4111-8111-111111111111'
+    ];
+    noteDurableRecoveryIncident({
+      domain: 'continuation',
+      ledger: 'continuations',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    const status = (await request('POST', '/status', { body: { openConversations: chats } })).body;
+
+    expect(status.managedConversations).toEqual(chats);
+    expect(status.nonDiscardableConversations).toEqual(chats);
+    expect(status.reusableConversations).toEqual([]);
+    expect(status.retiredConversations).toEqual([]);
+    expect(status.closableConversations).toEqual([]);
+  });
+
+  it('restores an existing resume carrier as inert custody and does not open or redeem it while paused', async () => {
+    await pair();
+    const conversationId = 'd0d00003-1111-4111-8111-111111111111';
+    const session = await createSession({ title: 'queued resume before pause', conversationId });
+    const resumeToken = await readyContinuation(session.id, 'resume custody survives restart', conversationId);
+
+    publishProviderTransportStatus({
+      ...connectedTransport,
+      state: 'offline',
+      detail: 'fixture outage',
+      handshakeAt: null
+    });
+    const queued = queueResume(session.id, resumeToken);
+    expect(queued).not.toBeNull();
+    await flushDurable();
+    const commandId = queued!.id;
+
+    resetBridgeForTests();
+    setBrowserOpener(async (url) => { opened.push(url); });
+    noteDurableRecoveryIncident({
+      domain: 'continuation',
+      ledger: 'continuations',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    await restoreCommands();
+    expect(pendingCommands()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: commandId, what: `resume:${session.id}` })
+    ]));
+
+    publishProviderTransportStatus({ ...connectedTransport, handshakeAt: Date.now() });
+    await flushBridgeTransportRecoveryForTests();
+    expect(opened).toEqual([]);
+
+    const redeemPaused = await request('POST', '/commands/redeem', {
+      body: { id: commandId, client: 'paused-resume-page' }
+    });
+    expect(redeemPaused.status).toBe(503);
+    expect(redeemPaused.body).toMatchObject({ error: 'continuation_recovery_required', retryable: true });
+    expect(pendingCommands()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: commandId, what: `resume:${session.id}` })
+    ]));
+  });
+});
+
+describe('agents durable recovery bridge fence', () => {
+  it('does not open a worker if agent authority pauses while its browser lease fsync is in flight', async () => {
+    await pair();
+    const durable = await import('../src/main/durable.js');
+    const originalWrite = durable.writeDurableNow;
+    const gate = faultGate();
+    let heldLease = false;
+    let leasePersisted!: () => void;
+    const persisted = new Promise<void>((resolve) => { leasePersisted = resolve; });
+    const write = vi.spyOn(durable, 'writeDurableNow').mockImplementation(async (name, value) => {
+      const leasedWorker = name === BRIDGE_COMMANDS_STATE &&
+        (value as any)?.commands?.some((row: any) => row?.spec?.type === 'worker' && row?.phase === 'leased');
+      if (!heldLease && leasedWorker) {
+        heldLease = true;
+        await gate.hold();
+        try { return await originalWrite(name, value); }
+        finally { leasePersisted(); }
+      }
+      return originalWrite(name, value);
+    });
+
+    try {
+      const started = spawn({ caller: { conversationId: 'agent-lease-race-prime' }, workers: [{ task: 'lease race custody' }] });
+      await gate.entered;
+      expect(opened).toEqual([]);
+
+      noteDurableRecoveryIncident({
+        domain: 'agents',
+        ledger: 'swarm',
+        failure: 'json_corrupt',
+        disposition: 'pause'
+      });
+      expect(agentsRecoveryPaused()).toBe(true);
+
+      gate.release();
+      await persisted;
+      await flushDurable();
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      expect(opened).toEqual([]);
+      expect(pendingCommands()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ what: `worker:${started.runId}:worker-1` })
+      ]));
+    } finally {
+      gate.release();
+      write.mockRestore();
+    }
+  });
+
+  it('does not create new worker bootstrap or revival carriers while agent authority is paused', () => {
+    const prime = { conversationId: 'agent-pause-prime' };
+    const started = spawn({ caller: prime, workers: [{ task: 'first assignment' }] });
+    expect(bindConversation('worker-1', 'agent-pause-worker', started.runId)).toBe(true);
+    finishAgent({ conversationId: 'agent-pause-worker' }, 'first assignment done');
+    stageMessages(prime, [{ to: 'worker-1', text: 'second assignment' }]).commit();
+    const revival = pendingWorkerRevivals()[0]!;
+    expect(revival).toBeTruthy();
+    const beforePause = pendingCommands().map((entry) => entry.id).sort();
+
+    noteDurableRecoveryIncident({
+      domain: 'agents',
+      ledger: 'swarm',
+      failure: 'schema_invalid',
+      disposition: 'pause'
+    });
+
+    expect(queueWorkerBootstrap('worker-1', 'must not open', null, null, started.runId)).toBeNull();
+    expect(queueWorkerRevival(
+      revival.id,
+      revival.conversationId,
+      revival.messageIds,
+      revival.runId
+    )).toBeNull();
+    expect(agentsRecoveryPaused()).toBe(true);
+    expect(pendingCommands().map((entry) => entry.id).sort()).toEqual(beforePause);
+  });
+
+  it('parks Compact, Resume, and Emergency Resume when agent identity authority is unreadable', async () => {
+    await pair();
+    const conversationId = 'agent-provider-pause-a';
+    const session = await createSession({ title: 'provider dependency pause', conversationId });
+    const resumeToken = await readyContinuation(session.id, 'provider replacement must wait for agents', conversationId);
+
+    noteDurableRecoveryIncident({
+      domain: 'agents',
+      ledger: 'swarm',
+      failure: 'schema_invalid',
+      disposition: 'pause'
+    });
+
+    await expect(compactSession(session.id)).rejects.toThrow('agents_durable_recovery_required');
+    expect(queueResume(session.id, resumeToken)).toBeNull();
+    expect(await queueEmergencyResume(session.id, conversationId, 'agents-paused-recovery')).toBeNull();
+    expect(pendingCommands().filter((entry) => entry.what.startsWith('resume:') || entry.what.startsWith('recovery:'))).toEqual([]);
+  });
+
+  it('keeps an existing resume carrier inert when only agents authority is paused', async () => {
+    await pair();
+    const conversationId = 'agent-provider-custody-a';
+    const session = await createSession({ title: 'resume custody under agents pause', conversationId });
+    const resumeToken = await readyContinuation(session.id, 'resume custody must not outrun swarm recovery', conversationId);
+
+    publishProviderTransportStatus({
+      ...connectedTransport,
+      state: 'offline',
+      detail: 'fixture outage',
+      handshakeAt: null
+    });
+    const queued = queueResume(session.id, resumeToken);
+    expect(queued).not.toBeNull();
+    await flushDurable();
+    const commandId = queued!.id;
+
+    resetBridgeForTests();
+    opened.length = 0;
+    setBrowserOpener(async (url) => { opened.push(url); });
+    noteDurableRecoveryIncident({
+      domain: 'agents',
+      ledger: 'retired-workers',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    await restoreCommands();
+    expect(pendingCommands()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: commandId, what: `resume:${session.id}` })
+    ]));
+
+    publishProviderTransportStatus({ ...connectedTransport, handshakeAt: Date.now() });
+    await flushBridgeTransportRecoveryForTests();
+    expect(opened).toEqual([]);
+
+    const redeemPaused = await request('POST', '/commands/redeem', {
+      body: { id: commandId, client: 'agents-paused-resume-page' }
+    });
+    expect(redeemPaused.status).toBe(503);
+    expect(redeemPaused.body).toMatchObject({ error: 'agents_recovery_required', retryable: true });
+    expect(pendingCommands()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: commandId, what: `resume:${session.id}` })
+    ]));
+  });
+
+  it('keeps an existing worker carrier inert across restart and refuses redeem while paused', async () => {
+    await pair();
+    const prime = { conversationId: 'agent-custody-prime' };
+    const started = spawn({ caller: prime, workers: [{ task: 'durable bootstrap custody' }] });
+
+    publishProviderTransportStatus({
+      ...connectedTransport,
+      state: 'offline',
+      detail: 'fixture outage',
+      handshakeAt: null
+    });
+    const queued = queueWorkerBootstrap('worker-1', 'durable bootstrap custody', null, null, started.runId);
+    expect(queued).not.toBeNull();
+    await flushDurable();
+    const commandId = queued!.id;
+
+    resetBridgeForTests();
+    opened.length = 0;
+    setBrowserOpener(async (url) => { opened.push(url); });
+    noteDurableRecoveryIncident({
+      domain: 'agents',
+      ledger: 'swarm',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    expect(agentsRecoveryPaused()).toBe(true);
+    await restoreCommands();
+    expect(agentsRecoveryPaused()).toBe(true);
+    expect(opened).toEqual([]);
+    expect(pendingCommands()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: commandId })
+    ]));
+
+    publishProviderTransportStatus({ ...connectedTransport, handshakeAt: Date.now() });
+    await flushBridgeTransportRecoveryForTests();
+    expect(opened).toEqual([]);
+
+    const redeemPaused = await request('POST', '/commands/redeem', {
+      body: { id: commandId, client: 'paused-worker-page' }
+    });
+    expect(redeemPaused.status).toBe(503);
+    expect(redeemPaused.body).toMatchObject({ error: 'agents_recovery_required', retryable: true });
+    expect(pendingCommands()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: commandId })
+    ]));
+  });
+});
+
+describe('bridge-command durable corruption recovery', () => {
+  const emptySnapshot = () => ({ version: 5 as const, commands: [], receipts: [] });
+  const durablePath = async (copy: 'primary' | 'backup' = 'primary') => {
+    const path = await import('node:path');
+    return path.join(dir, 'state', copy === 'primary' ? `${BRIDGE_COMMANDS_STATE}.json` : `${BRIDGE_COMMANDS_STATE}.backup.json`);
+  };
+
+  it('pauses on corrupt primary and never restores a valid backup as command authority', async () => {
+    const fs = await import('node:fs/promises');
+    const snapshot = emptySnapshot();
+    await writeDurableNow(BRIDGE_COMMANDS_STATE, snapshot);
+    await writeDurableCheckpointNow(BRIDGE_COMMANDS_STATE, snapshot);
+    await fs.writeFile(await durablePath(), '{"version":', 'utf8');
+
+    resetBridgeForTests();
+    await restoreCommands();
+
+    expect(browserCommandRecoveryPaused()).toBe(true);
+    expect(pendingCommands()).toEqual([]);
+    expect(durableRecoveryIncidents('browser-command')).toContainEqual(
+      expect.objectContaining({
+        ledger: BRIDGE_COMMANDS_STATE,
+        copy: 'primary',
+        failure: 'json_corrupt',
+        disposition: 'pause'
+      })
+    );
+    expect(await readDurableResult(BRIDGE_COMMANDS_STATE, 'backup')).toMatchObject({ kind: 'valid' });
+  });
+
+  it('keeps browser-command recovery paused when both durable copies are malformed', async () => {
+    const fs = await import('node:fs/promises');
+    await fs.mkdir((await import('node:path')).dirname(await durablePath()), { recursive: true });
+    await fs.writeFile(await durablePath(), '{"version":', 'utf8');
+    await fs.writeFile(await durablePath('backup'), '{"version":', 'utf8');
+
+    resetBridgeForTests();
+    await restoreCommands();
+
+    expect(browserCommandRecoveryPaused()).toBe(true);
+    expect(durableRecoveryIncidents('browser-command')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ copy: 'primary', failure: 'json_corrupt', disposition: 'pause' }),
+      expect.objectContaining({ copy: 'backup', failure: 'json_corrupt', disposition: 'degraded' })
+    ]));
+  });
+
+  it('rejects impossible leased evidence as whole-ledger schema corruption', async () => {
+    await writeDurableNow(BRIDGE_COMMANDS_STATE, {
+      version: 5,
+      commands: [{
+        id: 'bad-queued-claim',
+        spec: {
+          type: 'stop',
+          sessionId: 'session-bridge-command',
+          conversationId: 'cafe9001-0000-4000-8000-000000009001',
+          turnId: 'turn-one'
+        },
+        createdAt: Date.now(),
+        phase: 'queued',
+        claimedAt: Date.now(),
+        owner: 'page-that-cannot-own-a-queued-command',
+        lastError: null
+      }],
+      receipts: []
+    });
+
+    resetBridgeForTests();
+    await restoreCommands();
+
+    expect(browserCommandRecoveryPaused()).toBe(true);
+    expect(pendingCommands()).toEqual([]);
+    expect(durableRecoveryIncidents('browser-command')).toContainEqual(
+      expect.objectContaining({ copy: 'primary', failure: 'schema_invalid', disposition: 'pause' })
+    );
+  });
+
+  it('treats a missing command primary as an empty crash point and deletes stale backup evidence', async () => {
+    const stale = {
+      version: 5 as const,
+      commands: [{
+        id: 'stale-stop-command',
+        spec: {
+          type: 'stop' as const,
+          sessionId: 'session-stale-stop',
+          conversationId: 'cafe9002-0000-4000-8000-000000009002',
+          turnId: 'stale-turn'
+        },
+        createdAt: Date.now(),
+        phase: 'queued' as const,
+        claimedAt: null,
+        owner: null,
+        lastError: null
+      }],
+      receipts: []
+    };
+    await writeDurableCheckpointNow(BRIDGE_COMMANDS_STATE, stale);
+    expect(await readDurableResult(BRIDGE_COMMANDS_STATE)).toMatchObject({ kind: 'missing' });
+
+    resetBridgeForTests();
+    await restoreCommands();
+
+    expect(browserCommandRecoveryPaused()).toBe(false);
+    expect(pendingCommands()).toEqual([]);
+    expect(await readDurableResult(BRIDGE_COMMANDS_STATE, 'backup')).toMatchObject({
+      kind: 'valid',
+      value: expect.objectContaining({ version: 5, commands: [], receipts: [] })
+    });
+  });
+
+  it('keeps an existing carrier inert and refuses redeem or ACK while command authority is paused', async () => {
+    await pair();
+    const sourceChat = 'cafe9003-0000-4000-8000-000000009003';
+    const source = await createSession({ title: 'command custody', conversationId: sourceChat });
+    const continuation = await readyContinuation(source.id, 'retain command custody', sourceChat);
+
+    publishProviderTransportStatus({
+      ...connectedTransport,
+      state: 'offline',
+      detail: 'fixture outage',
+      handshakeAt: null
+    });
+    const command = queueResume(source.id, continuation);
+    expect(command).not.toBeNull();
+    opened.length = 0;
+
+    noteDurableRecoveryIncident({
+      domain: 'browser-command',
+      ledger: BRIDGE_COMMANDS_STATE,
+      failure: 'schema_invalid',
+      disposition: 'pause'
+    });
+
+    publishProviderTransportStatus({ ...connectedTransport, handshakeAt: Date.now() });
+    await flushBridgeTransportRecoveryForTests();
+    expect(opened).toEqual([]);
+    expect(pendingCommands()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: command!.id, what: `resume:${source.id}` })
+    ]));
+
+    const redeemPaused = await request('POST', '/commands/redeem', {
+      body: { id: command!.id, client: 'paused-command-page' }
+    });
+    expect(redeemPaused.status).toBe(503);
+    expect(redeemPaused.body).toMatchObject({ error: 'browser_command_recovery_required', retryable: true });
+
+    const ackPaused = await request('POST', '/commands/ack', {
+      body: {
+        id: command!.id,
+        client: 'paused-command-page',
+        status: 'sent',
+        conversationId: 'cafe9004-0000-4000-8000-000000009004'
+      }
+    });
+    expect(ackPaused.status).toBe(503);
+    expect(ackPaused.body).toMatchObject({ error: 'browser_command_recovery_required', retryable: true });
+    expect(pendingCommands()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: command!.id })
+    ]));
+  });
 });
 
 // ------------------------------------------------------------------ origin
@@ -921,6 +1375,40 @@ describe('observations', () => {
     await send([{ ...user, reaction: null }]);
     rows = await readEvents(first.body.sessionId, { kinds: ['user_message'] });
     expect(rows[0]).toMatchObject({ reaction: null, origin: before.seq });
+  });
+
+  it('keeps Stop observation processing alive while the long-run ledger is recovery-paused', async () => {
+    await pair();
+    const conversationId = 'f0f00003-1111-4111-8111-111111111120';
+    const opened = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [
+          { kind: 'user_message', time: Date.now(), text: 'start durable work', messageId: 'stop-pause-user' },
+          { kind: 'turn_start', time: Date.now(), turnId: 'stop-pause-turn' }
+        ]
+      }
+    });
+    expect(opened.status).toBe(200);
+    await ensureRecoveryWorkNow(opened.body.sessionId, conversationId, 'recovery:stop-pause');
+
+    noteDurableRecoveryIncident({
+      domain: 'long-run',
+      ledger: 'long-run',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    const stopped = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [{ kind: 'turn_end', time: Date.now(), turnId: 'stop-pause-turn', outcome: 'stopped' }]
+      }
+    });
+
+    expect(stopped.status).toBe(200);
+    const rows = await readEvents(opened.body.sessionId, { kinds: ['turn_end'] });
+    expect(rows).toContainEqual(expect.objectContaining({ turnId: 'stop-pause-turn', outcome: 'stopped' }));
   });
 
   it('refuses anything that is not a conversation id', async () => {
@@ -9905,6 +10393,31 @@ describe('the goal loop over the bridge', () => {
     });
     await setSecret('openRouterApiKey', 'sk-or-bridge');
     resetGoalStateForTests();
+  });
+
+  it('fails Goal draft and ACK side effects closed during Goal ledger recovery without blocking ordinary bridge status', async () => {
+    await pair();
+    noteDurableRecoveryIncident({
+      domain: 'goal',
+      ledger: 'goal-replies',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    const conversationId = 'cafe0080-0000-4000-8000-000000000080';
+    const drafted = await request('POST', '/goal/draft', {
+      body: { conversationId, turnId: 'goal-recovery-turn', clientId: 'goal-recovery-page' }
+    });
+    expect(drafted.status).toBe(503);
+    expect(drafted.body).toMatchObject({ error: 'goal_recovery_required', retryable: true });
+
+    const acked = await request('POST', '/goal/ack', {
+      body: { conversationId, token: 'goal-recovery-token', clientId: 'goal-recovery-page' }
+    });
+    expect(acked.status).toBe(503);
+    expect(acked.body).toMatchObject({ error: 'goal_recovery_required', retryable: true });
+
+    expect((await request('GET', '/status')).status).toBe(200);
   });
 
   it('advertises the configured Loop helper rather than the inactive API model', async () => {

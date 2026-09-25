@@ -69,6 +69,7 @@ import {
   goalProgressFor,
   goalDraftBusy,
   goalArmedFor,
+  goalRecoveryPaused,
   goalObjectiveFor,
   goalPendingReplyFor,
   goalReplySourceTurn,
@@ -128,6 +129,7 @@ import { briefShortfall, handoffPlanNotice, resumeBootstrapText } from './sessio
 import {
   PRIME_ID,
   agentConversation,
+  agentsRecoveryPaused,
   agentForConversation,
   agentInfoForOwnedConversation,
   primeForOwnedConversation,
@@ -183,6 +185,7 @@ import {
   continuationClaimedBy,
   commitContinuationResult,
   continuationByToken,
+  continuationRecoveryPaused,
   continuationProviderAskedAt,
   continuationForSession,
   pendingContinuations,
@@ -221,7 +224,12 @@ import {
   resumeSelfHealingTransportNow,
   resumeUnattemptedRecoveryAfterTransportNow
 } from './session/self-healing.js';
-import { readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
+import { readDurableResult, writeDurableCheckpointNow, writeDurableNow, writeDurableSoon } from './durable.js';
+import {
+  durableRecoveryPaused,
+  noteDurableRecoveryIncident,
+  resolveDurableRecoveryIncident
+} from './durable-recovery.js';
 import { APP_VERSION, BRIDGE_PROTOCOL, COMPANION_BUILD_ID } from './version.js';
 import { conversationHasMcpCallSince } from './session/store.js';
 import { sessionWorkingAt } from '../shared/session-activity.js';
@@ -331,7 +339,13 @@ export const REVIVAL_ACTIVITY_MS = REVIVAL_DEADLINE_MS + DETACHED_SILENCE_MS;
 const COMMAND_TTL_MS = 30 * 60_000;
 const MAX_COMMANDS = 20;
 const MAX_COMMAND_RECEIPTS = 64;
-const COMMANDS_STATE = 'bridge-commands';
+export const BRIDGE_COMMANDS_STATE = 'bridge-commands';
+const COMMANDS_STATE = BRIDGE_COMMANDS_STATE;
+export const BROWSER_COMMAND_RECOVERY_REFUSAL =
+  'BROWSER_COMMAND_DURABLE_RECOVERY_PAUSED: the durable browser-command ledger could not be read safely, so CoS cannot prove command custody, leases, or ACK receipts.';
+export function browserCommandRecoveryPaused(): boolean {
+  return durableRecoveryPaused('browser-command');
+}
 /**
  * Durable explicit-disconnect marker stored in the bridge credential slot itself.
  *
@@ -1671,8 +1685,26 @@ export async function setSessionAutomation(sessionId: string, automation: Sessio
   if (automation !== 'off') scheduleDeliver();
   return sessionControlsFor(sessionId);
 }
+function providerReplacementRecoveryError(): 'continuation_recovery_required' | 'agents_recovery_required' | 'browser_command_recovery_required' | null {
+  if (continuationRecoveryPaused()) return 'continuation_recovery_required';
+  if (agentsRecoveryPaused()) return 'agents_recovery_required';
+  if (browserCommandRecoveryPaused()) return 'browser_command_recovery_required';
+  return null;
+}
+
+function providerReplacementRecoveryPaused(): boolean {
+  return providerReplacementRecoveryError() !== null;
+}
+
+function assertProviderReplacementWritable(): void {
+  if (continuationRecoveryPaused()) throw new Error('continuation_durable_recovery_required');
+  if (agentsRecoveryPaused()) throw new Error('agents_durable_recovery_required');
+  if (browserCommandRecoveryPaused()) throw new Error('browser_command_recovery_required');
+}
+
 /** One ticket publication boundary shared by browser and app controls. */
 async function fileCompactionTicket(sessionId: string, id: string, automatic = false) {
+  assertProviderReplacementWritable();
   if (await controlledConversation(sessionId) !== id) throw new Error('conversation_changed');
   if (goalWorkerChat(id)) throw new Error('worker_compaction_disabled');
   if (isChatBlocked(id)) throw new Error('chat_blocked');
@@ -1703,7 +1735,7 @@ export async function cancelSessionCompaction(sessionId: string): Promise<Sessio
 
 /** A chat the loop may not drive — by role, or by the user's block. */
 function goalFencedChat(id: string): boolean {
-  return goalBlockReason(id) !== '';
+  return goalRecoveryPaused() || continuationRecoveryPaused() || agentsRecoveryPaused() || goalBlockReason(id) !== '';
 }
 
 function goalEnabledFor(id: string): boolean {
@@ -2853,6 +2885,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
       return json(res, 400, { error: 'bad_request' }, origin);
     }
+    const providerRecoveryError = providerReplacementRecoveryError();
+    if (providerRecoveryError) {
+      return json(res, 503, { error: providerRecoveryError, retryable: true }, origin);
+    }
     const checkpointToken = typeof body['token'] === 'string' ? body['token'] : '';
     const checkpoint = continuationByToken(checkpointToken);
     if (checkpoint?.automatic &&
@@ -3341,7 +3377,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         owner: null
       };
       try {
-        await writeDurableNow(COMMANDS_STATE, commandSnapshot({ commandOverride: { command, record } }));
+        await writeCommandLedgerNow(commandSnapshot({ commandOverride: { command, record } }));
       } catch (err) {
         // Session WAL already proves no native click occurred. Keep the old in-memory lease and
         // let startup recover the conservative disk row instead of publishing a re-open that was
@@ -3517,6 +3553,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const id = conversationId(body['conversationId']);
     const turnId = typeof body['turnId'] === 'string' ? body['turnId'].slice(0, 200) : '';
     const terminalRequired = body['terminalRequired'] === true;
+    if (goalRecoveryPaused()) {
+      return goalJson(res, 503, { error: 'goal_recovery_required', retryable: true }, origin);
+    }
     // The page asking is the pickup the owed-reply watchdog is waiting for, whatever the
     // provider then says. On 2026-09-02 OpenRouter answered ten drafts in a row with 429 and the
     // page retried every fifteen seconds, alive the whole time; the watchdog only saw a reply
@@ -3692,6 +3731,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     const id = conversationId(body['conversationId']);
     if (!id) return goalJson(res, 400, { error: 'bad_conversation_id' }, origin);
+    if (goalRecoveryPaused()) return goalJson(res, 503, { error: 'goal_recovery_required', retryable: true }, origin);
     const token = typeof body['token'] === 'string' ? body['token'] : '';
     const clientId = typeof body['clientId'] === 'string' ? body['clientId'].slice(0, 100) : '';
     try {
@@ -3993,6 +4033,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // no command text and acquires no owner/lease: it is only a freshness fence for recovery
   // markers that can outlive the command they once referred to.
   if (route === '/commands/revivals/pending' && req.method === 'POST') {
+    if (agentsRecoveryPaused()) return json(res, 503, { error: 'agents_recovery_required', retryable: true }, origin);
     let body: Record<string, unknown>;
     try {
       body = (await readBody(req)) as Record<string, unknown>;
@@ -4036,6 +4077,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
       return json(res, 400, { error: 'bad_request' }, origin);
     }
+    if (browserCommandRecoveryPaused()) {
+      return json(res, 503, { error: 'browser_command_recovery_required', retryable: true }, origin);
+    }
     tidyCommands();
     const wanted = typeof body['id'] === 'string' ? body['id'] : '';
     const client = typeof body['client'] === 'string' ? body['client'].slice(0, 64) : '';
@@ -4055,6 +4099,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // Current extension supplies a transaction owner stable across document reloads. A content
     // script from the immediately previous protocol may omit it; its one-document client remains
     // usable until that document dies, and a later stable marker still has to pass the WAL CAS.
+    if (command.spec.type === 'resume' || command.spec.type === 'recovery') {
+      const providerRecoveryError = providerReplacementRecoveryError();
+      if (providerRecoveryError) {
+        return json(res, 503, { error: providerRecoveryError, retryable: true }, origin);
+      }
+    }
+    if ((command.spec.type === 'worker' || command.spec.type === 'revive') && agentsRecoveryPaused()) {
+      return json(res, 503, { error: 'agents_recovery_required', retryable: true }, origin);
+    }
     const leaseOwner = command.spec.type === 'recovery' ? (recoveryOwner || client) : client;
     if (command.spec.type === 'recovery' && !(await recoveryCommandCurrent(command.spec))) {
       retire(command, 'its self-healing episode is no longer current');
@@ -4238,6 +4291,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
       return json(res, 400, { error: 'bad_request' }, origin);
     }
+    if (browserCommandRecoveryPaused()) {
+      return json(res, 503, { error: 'browser_command_recovery_required', retryable: true }, origin);
+    }
     const id = typeof body['id'] === 'string' ? body['id'] : '';
     // A protocol-1 extension sends no status and only ever acknowledges a success, so
     // a missing status still means "sent".
@@ -4259,6 +4315,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return json(res, 200, receiptReply(priorReceipt), origin);
     }
     const ownedCommand = commands.find((command) => command.id === id) ?? null;
+    if (ownedCommand?.spec.type === 'resume' || ownedCommand?.spec.type === 'recovery') {
+      const providerRecoveryError = providerReplacementRecoveryError();
+      if (providerRecoveryError) {
+        return json(res, 503, { error: providerRecoveryError, retryable: true }, origin);
+      }
+    }
+    if ((ownedCommand?.spec.type === 'worker' || ownedCommand?.spec.type === 'revive') && agentsRecoveryPaused()) {
+      return json(res, 503, { error: 'agents_recovery_required', retryable: true }, origin);
+    }
     // Every current page echoes its per-document client. If its command has already expired,
     // been cancelled or been superseded, accepting the late ACK as success strands a real
     // tab whose model can never be bound to the worker/session it was opened for. Legacy
@@ -4745,6 +4810,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
 /** Final action-boundary fence shared by every browser-mutating repair reason. */
 async function repairReasonCurrent(conversationId: string, repair: Repair): Promise<boolean> {
   if (repair.reason === 'goal') {
+    if (goalRecoveryPaused()) return false;
     const pickup = (await owedPickups(Date.now())).get(conversationId);
     const watch = goalWatch.get(conversationId);
     return !!pickup && !!watch && pickup.replyId === watch.replyId && Date.now() >= pickup.listenUntil &&
@@ -4886,6 +4952,7 @@ async function startEmergencyRecoveryForSpent(
   spent: readonly string[],
   now: number,
 ): Promise<{ recovering: string[]; fallback: string[] }> {
+  if (continuationRecoveryPaused() || agentsRecoveryPaused()) return { recovering: [...spent], fallback: [] };
   if (!getConfig().multiAgent.selfHealingSessions) return { recovering: [], fallback: [...spent] };
   const recovering: string[] = [];
   const fallback: string[] = [];
@@ -5625,10 +5692,11 @@ function commandSnapshot(options: {
 
 async function persistCommandsNow(): Promise<void> {
   if (commandWrites.size) await Promise.allSettled([...commandWrites.values()]);
-  await writeDurableNow(COMMANDS_STATE, commandSnapshot());
+  await writeCommandLedgerNow(commandSnapshot());
 }
 
 function persistCommands(): void {
+  if (browserCommandRecoveryPaused()) return;
   if (commandWrites.size) {
     // Never capture a stale full-ledger snapshot while a lease/receipt is staged.
     void Promise.allSettled([...commandWrites.values()]).then(() => persistCommands());
@@ -5668,7 +5736,7 @@ async function persistCommandLease(
       owner
     };
     try {
-      await writeDurableNow(COMMANDS_STATE, commandSnapshot({ commandOverride: { command, record } }));
+      await writeCommandLedgerNow(commandSnapshot({ commandOverride: { command, record } }));
     } catch (err) {
       // The staged lease did not become authoritative. Supersede durable.ts's retained failed
       // generation with the still-authoritative queued/current snapshot so a background retry
@@ -5840,7 +5908,7 @@ async function finalizeCommand(command: Command, receipt: CommandReceipt): Promi
     try {
       // The receipt and command retirement are one durable state transition. Publishing either
       // side in memory first recreates the lost-response ambiguity this tombstone exists to end.
-      await writeDurableNow(COMMANDS_STATE, commandSnapshot({ removeCommandId: command.id, addReceipt: receipt }));
+      await writeCommandLedgerNow(commandSnapshot({ removeCommandId: command.id, addReceipt: receipt }));
     } catch (err) {
       persistCommands();
       logWarn(`bridge: could not persist the final receipt for ${specKey(command.spec)} — ${err instanceof Error ? err.message : String(err)}`);
@@ -5856,6 +5924,7 @@ async function finalizeCommand(command: Command, receipt: CommandReceipt): Promi
 }
 
 function queue(spec: CommandSpec): Command {
+  if (browserCommandRecoveryPaused()) throw new Error('browser_command_recovery_required');
   const key = specKey(spec);
   const existing = commands.find((command) => specKey(command.spec) === key);
   if (existing) {
@@ -6083,6 +6152,7 @@ export function cancelResume(sessionId: string): boolean {
  * safe: restoreCommands refuses a resume whose authoritative continuation is already aborted.
  */
 export async function cancelResumeNow(sessionId: string): Promise<boolean> {
+  if (continuationRecoveryPaused()) return false;
   const token = sessionTokens.get(sessionId);
   const entry = token ? continuationByToken(token) : continuationForSession(sessionId);
   const queued = commands.find((command) => command.spec.type === 'resume' && command.spec.sessionId === sessionId) ?? null;
@@ -6100,7 +6170,7 @@ export async function cancelResumeNow(sessionId: string): Promise<boolean> {
     if (queued.timer) clearTimeout(queued.timer);
     queued.timer = null;
     try {
-      await writeDurableNow(COMMANDS_STATE, commandSnapshot({ removeCommandId: queued.id }));
+      await writeCommandLedgerNow(commandSnapshot({ removeCommandId: queued.id }));
     } catch (err) {
       // The semantic abort already landed. Keeping the failed removal generation queued for
       // durable.ts retry is safe, and the in-memory transport must still disappear immediately.
@@ -6135,6 +6205,7 @@ async function cancelAutomaticResumesNow(sessionId?: string): Promise<number> {
  * recovery key exists only if the user asks the app for one after that has failed.
  */
 export function queueWorkerBootstrap(agent: string, task: string, model: string | null, reasoningEffort: ReasoningEffort | null, runId: string): BridgeCommand | null {
+  if (agentsRecoveryPaused() || browserCommandRecoveryPaused()) return null;
   // A worker bootstrap is authority for one concrete broker incarnation. There is no safe
   // meaning for one outside a run, and manufacturing an unscoped command here is exactly how
   // stale durable work later becomes somebody else's `worker-1`.
@@ -6162,6 +6233,7 @@ export function queueWorkerRevival(
   wake: readonly string[],
   runId: string
 ): BridgeCommand | null {
+  if (agentsRecoveryPaused() || browserCommandRecoveryPaused()) return null;
   // Same rule as a bootstrap: authority for one concrete broker incarnation, or nothing.
   if (!runId || !conversationId || !swarmRunning(runId)) return null;
   // An empty wake is not a wake. The broker republishes its whole `waking` list on every
@@ -6191,6 +6263,7 @@ export function queueWorkerRevival(
  * claiming a continuation, and a second command for the same session folds into this one.
  */
 export function queueResume(sessionId: string, token: string): BridgeCommand | null {
+  if (providerReplacementRecoveryPaused()) return null;
   const command = queueResumeCommand(sessionId, token);
   void deliver();
   return describe(command, null);
@@ -6207,7 +6280,7 @@ export async function queueEmergencyResume(
   fromConversationId: string,
   episodeId: string
 ): Promise<BridgeCommand | null> {
-  if (!getConfig().multiAgent.selfHealingSessions || providerTransportUnavailable()) return null;
+  if (providerReplacementRecoveryPaused() || !getConfig().multiAgent.selfHealingSessions || providerTransportUnavailable()) return null;
   if (runningToolCalls(fromConversationId) > 0 || settlingToolCalls(fromConversationId) > 0) return null;
   // Close the zero-inflight race synchronously. From this point A cannot begin another local
   // operation while the durable hard-recovery transition and browser command are prepared.
@@ -6234,6 +6307,7 @@ async function emergencyResumeCommandSpec(
   fromConversationId: string,
   episodeId: string
 ): Promise<Extract<CommandSpec, { type: 'recovery' }> | null> {
+  if (providerReplacementRecoveryPaused()) return null;
   const prepared = await prepareEmergencyResume(sessionId, fromConversationId, episodeId);
   if (!prepared) return null;
   const session = await getSession(sessionId);
@@ -6308,6 +6382,7 @@ async function failRecoveryCommand(
 }
 
 function queueResumeCommand(sessionId: string, token: string): Command {
+  assertProviderReplacementWritable();
   rememberToken(sessionId, token);
   const command = queue({ type: 'resume', sessionId, token });
   changed();
@@ -6497,9 +6572,11 @@ function pendingBrowserPlacement(conversationId: string | null): {
   id: string; model: string | null; reasoningEffort: ReasoningEffort | null;
   background?: true; active: boolean; homeConversationId: string | null; project: string | null;
 } | null {
+  if (browserCommandRecoveryPaused()) return null;
   const command = commands.find(entry => entry.owner === null && entry.placement &&
     (entry.placement.conversationId === conversationId || (conversationId === null && entry.spec.type === 'worker')));
   if (!command?.placement) return null;
+  if ((command.spec.type === 'resume' || command.spec.type === 'recovery') && providerReplacementRecoveryPaused()) return null;
   const placement = command.placement;
   delete command.placement;
   const spec = command.spec;
@@ -6756,7 +6833,7 @@ async function chatStillWorking(conversationId: string, turnId: string, sessionI
  * carrying a continuation is not given a second.
  */
 async function considerAutomaticCompaction(conversationId: string, sessionId: string): Promise<void> {
-  if (!getConfig().compaction.auto || compactionFilings.has(conversationId)) return;
+  if (providerReplacementRecoveryPaused() || !getConfig().compaction.auto || compactionFilings.has(conversationId)) return;
   if (goalFencedChat(conversationId) || continuationForSession(sessionId) || !chatIsWorking(conversationId)) return;
   compactionFilings.add(conversationId);
   try {
@@ -6793,6 +6870,7 @@ async function considerAutomaticCompaction(conversationId: string, sessionId: st
  * silent.
  */
 async function fileSilenceTickets(spent: readonly string[], now: number): Promise<void> {
+  if (continuationRecoveryPaused()) return;
   for (const conversationId of spent) {
     // An existing user instruction takes this boundary before a synthesized Goal reply.
     if (await fileSilenceInputTicket(conversationId, now)) continue;
@@ -6849,6 +6927,7 @@ async function fileSilenceTickets(spent: readonly string[], now: number): Promis
 
 /** Reuse silence's exact work grant and confirmed refresh; only the outbox owns the ticket. */
 async function fileSilenceInputTicket(conversationId: string, now: number, listenUntil?: number): Promise<boolean> {
+  if (continuationRecoveryPaused()) return false;
   const grant = activeUntil.get(conversationId);
   const repair = repairsInFlight.get(conversationId);
   if (!grant?.turnId || (!grant.thinkingFailed && now - grant.budgetAt < (grant.model === 'other' ? CHAT_SILENCE_MS : PRO_SILENCE_MS)) ||
@@ -7003,6 +7082,7 @@ export function unattributedRepairEta(now = Date.now(), requestId?: string | nul
 
 /** Project the actual owners; reading controls cannot file, extend or spend recovery. */
 async function sessionRecoveryCountdowns(sessionId: string, conversationId: string): Promise<import('../shared/recovery.js').RecoveryCountdown[]> {
+  if (continuationRecoveryPaused()) return [];
   const rows = await listInputs();
   const queuedAfterTurn = await hasQueuedAfterTurnInput(sessionId);
   const [boundary] = await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end', 'user_message'] });
@@ -7189,6 +7269,7 @@ function queueBrowserRecovery(
   now = Date.now(),
   assistantSource?: Repair['assistantSource']
 ): boolean {
+  if (continuationRecoveryPaused() || agentsRecoveryPaused()) return false;
   // A blocked chat is one the user took this app's hands off, and every repair here is a hand
   // going back on: a reload restarts the rogue page's turn machinery, and a reopen gives a
   // conversation whose every tool call is already being refused a brand-new tab to try from.
@@ -7318,7 +7399,11 @@ async function noteRecoveryObservations(
   const ended = observations.findLast(item => item.kind === 'turn_end');
   if (sessionId && ended?.outcome === 'stopped') {
     await cancelSelfHealingForStopNow(sessionId, conversationId);
-    await cancelLongRunNow(sessionId, conversationId, 'manual_stop');
+    // Stop remains the highest-priority revocation even when the Long-Run ledger itself is in
+    // recovery pause. Failure to amend that corrupt ledger must not abort the rest of Stop's
+    // browser/session cleanup; the global recovery fence already denies Long-Run execution.
+    await cancelLongRunNow(sessionId, conversationId, 'manual_stop').catch((error) =>
+      logWarn(`bridge: could not persist Long-Run Stop revocation — ${error instanceof Error ? error.message : String(error)}`));
     const cancelledWork = longRunWorkFor(sessionId);
     if (cancelledWork?.state === 'cancelled' && cancelledWork.inputId) {
       await cancelInput(cancelledWork.inputId);
@@ -7557,6 +7642,25 @@ function nonDiscardableAgentConversations(): string[] {
  * The extension still proves the exact document has no draft or generation before closing.
  */
 async function browserTabPolicy(openConversations: Set<string>) {
+  if (continuationRecoveryPaused() || agentsRecoveryPaused()) {
+    // The continuation WAL may be the only proof that an apparently idle page is chat A, chat B,
+    // or a superseded source. Until that authority is readable, automatic reuse/close has no
+    // safe target set. Conservatively retain every currently open page; explicit user actions
+    // remain separate from this maintenance projection.
+    const held = [...openConversations].sort();
+    return {
+      idleReuseAfterMs: 120_000,
+      idleCloseAfterMs: 300_000,
+      cancelledDecisionClaims: [],
+      retiredConversations: [],
+      conversationActivityAt: {},
+      managedConversations: held,
+      reusableConversations: [],
+      nonDiscardableConversations: held,
+      blockedConversations: held.filter(isChatBlocked),
+      closableConversations: []
+    };
+  }
   // Existing cached metadata is the ownership index; never scan transcripts per browser poll.
   const summaries = await listUsageSessions();
   const managed = new Set(summaries.filter(row => row.origin && row.conversationId && openConversations.has(row.conversationId)).map(row => row.conversationId!));
@@ -8036,7 +8140,7 @@ async function owedPickups(now: number): Promise<Map<string, { conversationId: s
 }
 
 async function inspectOwedGoals(now: number): Promise<boolean> {
-  if (providerTransportUnavailable()) return false;
+  if (goalRecoveryPaused() || continuationRecoveryPaused() || agentsRecoveryPaused() || providerTransportUnavailable()) return false;
   const floor = goalWatchFloor;
   if (floor === null) return false;
   const owed = await owedPickups(now);
@@ -8111,7 +8215,7 @@ async function inspectOwedGoals(now: number): Promise<boolean> {
  * Auto Off additionally cancels threshold-created tickets, never manual requests.
  */
 async function inspectOwedCompactions(now: number): Promise<boolean> {
-  if (providerTransportUnavailable()) return false;
+  if (continuationRecoveryPaused() || agentsRecoveryPaused() || providerTransportUnavailable()) return false;
   if (compactionWatchFloor === null) return false;
   const owed = new Map(pendingContinuations().map((entry) => [entry.from, entry]));
   for (const [conversationId, watch] of compactionWatch) {
@@ -8419,6 +8523,7 @@ async function noteCallAttribution(
     return;
   }
   if (requestId && requestCorrelation(requestId)) return;
+  if (continuationRecoveryPaused()) return;
   retireSpentRepairs();
   const opening = repairCandidates().filter(unattributedCandidateCurrent);
   const key = requestId ?? `headerless:${opening.map(entry => `${entry.sessionId}:${entry.turnId}`).sort().join(',')}`;
@@ -8486,6 +8591,7 @@ function armUnattributedTick(): void {
 }
 
 async function tickUnattributedIncident(): Promise<void> {
+  if (continuationRecoveryPaused()) return;
   retireSpentRepairs();
   let updated = false;
   for (const incident of unattributedIncidents.values()) {
@@ -8547,11 +8653,13 @@ async function tickUnattributedIncident(): Promise<void> {
 async function takePendingRepairs(
   now = Date.now()
 ): Promise<Array<{ conversationId: string; token: string; reason: Repair['reason']; focus: boolean }>> {
+  if (continuationRecoveryPaused() || agentsRecoveryPaused()) return [];
   retireSpentRepairs();
-  const pickupFloor = goalWatchFloor;
-  const owed = await owedPickups(now);
+  const goalPaused = goalRecoveryPaused();
+  const pickupFloor = goalPaused ? null : goalWatchFloor;
+  const owed: Awaited<ReturnType<typeof owedPickups>> = goalPaused ? new Map() : await owedPickups(now);
   for (const [conversationId, repair] of repairsInFlight) {
-    if (repair.reason !== 'goal') continue;
+    if (repair.reason !== 'goal' || goalPaused) continue;
     const pickup = owed.get(conversationId);
     const watch = goalWatch.get(conversationId);
     // A handler/claim/listening transition can temporarily hide the owed head. Preserve
@@ -8624,6 +8732,7 @@ async function takePendingRepairs(
     requiresClaim?: boolean;
   }> = [];
   for (const [conversationId, repair] of repairsInFlight) {
+    if (goalPaused && repair.reason === 'goal') continue;
     const unclaimedError = repair.reason === 'assistant-error' && repair.state === 'handed' && !repair.claimed;
     if (repair.state !== 'queued' && !unclaimedError) continue;
     if (now < repair.notBefore) continue;
@@ -8639,6 +8748,7 @@ async function takePendingRepairs(
     // A missed pre-action claim may retry the same offer. Once claimed, ambiguous
     // acknowledgement keeps custody and cannot authorize a second browser action.
     if (repair.reason === 'goal') {
+      if (goalPaused) continue;
       const current = (await owedPickups(Date.now())).get(conversationId);
       if (goalWatchFloor !== pickupFloor || !current || current.replyId !== goalWatch.get(conversationId)?.replyId || Date.now() < current.listenUntil ||
           continuationForSession(current.sessionId) || (!current.queued && goalDraftBusy(conversationId))) {
@@ -8706,6 +8816,7 @@ async function confirmRepair(token: string, action: 'reloaded' | 'reopened' | nu
       lastBrowserRecoveryBudgetAt.set(conversationId, recoveredAt);
       awaitingReturn.add(conversationId);
       if (repair.reason === 'silence') {
+        if (continuationRecoveryPaused()) continue;
         const failedGrant = activeUntil.get(conversationId);
         const selfHealing = Boolean(failedGrant && getConfig().multiAgent.selfHealingSessions);
         if (failedGrant && selfHealing) {
@@ -8901,7 +9012,7 @@ async function deliver(): Promise<void> {
 }
 
 async function deliverOne(): Promise<void> {
-  if (providerTransportUnavailable()) return;
+  if (browserCommandRecoveryPaused() || providerTransportUnavailable()) return;
   tidyCommands();
   const command = nextDeliverable();
   if (!command) return;
@@ -8931,6 +9042,21 @@ async function deliverOne(): Promise<void> {
   }
   const claimedAt = Date.now();
   if (!(await persistCommandLease(command, null, claimedAt))) return;
+  // Persisting the lease is an await boundary. A bridge reset/restart, transport suspension, or
+  // recovery pause can become authoritative while that fsync is in flight. Re-check the live
+  // owner before the first browser side effect so an old delivery continuation cannot outlive
+  // the command set or authority generation that selected it.
+  const deliveryStillCurrent = (): boolean =>
+    commands.includes(command) &&
+    !browserCommandRecoveryPaused() &&
+    !providerTransportUnavailable() &&
+    !((command.spec.type === 'worker' || command.spec.type === 'revive') && agentsRecoveryPaused()) &&
+    !((command.spec.type === 'resume' || command.spec.type === 'recovery') && providerReplacementRecoveryPaused());
+  if (!deliveryStillCurrent()) return;
+  // Recovery validity itself crosses durable session state, so close the same TOCTOU window once
+  // more after that await before opening a replacement executor.
+  if (command.spec.type === 'recovery' && !(await recoveryCommandCurrent(command.spec))) return;
+  if (!deliveryStillCurrent()) return;
   armDeadline(command);
   changed();
   // The recorder can see a brand-new ChatGPT conversation before that page's content script has
@@ -9097,11 +9223,19 @@ function rearmRetainedCommandDeadlines(): void {
  */
 function expire(command: Command): void {
   if (!commands.includes(command)) return;
+  if (browserCommandRecoveryPaused()) {
+    armDeadline(command, 30_000);
+    return;
+  }
   if (providerTransportUnavailable()) {
     command.timer = null;
     return;
   }
   const spec = command.spec;
+  if ((spec.type === 'worker' || spec.type === 'revive') && agentsRecoveryPaused()) {
+    armDeadline(command, 30_000);
+    return;
+  }
   // A wake's deadline moves once when its delivery is proven, and the timer armed at the wake
   // does not know that. Re-arm for the remainder rather than end a worker that is reading.
   if (spec.type === 'revive') {
@@ -9112,6 +9246,10 @@ function expire(command: Command): void {
     }
   }
   if (spec.type === 'resume') {
+    if (providerReplacementRecoveryPaused()) {
+      armDeadline(command, 30_000);
+      return;
+    }
     const continuation = continuationByToken(spec.token);
     if (continuation?.state === 'committed' && continuation.to) {
       const receipt: CommandReceipt = {
@@ -9299,6 +9437,11 @@ function describe(command: Command, client: string | null, claimedSummary?: stri
 
 function drop(command: Command, why: string): boolean {
   if (!commands.includes(command)) return false;
+  if ((command.spec.type === 'resume' || command.spec.type === 'recovery') && providerReplacementRecoveryPaused()) {
+    command.lastError = 'Provider replacement is paused until its durable transaction and agent authority are recoverable.';
+    armDeadline(command, 30_000);
+    return true;
+  }
   if (command.spec.type === 'recovery') {
     if (command.timer) clearTimeout(command.timer);
     command.timer = null;
@@ -9321,7 +9464,7 @@ function drop(command: Command, why: string): boolean {
             );
             if (committed.status === 'retryable') return false;
             if (committed.status === 'committed') {
-              await writeDurableNow(COMMANDS_STATE, commandSnapshot({ removeCommandId: command.id }));
+              await writeCommandLedgerNow(commandSnapshot({ removeCommandId: command.id }));
               commands = commands.filter((entry) => entry !== command);
               changed();
               return true;
@@ -9353,7 +9496,7 @@ function drop(command: Command, why: string): boolean {
         // elsewhere. If the same hard-recovery episode is still current, keep the durable command
         // and retry the local failure write later rather than dropping the only attempt record.
         if (!failed && await recoveryCommandCurrent(command.spec)) return false;
-        await writeDurableNow(COMMANDS_STATE, commandSnapshot({ removeCommandId: command.id }));
+        await writeCommandLedgerNow(commandSnapshot({ removeCommandId: command.id }));
       } catch (error) {
         logWarn(`bridge: could not durably fail ${specKey(command.spec)} — ${error instanceof Error ? error.message : String(error)}`);
         return false;
@@ -9389,7 +9532,7 @@ function drop(command: Command, why: string): boolean {
         const released = await releaseContinuationDestinationSendNow(command.spec.token, command.id);
         if (!released) return false;
       }
-      await writeDurableNow(COMMANDS_STATE, commandSnapshot({ removeCommandId: command.id }));
+      await writeCommandLedgerNow(commandSnapshot({ removeCommandId: command.id }));
       if (command.timer) clearTimeout(command.timer);
       command.timer = null;
       commands = commands.filter(candidate => candidate !== command);
@@ -9458,11 +9601,13 @@ function drop(command: Command, why: string): boolean {
  * Retires and expires commands. Run before anything is handed out or delivered.
  */
 function tidyCommands(): void {
-  if (providerTransportUnavailable()) return;
+  if (browserCommandRecoveryPaused() || providerTransportUnavailable()) return;
   const now = Date.now();
   const pendingWorkers = new Set(pendingWorkerSpawns().map(worker => `${worker.runId}:${worker.id}`));
   const wakingWorkers = new Set(pendingWorkerRevivals().map(revival => `${revival.runId}:${revival.id}`));
   for (const command of [...commands]) {
+    if ((command.spec.type === 'resume' || command.spec.type === 'recovery') && providerReplacementRecoveryPaused()) continue;
+    if ((command.spec.type === 'worker' || command.spec.type === 'revive') && agentsRecoveryPaused()) continue;
     const workerAgent = command.spec.type === 'worker' ? command.spec.agent : null;
     if ((command.spec.type === 'worker' || command.spec.type === 'revive') && !swarmRunning(command.spec.runId)) {
       // Run turnover is an identity boundary. A command from the retired incarnation is not
@@ -9499,6 +9644,8 @@ function tidyCommands(): void {
 /** Whether a page is already working on this command, with time still on its deadline. */
 const isLeased = (command: Command): boolean => {
   if (command.claimedAt === null) return false;
+  if ((command.spec.type === 'resume' || command.spec.type === 'recovery') && providerReplacementRecoveryPaused()) return true;
+  if ((command.spec.type === 'worker' || command.spec.type === 'revive') && agentsRecoveryPaused()) return true;
   if (commandDeadlineDelay(command) > 0) return true;
   if (command.spec.type !== 'resume') return false;
   const state = continuationByToken(command.spec.token)?.state;
@@ -9512,9 +9659,14 @@ const isLeased = (command: Command): boolean => {
  */
 function nextDeliverable(): Command | null {
   if (commandWrites.size > 0) return null;
-  // A spent lease stays spent even after its deadline; only expiry settles it.
+  const providerReplacementPaused = providerReplacementRecoveryPaused();
+  const agentsPaused = agentsRecoveryPaused();
+  // A spent lease stays spent even after its deadline; only expiry settles it. Both resume and
+  // Emergency Resume are provider-replacement transports and stay inert while continuation
+  // ownership is unknown.
   return commands.find((command) => command.claimedAt === null &&
-    (command.spec.type === 'worker' || command.spec.type === 'resume' || command.spec.type === 'recovery')) ?? null;
+    ((!agentsPaused && command.spec.type === 'worker') ||
+      (!providerReplacementPaused && (command.spec.type === 'resume' || command.spec.type === 'recovery')))) ?? null;
 }
 
 /**
@@ -9561,6 +9713,7 @@ async function reconcileOpeningCommand(
   if (!command || command.claimedAt === null) return { status: 'none' };
 
   if (command.spec.type === 'resume') {
+    if (providerReplacementRecoveryPaused()) return { status: 'retryable', error: 'opening_resume_recovery_paused' };
     if (command.owner !== client) return { status: 'terminal', error: 'opening_command_owner_changed' };
     const continuation = continuationByToken(command.spec.token);
     if (!continuation || continuation.sessionId !== command.spec.sessionId ||
@@ -9739,6 +9892,210 @@ interface CommandRestorePlan {
   transportPausedAt: number | null;
 }
 
+function validStoredCommandSpec(version: number, value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Partial<CommandSpec>;
+  if (raw.type === 'stop') {
+    const stop = raw as Partial<Extract<CommandSpec, { type: 'stop' }>>;
+    return typeof stop.sessionId === 'string' && /^[a-z0-9-]{8,64}$/i.test(stop.sessionId) &&
+      typeof stop.conversationId === 'string' && !!conversationId(stop.conversationId) &&
+      typeof stop.turnId === 'string' && stop.turnId.length > 0 && stop.turnId.length <= 256 &&
+      (stop.userMessageId === undefined ||
+        (typeof stop.userMessageId === 'string' && stop.userMessageId.length > 0 && stop.userMessageId.length <= 256));
+  }
+  if (raw.type === 'resume') {
+    const resume = raw as Partial<Extract<CommandSpec, { type: 'resume' }>>;
+    return typeof resume.sessionId === 'string' && /^[a-z0-9-]{8,64}$/i.test(resume.sessionId) &&
+      typeof resume.token === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(resume.token);
+  }
+  if (raw.type === 'worker') {
+    if (version < 3) return false;
+    const worker = raw as Partial<Extract<CommandSpec, { type: 'worker' }>>;
+    return typeof worker.agent === 'string' && /^[a-z0-9-]{1,40}$/i.test(worker.agent) &&
+      typeof worker.task === 'string' &&
+      typeof worker.runId === 'string' && worker.runId.length > 0 &&
+      (worker.model === undefined || worker.model === null || typeof worker.model === 'string') &&
+      (worker.reasoningEffort === undefined || worker.reasoningEffort === null || typeof worker.reasoningEffort === 'string');
+  }
+  if (raw.type === 'revive') {
+    if (version < 4) return false;
+    const revive = raw as Partial<Extract<CommandSpec, { type: 'revive' }>>;
+    return typeof revive.agent === 'string' && /^[a-z0-9-]{1,40}$/i.test(revive.agent) &&
+      typeof revive.conversationId === 'string' && !!conversationId(revive.conversationId) &&
+      typeof revive.runId === 'string' && revive.runId.length > 0 &&
+      (revive.wake === undefined || typeof revive.wake === 'string');
+  }
+  if (raw.type === 'recovery') {
+    if (version < 5) return false;
+    const recovery = raw as Partial<Extract<CommandSpec, { type: 'recovery' }>>;
+    return typeof recovery.sessionId === 'string' && recovery.sessionId.length > 0 && recovery.sessionId.length <= 64 &&
+      typeof recovery.fromConversationId === 'string' && !!conversationId(recovery.fromConversationId) &&
+      typeof recovery.episodeId === 'string' && recovery.episodeId.length > 0 && recovery.episodeId.length <= 64 &&
+      typeof recovery.text === 'string' && recovery.text.length <= MAX_CHATGPT_MESSAGE_CHARS &&
+      (recovery.generation === undefined || typeof recovery.generation === 'number') &&
+      (recovery.agent === undefined || recovery.agent === null || typeof recovery.agent === 'string') &&
+      (recovery.runId === undefined || recovery.runId === null || typeof recovery.runId === 'string') &&
+      (recovery.model === undefined || recovery.model === null || typeof recovery.model === 'string') &&
+      (recovery.reasoningEffort === undefined || recovery.reasoningEffort === null || typeof recovery.reasoningEffort === 'string');
+  }
+  return false;
+}
+
+function validStoredCommandRecord(version: number, value: unknown): value is DurableCommandRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Partial<DurableCommandRecord>;
+  if (typeof raw.id !== 'string' || raw.id.length === 0 || raw.id.length > 64 ||
+      !validStoredCommandSpec(version, raw.spec) ||
+      typeof raw.createdAt !== 'number' || !Number.isFinite(raw.createdAt)) return false;
+
+  if (version >= 2 && raw.phase !== 'queued' && raw.phase !== 'leased') return false;
+  if (version === 1 && !(raw.phase === undefined || raw.phase === 'queued' || raw.phase === 'leased')) return false;
+  if (!(raw.claimedAt === undefined || raw.claimedAt === null ||
+        (typeof raw.claimedAt === 'number' && Number.isFinite(raw.claimedAt)))) return false;
+  if (version >= 2 && raw.phase === 'queued' && raw.claimedAt != null) return false;
+  if (!(raw.deadlineCreatedAt === undefined ||
+        (typeof raw.deadlineCreatedAt === 'number' && Number.isFinite(raw.deadlineCreatedAt)))) return false;
+  if (!(raw.deadlineClaimedAt === undefined || raw.deadlineClaimedAt === null ||
+        (typeof raw.deadlineClaimedAt === 'number' && Number.isFinite(raw.deadlineClaimedAt)))) return false;
+  if (!(raw.owner === undefined || raw.owner === null ||
+        (typeof raw.owner === 'string' && raw.owner.length <= 64))) return false;
+  if (!(raw.lastError === undefined || raw.lastError === null || typeof raw.lastError === 'string')) return false;
+  return true;
+}
+
+function validStoredCommandReceipt(value: unknown): value is CommandReceipt {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as Partial<CommandReceipt>;
+  return typeof raw.id === 'string' && raw.id.length > 0 && raw.id.length <= 64 &&
+    (raw.client === undefined || raw.client === null || (typeof raw.client === 'string' && raw.client.length <= 64)) &&
+    (raw.conversationId === undefined || raw.conversationId === null || typeof raw.conversationId === 'string') &&
+    (raw.outcome === 'committed' || raw.outcome === 'terminal-failure') &&
+    typeof raw.committed === 'boolean' &&
+    (raw.outcome === 'committed') === raw.committed &&
+    (raw.error === undefined || raw.error === null || typeof raw.error === 'string') &&
+    typeof raw.completedAt === 'number' && Number.isFinite(raw.completedAt);
+}
+
+export function validateBridgeCommandSnapshot(value: unknown): value is DurableCommandSnapshot {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const raw = value as { version?: unknown; commands?: unknown; receipts?: unknown; transportPausedAt?: unknown };
+  const version = raw.version;
+  if (version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5) return false;
+  if (!Array.isArray(raw.commands)) return false;
+  if (version >= 3 && !Array.isArray(raw.receipts)) return false;
+  if (!(raw.receipts === undefined || Array.isArray(raw.receipts))) return false;
+  if (!(raw.transportPausedAt === undefined || raw.transportPausedAt === null ||
+        (typeof raw.transportPausedAt === 'number' && Number.isFinite(raw.transportPausedAt)))) return false;
+
+  const commandIds = new Set<string>();
+  for (const command of raw.commands) {
+    if (!validStoredCommandRecord(version, command) || commandIds.has(command.id)) return false;
+    commandIds.add(command.id);
+  }
+  const receiptIds = new Set<string>();
+  for (const receipt of (raw.receipts ?? []) as unknown[]) {
+    if (!validStoredCommandReceipt(receipt) || receiptIds.has(receipt.id)) return false;
+    receiptIds.add(receipt.id);
+  }
+  return true;
+}
+
+function noteBrowserCommandRecovery(
+  copy: 'primary' | 'backup',
+  failure: 'json_corrupt' | 'schema_invalid' | 'io_error' | 'checkpoint_degraded',
+  disposition: 'pause' | 'degraded',
+  detail?: string
+): void {
+  noteDurableRecoveryIncident({
+    domain: 'browser-command',
+    ledger: COMMANDS_STATE,
+    copy,
+    failure,
+    disposition,
+    detail
+  });
+}
+
+async function inspectCommandBackup(): Promise<void> {
+  const backup = await readDurableResult<unknown>(COMMANDS_STATE, 'backup');
+  if (backup.kind === 'missing') {
+    resolveDurableRecoveryIncident('browser-command', COMMANDS_STATE, 'backup');
+    return;
+  }
+  if (backup.kind === 'io_error') {
+    noteBrowserCommandRecovery('backup', 'io_error', 'degraded', backup.error);
+    return;
+  }
+  if (backup.kind === 'corrupt') {
+    noteBrowserCommandRecovery('backup', 'json_corrupt', 'degraded', backup.error);
+    return;
+  }
+  if (!validateBridgeCommandSnapshot(backup.value)) {
+    noteBrowserCommandRecovery('backup', 'schema_invalid', 'degraded', 'bridge-command backup failed owner schema validation');
+    return;
+  }
+  resolveDurableRecoveryIncident('browser-command', COMMANDS_STATE, 'backup');
+}
+
+async function checkpointCommandLedger(snapshot: DurableCommandSnapshot): Promise<void> {
+  try {
+    await writeDurableCheckpointNow(COMMANDS_STATE, snapshot);
+    resolveDurableRecoveryIncident('browser-command', COMMANDS_STATE, 'backup');
+  } catch (error) {
+    noteBrowserCommandRecovery(
+      'backup',
+      'checkpoint_degraded',
+      'degraded',
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+}
+
+async function readCommandAuthority(): Promise<DurableCommandSnapshot | null> {
+  const primary = await readDurableResult<unknown>(COMMANDS_STATE);
+  if (primary.kind === 'missing') {
+    // Missing is an owner-defined empty crash point. Session/self-healing WAL may reconstruct
+    // only independently proved recovery custody; stale command backup must never resurrect work.
+    try {
+      await writeDurableCheckpointNow(COMMANDS_STATE, null);
+      resolveDurableRecoveryIncident('browser-command', COMMANDS_STATE, 'backup');
+    } catch (error) {
+      noteBrowserCommandRecovery(
+        'backup',
+        'checkpoint_degraded',
+        'degraded',
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+    resolveDurableRecoveryIncident('browser-command', COMMANDS_STATE, 'primary');
+    return { version: 5, commands: [], receipts: [] };
+  }
+  if (primary.kind === 'io_error') {
+    noteBrowserCommandRecovery('primary', 'io_error', 'pause', primary.error);
+    await inspectCommandBackup();
+    return null;
+  }
+  if (primary.kind === 'corrupt') {
+    noteBrowserCommandRecovery('primary', 'json_corrupt', 'pause', primary.error);
+    await inspectCommandBackup();
+    return null;
+  }
+  if (!validateBridgeCommandSnapshot(primary.value)) {
+    noteBrowserCommandRecovery('primary', 'schema_invalid', 'pause', 'bridge-command primary failed owner schema validation');
+    await inspectCommandBackup();
+    return null;
+  }
+  resolveDurableRecoveryIncident('browser-command', COMMANDS_STATE, 'primary');
+  await inspectCommandBackup();
+  return primary.value;
+}
+
+async function writeCommandLedgerNow(snapshot: DurableCommandSnapshot): Promise<void> {
+  if (browserCommandRecoveryPaused()) throw new Error('browser_command_recovery_required');
+  await writeDurableNow(COMMANDS_STATE, snapshot);
+  await checkpointCommandLedger(snapshot);
+}
+
 /** One durable receipt that is still useful, rebuilt field-by-field. */
 function restoredReceipt(raw: Partial<CommandReceipt>, now: number): CommandReceipt | null {
   if (
@@ -9788,6 +10145,16 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
     typeof (raw as Partial<Extract<CommandSpec, { type: 'worker' }>>).runId === 'string'
   ) {
     const worker = raw as Extract<CommandSpec, { type: 'worker' }>;
+    if (agentsRecoveryPaused()) {
+      return {
+        type: 'worker',
+        agent: worker.agent,
+        task: worker.task.slice(0, 512 * 1024),
+        model: isModelSlug(worker.model) ? worker.model : null,
+        reasoningEffort: isReasoningEffort(worker.reasoningEffort) ? worker.reasoningEffort : null,
+        runId: worker.runId
+      };
+    }
     if (!swarmRunning(worker.runId)) return null;
     // A retained transport may deliberately outlive its live queue entry while broker failure
     // is being fsynced. If restart sees the *newer* broker side first, a terminal/sleeping row is
@@ -9817,6 +10184,16 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
     typeof (raw as Partial<Extract<CommandSpec, { type: 'revive' }>>).runId === 'string'
   ) {
     const revive = raw as Extract<CommandSpec, { type: 'revive' }>;
+    if (!conversationId(revive.conversationId)) return null;
+    if (agentsRecoveryPaused()) {
+      return {
+        type: 'revive',
+        agent: revive.agent,
+        conversationId: revive.conversationId,
+        runId: revive.runId,
+        wake: typeof revive.wake === 'string' ? revive.wake : ''
+      };
+    }
     if (!swarmRunning(revive.runId)) return null;
     if (agentConversation(revive.agent, revive.runId) !== revive.conversationId) return null;
     const revivalState = swarmState(revive.runId).agents.find((entry) => entry.id === revive.agent && entry.role === 'worker')?.state;
@@ -9860,6 +10237,14 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
     typeof (raw as Partial<Extract<CommandSpec, { type: 'resume' }>>).token === 'string'
   ) {
     const resume = raw as Extract<CommandSpec, { type: 'resume' }>;
+    if (!/^[a-z0-9-]{8,64}$/i.test(resume.sessionId) ||
+        !/^[A-Za-z0-9_-]{16,64}$/.test(resume.token)) return null;
+    // A paused continuation WAL cannot authorize retirement. Preserve a structurally valid
+    // browser carrier as inert custody until the owner ledger is readable again; live delivery,
+    // redeem and ACK paths are separately fenced while recovery is paused.
+    if (providerReplacementRecoveryPaused()) {
+      return { type: 'resume', sessionId: resume.sessionId, token: resume.token };
+    }
     const continuation = continuationByToken(resume.token);
     if (!continuation || continuation.sessionId !== resume.sessionId || continuation.state === 'aborted') return null;
     return { type: 'resume', sessionId: resume.sessionId, token: resume.token };
@@ -9898,6 +10283,8 @@ function planCommandRestore(
 ): CommandRestorePlan | null {
   const version = saved.version;
   if (version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 || !Array.isArray(saved.commands)) return null;
+  const providerReplacementPaused = providerReplacementRecoveryPaused();
+  const agentsPaused = agentsRecoveryPaused();
   const persistedPauseAt =
     typeof saved.transportPausedAt === 'number' && Number.isFinite(saved.transportPausedAt)
       ? saved.transportPausedAt
@@ -9973,18 +10360,23 @@ function planCommandRestore(
     // The broker cannot yet say whether a restored wake was delivered, so disk rows get the
     // longer budget here; the deadline re-armed below applies the exact one.
     if (freezeTransportAge) deadlineCreatedAt += restartSuspensionMs;
-    const stale = spec.type === 'revive'
-      ? now >= deadlineCreatedAt + REVIVAL_ACTIVITY_MS
-      : now - deadlineCreatedAt > COMMAND_TTL_MS;
+    const stale = ((spec.type === 'resume' || spec.type === 'recovery') && providerReplacementPaused) ||
+      ((spec.type === 'worker' || spec.type === 'revive') && agentsPaused)
+      ? false
+      : spec.type === 'revive'
+        ? now >= deadlineCreatedAt + REVIVAL_ACTIVITY_MS
+        : now - deadlineCreatedAt > COMMAND_TTL_MS;
     if (stale) {
       if (spec.type === 'revive') expiredRevivals.push({ id: raw.id!, spec });
       continue;
     }
 
-    const continuation = spec.type === 'resume' ? continuationByToken(spec.token) : null;
+    const continuation = spec.type === 'resume' && !providerReplacementPaused ? continuationByToken(spec.token) : null;
     const legacyAlreadyClaimed =
-      version === 1 && continuation !== null &&
-      (continuation.state === 'claimed' || continuation.state === 'committing' || continuation.state === 'committed');
+      version === 1 && spec.type === 'resume' && providerReplacementPaused
+        ? true
+        : version === 1 && continuation !== null &&
+          (continuation.state === 'claimed' || continuation.state === 'committing' || continuation.state === 'committed');
     const leased = persistedLeased || legacyAlreadyClaimed;
     let claimedAt = leased && typeof raw.claimedAt === 'number' && Number.isFinite(raw.claimedAt) ? raw.claimedAt : null;
     if (leased && claimedAt === null) claimedAt = now;
@@ -10014,7 +10406,7 @@ function planCommandRestore(
   // for its key were discarded above before expiry was considered.
   const expiredRetainedRevivalIds = new Set<string>();
   for (const command of plannedCommands) {
-    if (command.spec.type !== 'revive' || now < revivalDeadlineAt(command)) continue;
+    if (command.spec.type !== 'revive' || agentsPaused || now < revivalDeadlineAt(command)) continue;
     expiredRevivals.push({ id: command.id, spec: command.spec });
     expiredRetainedRevivalIds.add(command.id);
   }
@@ -10186,29 +10578,33 @@ async function restoreMissingEmergencyResumes(plan: CommandRestorePlan, now: num
  * 1 is migrated conservatively, including resume commands whose continuation WAL survived.
  */
 export async function restoreCommands(): Promise<void> {
-  // Session metadata is the A→B authority. Repair any crash window in its in-memory projections
-  // before restored browser commands become deliverable or an old executor can regain custody.
-  await reconcileSelfHealingAfterRestart();
-  const saved = await readDurable<{
-    version?: number;
-    commands?: unknown;
-    receipts?: unknown;
-    transportPausedAt?: unknown;
-  }>(COMMANDS_STATE);
+  const saved = await readCommandAuthority();
+  if (!saved) return;
+
+  // Provider replacement depends on both its own transaction/session evidence and the broker
+  // identity owner it may have to move. If either owner is paused, preserve carriers as inert
+  // custody and do not manufacture or reconcile replacement execution on startup.
+  if (!providerReplacementRecoveryPaused()) await reconcileSelfHealingAfterRestart();
   const now = Date.now();
-  // A missing command file is a valid crash point: the session WAL can already say
-  // `hard_recovery` before the transport has performed its first durable write. Seed an empty
-  // version-5 snapshot from retained in-memory state so that episode can reconstruct below.
-  const plan = planCommandRestore(saved ?? { version: 5, commands: [], receipts: [] }, now);
-  if (!plan) return;
+  const plan = planCommandRestore(saved, now);
+  if (!plan) {
+    noteBrowserCommandRecovery(
+      'primary',
+      'schema_invalid',
+      'pause',
+      'validated bridge-command snapshot could not be planned safely'
+    );
+    return;
+  }
 
   // Recovery commands carry local-session authority rather than a standalone continuation WAL.
   // Revalidate them after session crash reconciliation and before any command is published or
   // allowed to open a browser. A stale durable marker may remain on disk after the A→B commit or
   // after a terminal recovery failure; neither state is permission to create another executor.
   const currentCommands: Command[] = [];
+  const providerReplacementPaused = providerReplacementRecoveryPaused();
   for (const command of plan.commands) {
-    if (command.spec.type === 'recovery' && !(await recoveryCommandCurrent(command.spec))) {
+    if (!providerReplacementPaused && command.spec.type === 'recovery' && !(await recoveryCommandCurrent(command.spec))) {
       if (command.timer) clearTimeout(command.timer);
       command.timer = null;
       continue;
@@ -10216,7 +10612,7 @@ export async function restoreCommands(): Promise<void> {
     currentCommands.push(command);
   }
   plan.commands = currentCommands;
-  await restoreMissingEmergencyResumes(plan, now);
+  if (!providerReplacementPaused) await restoreMissingEmergencyResumes(plan, now);
 
   // Rebuild the replacement-chat recorder gate from durable recovery authority before the
   // bridge publishes any restored browser work. `startBridgeOnce()` keeps every browser route
@@ -10224,10 +10620,10 @@ export async function restoreCommands(): Promise<void> {
   // cannot race `/events` into minting a shadow session after an app crash. The ACK/terminal
   // recovery path clears this exact episode id through endResumeClaim().
   for (const command of plan.commands) {
-    if (command.spec.type === 'recovery') noteResumeOpening(command.spec.episodeId);
+    if (!providerReplacementPaused && command.spec.type === 'recovery') noteResumeOpening(command.spec.episodeId);
   }
 
-  if (plan.expiredRevivals.length > 0) {
+  if (!agentsRecoveryPaused() && plan.expiredRevivals.length > 0) {
     let brokerRelevant = false;
     for (const expired of plan.expiredRevivals) {
       const revive = expired.spec;
@@ -10272,7 +10668,7 @@ export async function restoreCommands(): Promise<void> {
   // plan in memory is safe because admission is still fenced by bridgeRecovering.
   let rewriteDurable = true;
   try {
-    await writeDurableNow(COMMANDS_STATE, restoredCommandSnapshot(plan.commands, plan.receipts, now, plan.transportPausedAt));
+    await writeCommandLedgerNow(restoredCommandSnapshot(plan.commands, plan.receipts, now, plan.transportPausedAt));
     rewriteDurable = false;
   } catch (err) {
     logWarn(`bridge: could not persist reconstructed command state — ${err instanceof Error ? err.message : String(err)}`);

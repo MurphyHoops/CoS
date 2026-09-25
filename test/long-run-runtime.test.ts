@@ -58,6 +58,7 @@ vi.mock('../src/main/session/connectivity.js', () => ({
 }));
 
 const { initDurableStore, readDurable, resetDurableForTests } = await import('../src/main/durable.js');
+const { noteDurableRecoveryIncident, resetDurableRecoveryForTests } = await import('../src/main/durable-recovery.js');
 const {
   LONG_RUN_STATE,
   armLongRunWaitNow,
@@ -100,6 +101,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   resetLongRunRuntimeForTests();
   resetLongRunStateForTests();
+  resetDurableRecoveryForTests();
   resetDurableForTests();
   directory = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-long-run-runtime-'));
   initDurableStore(directory);
@@ -139,11 +141,31 @@ beforeEach(async () => {
 afterEach(async () => {
   resetLongRunRuntimeForTests();
   resetLongRunStateForTests();
+  resetDurableRecoveryForTests();
   resetDurableForTests();
   await fs.rm(directory, { recursive: true, force: true });
 });
 
 describe('local long-run supervisor', () => {
+  it('does no runtime or broker work while long-run durable recovery is paused', async () => {
+    await ensureRecoveryWorkNow(SESSION, CHAT, 'recovery:paused-runtime');
+    noteDurableRecoveryIncident({
+      domain: 'long-run',
+      ledger: 'long-run',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    await pollLongRunRuntime(Date.now() + 120_000);
+
+    expect(mocks.loadSessionProjectRuntimeProfile).not.toHaveBeenCalled();
+    expect(mocks.evaluateSessionProjectCompletion).not.toHaveBeenCalled();
+    expect(mocks.enqueueInput).not.toHaveBeenCalled();
+    expect(mocks.retireWorkerContinuationIfUnsent).not.toHaveBeenCalled();
+    expect(mocks.stageWorkerContinuation).not.toHaveBeenCalled();
+    expect(customInspect).not.toHaveBeenCalled();
+  });
+
   it('turns a timer completion into exactly one durable continuation', async () => {
     const dueAt = Date.now() + 1_000;
     await armLongRunWaitNow({

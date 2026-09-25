@@ -62,9 +62,11 @@ const {
   bindContinuationDestinationMessageNow,
   claimContinuationNow,
   commitContinuation,
+  commitContinuationResult,
   compactingConversation,
   continuationByToken,
   continuationForSession,
+  continuationRecoveryPaused,
   dispatchContinuationDestinationSendNow,
   dispatchContinuationSourceSendNow,
   openContinuationNow,
@@ -72,6 +74,7 @@ const {
   repairPrimeFromResumeShadow,
   resetContinuationsForTests,
   restoreContinuations,
+  restoreContinuationsDurableState,
   setContinuationRecoveryHooks,
   snapshotContinuations,
   supersededSourceConversations
@@ -82,7 +85,12 @@ const { createSession, getSession, initSessionStore, resetSessionStoreForTests, 
   '../src/main/session/store.js'
 );
 const store = await import('../src/main/session/store.js');
-const { initDurableStore, readDurable, resetDurableForTests, writeDurableNow } = await import('../src/main/durable.js');
+const { flushDurable, initDurableStore, readDurable, resetDurableForTests, writeDurableNow } = await import('../src/main/durable.js');
+const {
+  durableRecoveryIncidents,
+  noteDurableRecoveryIncident,
+  resetDurableRecoveryForTests
+} = await import('../src/main/durable-recovery.js');
 const {
   armLongRunWaitNow,
   executionEpochFor,
@@ -123,6 +131,8 @@ async function handoffCount(sessionId: string): Promise<number> {
 const CHAT_A = 'chat-a';
 const CHAT_B = 'chat-b';
 const CHAT_C = 'chat-c';
+const continuationPrimary = (): string => path.join(dir, 'state', 'continuations.json');
+const continuationBackup = (): string => path.join(dir, 'state', 'continuations.backup.json');
 
 beforeAll(async () => {
   dir = await makeTempDir('clf-continuation-');
@@ -138,6 +148,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
+  resetDurableRecoveryForTests();
   resetDurableForTests();
   initDurableStore(dir);
   resetContinuationsForTests();
@@ -163,6 +174,216 @@ async function readyContinuation(): Promise<{ sessionId: string; token: string }
   await attachSummary(opened.token, SAMPLE_BRIEF);
   return { sessionId: summary.id, token: opened.token };
 }
+
+describe('durable continuation corruption recovery', () => {
+  async function clearLiveStateKeepingBackup(): Promise<void> {
+    resetContinuationsForTests();
+    await flushDurable();
+    resetDurableRecoveryForTests();
+  }
+
+  it('pauses on truncated primary and never auto-restores a valid continuation backup', async () => {
+    const { sessionId, token } = await readyContinuation();
+    await flushDurable();
+    expect(await fs.readFile(continuationBackup(), 'utf8')).toContain(token);
+
+    await clearLiveStateKeepingBackup();
+    await fs.writeFile(continuationPrimary(), '{"version":', 'utf8');
+    await restoreContinuationsDurableState();
+
+    expect(continuationRecoveryPaused()).toBe(true);
+    expect(continuationForSession(sessionId)).toBeNull();
+    expect(durableRecoveryIncidents('continuation')).toContainEqual(
+      expect.objectContaining({ copy: 'primary', failure: 'json_corrupt', disposition: 'pause' })
+    );
+    await expect(beginContinuationDestinationSendNow(token)).rejects.toThrow('continuation_durable_recovery_required');
+  });
+
+  it('rejects the whole WAL when one send checkpoint carries impossible authority', async () => {
+    const { sessionId } = await readyContinuation();
+    const snapshot = structuredClone(snapshotContinuations()) as any;
+    snapshot.entries[0].destinationSend = {
+      state: 'sent',
+      conversationId: null,
+      messageId: null
+    };
+
+    await clearLiveStateKeepingBackup();
+    await fs.writeFile(continuationPrimary(), JSON.stringify(snapshot), 'utf8');
+    await restoreContinuationsDurableState();
+
+    expect(continuationRecoveryPaused()).toBe(true);
+    expect(continuationForSession(sessionId)).toBeNull();
+    expect(durableRecoveryIncidents('continuation')).toContainEqual(
+      expect.objectContaining({ copy: 'primary', failure: 'schema_invalid', disposition: 'pause' })
+    );
+  });
+
+  it('rejects a post-capture continuation whose durable handoff identity was lost', async () => {
+    const { sessionId } = await readyContinuation();
+    const snapshot = structuredClone(snapshotContinuations()) as any;
+    expect(snapshot.entries[0].state).toBe('awaiting-chat');
+    snapshot.entries[0].handoffId = null;
+
+    await clearLiveStateKeepingBackup();
+    await fs.writeFile(continuationPrimary(), JSON.stringify(snapshot), 'utf8');
+    await restoreContinuationsDurableState();
+
+    expect(continuationRecoveryPaused()).toBe(true);
+    expect(continuationForSession(sessionId)).toBeNull();
+    expect(durableRecoveryIncidents('continuation')).toContainEqual(
+      expect.objectContaining({ copy: 'primary', failure: 'schema_invalid', disposition: 'pause' })
+    );
+  });
+
+  it('treats a missing primary with surviving continuation backup as recovery-required', async () => {
+    const { token } = await readyContinuation();
+    await flushDurable();
+    expect(await fs.readFile(continuationBackup(), 'utf8')).toContain(token);
+
+    await clearLiveStateKeepingBackup();
+    await fs.rm(continuationPrimary(), { force: true });
+    await restoreContinuationsDurableState();
+
+    expect(continuationRecoveryPaused()).toBe(true);
+    expect(durableRecoveryIncidents('continuation')).toContainEqual(
+      expect.objectContaining({ copy: 'primary', failure: 'orphan_backup', disposition: 'pause' })
+    );
+  });
+
+  it('keeps continuation authority paused when both primary and backup are corrupt', async () => {
+    await readyContinuation();
+    await clearLiveStateKeepingBackup();
+    await fs.writeFile(continuationPrimary(), '{"version":', 'utf8');
+    await fs.writeFile(continuationBackup(), '{"version":', 'utf8');
+    await restoreContinuationsDurableState();
+
+    expect(continuationRecoveryPaused()).toBe(true);
+    expect(durableRecoveryIncidents('continuation')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ copy: 'primary', failure: 'json_corrupt', disposition: 'pause' }),
+      expect.objectContaining({ copy: 'backup', failure: 'json_corrupt', disposition: 'degraded' })
+    ]));
+  });
+
+  it('rejects duplicate open session authority instead of publishing a partial WAL', async () => {
+    const { token } = await readyContinuation();
+    const snapshot = structuredClone(snapshotContinuations()) as any;
+    snapshot.entries.push({
+      ...structuredClone(snapshot.entries[0]),
+      token: `${token}x`
+    });
+
+    resetContinuationsForTests();
+    await flushDurable();
+    expect(await restoreContinuations(snapshot)).toBe(false);
+
+    expect(continuationByToken(token)).toBeNull();
+    expect(continuationByToken(`${token}x`)).toBeNull();
+  });
+
+  it('restores every valid authority row instead of truncating the WAL after 32 entries', async () => {
+    const seed = await createSession({ title: 'restore all continuation rows seed', conversationId: CHAT_A });
+    await openContinuationNow(seed.id, CHAT_A);
+    const base = structuredClone(snapshotContinuations()) as any;
+    const template = base.entries[0];
+    const sessions: Array<{ id: string; from: string }> = [];
+    for (let index = 0; index < 33; index += 1) {
+      const from = `chat-row-${String(index).padStart(2, '0')}`;
+      const session = await createSession({ title: `restore row ${index}`, conversationId: from });
+      sessions.push({ id: session.id, from });
+    }
+    base.entries = sessions.map((session, index) => ({
+      ...structuredClone(template),
+      token: `continuation-row-${String(index).padStart(2, '0')}-authority`,
+      sessionId: session.id,
+      from: session.from
+    }));
+
+    resetContinuationsForTests();
+    await flushDurable();
+    expect(await restoreContinuations(base)).toBe(true);
+
+    expect(continuationByToken('continuation-row-32-authority')).toMatchObject({
+      sessionId: sessions[32]!.id,
+      from: 'chat-row-32',
+      state: 'awaiting-summary'
+    });
+  });
+
+  it('revokes live continuation Send, claim and commit authority immediately when pause appears', async () => {
+    const summary = await createSession({ title: 'live continuation recovery fence', conversationId: CHAT_A });
+    const opened = await openContinuationNow(summary.id, CHAT_A);
+
+    noteDurableRecoveryIncident({
+      domain: 'continuation',
+      ledger: 'continuations',
+      failure: 'schema_invalid',
+      disposition: 'pause'
+    });
+
+    expect(continuationRecoveryPaused()).toBe(true);
+    expect(continuationForSession(summary.id)).toBeNull();
+    await expect(beginContinuationSourceSendNow(opened.token)).rejects.toThrow('continuation_durable_recovery_required');
+    await expect(claimContinuationNow(opened.token, 'resume-command')).rejects.toThrow('continuation_durable_recovery_required');
+    expect(await commitContinuationResult(opened.token, CHAT_B)).toMatchObject({ status: 'retryable' });
+    expect(abortContinuation(opened.token, 'must not mutate unknown WAL')).toBe(false);
+  });
+
+  it('preserves the documented legacy normalization for an unrecognized Project string', async () => {
+    const { token } = await readyContinuation();
+    const snapshot = structuredClone(snapshotContinuations()) as any;
+    snapshot.entries[0].project = 'legacy-project-name-that-is-not-a-routing-id';
+
+    resetContinuationsForTests();
+    await flushDurable();
+    expect(await restoreContinuations(snapshot)).toBe(true);
+    expect(continuationByToken(token)?.project).toBeNull();
+  });
+});
+
+describe('agents authority dependency', () => {
+  it('does not publish a new continuation or cross A to B while agent identity is recovery-paused', async () => {
+    const { sessionId, token } = await readyContinuation();
+    const before = continuationByToken(token);
+    expect(before?.state).toBe('awaiting-chat');
+
+    noteDurableRecoveryIncident({
+      domain: 'agents',
+      ledger: 'swarm',
+      failure: 'schema_invalid',
+      disposition: 'pause'
+    });
+
+    const result = await commitContinuationResult(token, CHAT_B);
+    expect(result).toMatchObject({ status: 'retryable' });
+    expect((await getSession(sessionId))?.conversationId).toBe(CHAT_A);
+    expect(continuationByToken(token)).toMatchObject({ state: 'awaiting-chat', to: null });
+
+    const another = await createSession({ title: 'blocked open', conversationId: CHAT_C });
+    await expect(openContinuationNow(another.id, CHAT_C)).rejects.toThrow('agents_durable_recovery_required');
+  });
+
+  it('defers healthy continuation WAL restore without rewriting or misclassifying it when agents are paused', async () => {
+    const { sessionId, token } = await readyContinuation();
+    await flushDurable();
+    const before = await fs.readFile(continuationPrimary(), 'utf8');
+    expect(before).toContain(token);
+
+    resetContinuationsForTests();
+    noteDurableRecoveryIncident({
+      domain: 'agents',
+      ledger: 'retired-workers',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    await restoreContinuationsDurableState();
+
+    expect(continuationForSession(sessionId)).toBeNull();
+    expect(durableRecoveryIncidents('continuation')).toEqual([]);
+    expect(await fs.readFile(continuationPrimary(), 'utf8')).toBe(before);
+  });
+});
 
 describe('capturing the brief', () => {
   it('freezes exact source model intent across selection changes and durable restore', async () => {
@@ -1317,7 +1538,7 @@ describe('restart lifetime recovery', () => {
           openedAt: now - 1_000,
           state: 'committed',
           summary: SAMPLE_BRIEF,
-          handoffId: null,
+          handoffId: 'first-move-handoff',
           claimedBy: CHAT_B,
           armed: true,
           error: null
@@ -1350,7 +1571,7 @@ describe('restart lifetime recovery', () => {
           openedAt: now - CONTINUATION_TTL_MS - 1,
           state: 'committing',
           summary: SAMPLE_BRIEF,
-          handoffId: null,
+          handoffId: 'expired-commit-handoff',
           claimedBy: CHAT_B,
           armed: true,
           error: null
@@ -1384,7 +1605,7 @@ describe('restart lifetime recovery', () => {
           openedAt: now - CONTINUATION_TTL_MS - 1,
           state: 'committed',
           summary: SAMPLE_BRIEF,
-          handoffId: null,
+          handoffId: 'terminal-replay-handoff',
           claimedBy: CHAT_B,
           armed: true,
           error: null

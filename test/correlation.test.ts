@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -16,11 +16,14 @@ import {
   requestCorrelation,
   awaitRequestCorrelation,
   restoreRequestCorrelations,
+  CORRELATIONS_STATE,
+  correlationRecoveryPaused,
   resetCorrelationRegistryForTests
 } from '../src/main/session/correlation.js';
+import { durableRecoveryIncidents, resetDurableRecoveryForTests } from '../src/main/durable-recovery.js';
 
 describe('request correlation ownership', () => {
-  beforeEach(() => resetCorrelationRegistryForTests());
+  beforeEach(() => { resetCorrelationRegistryForTests(); resetDurableRecoveryForTests(); });
   afterEach(() => vi.useRealTimers());
 
   it('spends grace once per request while accepting late exact evidence', async () => {
@@ -285,6 +288,85 @@ describe('request correlation ownership', () => {
       expect(requestCorrelation(requestId)?.sessionId).toBe('2026-01-01-00000028');
     } finally {
       resetCorrelationRegistryForTests();
+      resetDurableForTests();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a corrupt primary authoritative-for-pause instead of rebuilding over it from history', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'clf-correlation-corrupt-'));
+    try {
+      resetDurableForTests();
+      resetSessionStoreForTests();
+      initDurableStore(dir);
+      initSessionStore(dir);
+      const session = await createSession({ title: 'corrupt correlation', conversationId: 'conv-corrupt-history' });
+      await appendEvent(session.id, {
+        time: 100,
+        source: 'mcp',
+        kind: 'tool_call',
+        call: {
+          callId: 'call-corrupt-history',
+          tool: 'read',
+          attribution: 'request_id',
+          requestId: 'wfr_corrupt_history',
+          conversationId: 'conv-corrupt-history',
+          attributionMethod: 'request_id',
+          args: { text: '{}', truncated: false, chars: 2 },
+          result: { text: 'ok', truncated: false, chars: 2 },
+          outcome: 'ok',
+          durationMs: 1,
+          summary: { kind: 'read', tone: 'neutral', title: 'Read history' }
+        }
+      });
+      const state = path.join(dir, 'state', `${CORRELATIONS_STATE}.json`);
+      await writeDurableNow(CORRELATIONS_STATE, { version: 5, entries: [] });
+      await writeFile(state, '{"version":', 'utf8');
+
+      resetCorrelationRegistryForTests();
+      await restoreRequestCorrelations();
+
+      expect(correlationRecoveryPaused()).toBe(true);
+      expect(requestCorrelation('wfr_corrupt_history')).toBeNull();
+      expect(durableRecoveryIncidents('correlation')).toContainEqual(
+        expect.objectContaining({ ledger: CORRELATIONS_STATE, failure: 'json_corrupt', disposition: 'pause' })
+      );
+      expect(await readFile(state, 'utf8')).toBe('{"version":');
+    } finally {
+      resetCorrelationRegistryForTests();
+      resetDurableRecoveryForTests();
+      resetSessionStoreForTests();
+      resetDurableForTests();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects duplicate permanent request owners as whole-ledger schema corruption', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'clf-correlation-schema-'));
+    try {
+      resetDurableForTests();
+      initDurableStore(dir);
+      const row = {
+        requestId: 'wfr_duplicate_owner',
+        conversationId: 'conv-duplicate',
+        sessionId: 'session-duplicate',
+        messageId: 'message-duplicate',
+        tool: '',
+        observedAt: 100
+      };
+      await writeDurableNow(CORRELATIONS_STATE, { version: 5, entries: [row, { ...row }] });
+
+      resetCorrelationRegistryForTests();
+      await restoreRequestCorrelations();
+
+      expect(correlationRecoveryPaused()).toBe(true);
+      expect(requestCorrelation(row.requestId)).toBeNull();
+      expect(durableRecoveryIncidents('correlation')).toContainEqual(
+        expect.objectContaining({ ledger: CORRELATIONS_STATE, failure: 'schema_invalid', disposition: 'pause' })
+      );
+    } finally {
+      resetCorrelationRegistryForTests();
+      resetDurableRecoveryForTests();
       resetDurableForTests();
       await rm(dir, { recursive: true, force: true });
     }

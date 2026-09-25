@@ -22,6 +22,7 @@ import path from 'node:path';
 import sharp from 'sharp';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { effectiveCapabilities, defaultConfig } from '../src/main/config.js';
+import { initDurableStore } from '../src/main/durable.js';
 import { lastRequestAt, selfTestHeaders, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from '../src/main/mcp/server.js';
 import { lastToolCallAt, type ToolContext } from '../src/main/mcp/tools.js';
 import { friendlyError } from '../src/main/mcp/kernel.js';
@@ -40,6 +41,7 @@ import { observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { WINDOWS_COMPUTER_METHODS, WINDOWS_COMPUTER_READ_METHODS } from '../src/shared/windows-computer.js';
 import { BROWSER_TOOLS, BROWSER_READ_TOOLS } from '../src/shared/browser-control.js';
 import { resetBlockedChatsForTests, setChatBlocked } from '../src/main/session/blocked-chats.js';
+import { noteDurableRecoveryIncident, resetDurableRecoveryForTests } from '../src/main/durable-recovery.js';
 import {
   abortContinuation,
   attachSummary,
@@ -250,6 +252,7 @@ beforeAll(async () => {
   // default now, so without a directory of its own the recorder wrote session folders
   // into the process's working directory — which for a test run is the repository.
   initSessionStore(base);
+  initDurableStore(base);
   approved = path.join(base, 'workspace');
   outside = path.join(base, 'private');
   await writeTree(approved, {
@@ -3078,6 +3081,63 @@ describe('agent-maintained plans over MCP', () => {
 });
 
 describe('durable wait admission over MCP', () => {
+  beforeEach(() => resetDurableRecoveryForTests());
+  afterAll(() => resetDurableRecoveryForTests());
+
+  it('fails ordinary MCP tools closed while the long-run authority ledger is in recovery pause', async () => {
+    noteDurableRecoveryIncident({
+      domain: 'long-run',
+      ledger: 'long-run',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    const reply = await modern(
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } }
+    );
+
+    expect(failed(reply)).toBe(true);
+    expect(textOf(reply)).toContain('long-run execution ledger');
+    expect(textOf(reply)).not.toContain('/workspace/notes.txt');
+  });
+
+  it('fails ordinary MCP tools closed while the continuation transaction ledger is in recovery pause', async () => {
+    noteDurableRecoveryIncident({
+      domain: 'continuation',
+      ledger: 'continuations',
+      failure: 'schema_invalid',
+      disposition: 'pause'
+    });
+
+    const reply = await modern(
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } }
+    );
+
+    expect(failed(reply)).toBe(true);
+    expect(textOf(reply)).toContain('Compact & Resume transaction ledger');
+    expect(textOf(reply)).not.toContain('/workspace/notes.txt');
+  });
+
+  it('fails ordinary MCP tools closed while multi-agent authority is in recovery pause', async () => {
+    noteDurableRecoveryIncident({
+      domain: 'agents',
+      ledger: 'swarm',
+      failure: 'schema_invalid',
+      disposition: 'pause'
+    });
+
+    const reply = await modern(
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } }
+    );
+
+    expect(failed(reply)).toBe(true);
+    expect(textOf(reply)).toContain('multi-agent authority ledgers');
+    expect(textOf(reply)).not.toContain('/workspace/notes.txt');
+  });
+
   it('fails closed when session_wait cannot prove the source turn yet', async () => {
     ctx.sessionTools = true;
     const conversationId = 'wait-admission-source';
@@ -4023,8 +4083,14 @@ describe('blocked chats', () => {
       requestId ? { 'x-request-id': `${requestId}/att1` } : {}
     );
 
-  beforeEach(() => resetBlockedChatsForTests());
-  afterAll(() => resetBlockedChatsForTests());
+  beforeEach(() => {
+    resetBlockedChatsForTests();
+    resetDurableRecoveryForTests();
+  });
+  afterAll(() => {
+    resetBlockedChatsForTests();
+    resetDurableRecoveryForTests();
+  });
 
   it('refuses a blocked chat’s call and tells the model to stop instead of retrying', async () => {
     await setChatBlocked(ROGUE, true);
@@ -4070,6 +4136,22 @@ describe('blocked chats', () => {
     const unproven = await readAs(null);
     expect(failed(unproven)).toBe(false);
     expect(textOf(unproven)).toContain('/workspace/notes.txt');
+  });
+
+  it('fails every MCP tool closed while blocked-chat durable recovery is paused, even without caller identity', async () => {
+    noteDurableRecoveryIncident({
+      domain: 'blocked-tools',
+      ledger: 'blocked-chats',
+      failure: 'json_corrupt',
+      disposition: 'pause'
+    });
+
+    const reply = await readAs(null);
+    const text = textOf(reply);
+
+    expect(failed(reply)).toBe(true);
+    expect(text).toContain('DURABLE_RECOVERY_PAUSED');
+    expect(text).not.toContain('/workspace/notes.txt');
   });
 
   it('refuses the call whose page evidence proves the blocked chat only after it arrives', async () => {

@@ -10,10 +10,21 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { flushDurable, initDurableStore, readDurable, resetDurableForTests } from '../src/main/durable.js';
+import {
+  flushDurable,
+  initDurableStore,
+  readDurable,
+  readDurableResult,
+  resetDurableForTests
+} from '../src/main/durable.js';
+import {
+  durableRecoveryIncidents,
+  resetDurableRecoveryForTests
+} from '../src/main/durable-recovery.js';
 import {
   BLOCKED_CHAT_REFUSAL,
   blockedChatIds,
+  blockedChatRecoveryPaused,
   isChatBlocked,
   resetBlockedChatsForTests,
   restoreBlockedChats,
@@ -28,6 +39,7 @@ let dir: string;
 
 beforeEach(async () => {
   resetBlockedChatsForTests();
+  resetDurableRecoveryForTests();
   resetDurableForTests();
   dir = await makeTempDir('clf-blocked-');
   initDurableStore(dir);
@@ -35,6 +47,7 @@ beforeEach(async () => {
 
 afterAll(async () => {
   resetBlockedChatsForTests();
+  resetDurableRecoveryForTests();
   resetDurableForTests();
   if (dir) await removeTempDir(dir);
 });
@@ -192,5 +205,70 @@ describe('blocked chats', () => {
     resetBlockedChatsForTests();
     await restoreBlockedChats();
     expect(isChatBlocked(ROGUE)).toBe(true);
+  });
+
+  it('pauses blocked-tool authority on truncated JSON instead of treating it as empty', async () => {
+    const stateDir = path.join(dir, 'state');
+    await fs.mkdir(stateDir, { recursive: true });
+    await fs.writeFile(path.join(stateDir, 'blocked-chats.json'), '{"version":1,"entries":[', 'utf8');
+
+    await restoreBlockedChats();
+
+    expect(blockedChatIds()).toEqual([]);
+    expect(blockedChatRecoveryPaused()).toBe(true);
+    expect(durableRecoveryIncidents('blocked-tools')).toEqual([
+      expect.objectContaining({ ledger: 'blocked-chats', copy: 'primary', failure: 'json_corrupt', disposition: 'pause' })
+    ]);
+    await expect(setChatBlocked(ROGUE, true)).rejects.toThrow(/durable recovery/i);
+  });
+
+  it('rejects the complete snapshot when any blocked-chat row is schema-invalid', async () => {
+    const stateDir = path.join(dir, 'state');
+    await fs.mkdir(stateDir, { recursive: true });
+    await fs.writeFile(path.join(stateDir, 'blocked-chats.json'), JSON.stringify({
+      version: 1,
+      entries: [
+        { conversationId: ROGUE, blockedAt: Date.now() },
+        { conversationId: 'bad!', blockedAt: Date.now() }
+      ]
+    }), 'utf8');
+
+    await restoreBlockedChats();
+
+    expect(blockedChatIds()).toEqual([]);
+    expect(isChatBlocked(ROGUE)).toBe(false);
+    expect(blockedChatRecoveryPaused()).toBe(true);
+    expect(durableRecoveryIncidents('blocked-tools')).toEqual([
+      expect.objectContaining({ failure: 'schema_invalid', disposition: 'pause' })
+    ]);
+  });
+
+  it('does not auto-restore a valid backup when the primary is corrupt', async () => {
+    await setChatBlocked(ROGUE, true);
+    expect(await readDurableResult('blocked-chats', 'backup')).toMatchObject({ kind: 'valid' });
+
+    resetBlockedChatsForTests();
+    resetDurableRecoveryForTests();
+    await fs.writeFile(path.join(dir, 'state', 'blocked-chats.json'), '{"version":', 'utf8');
+    await restoreBlockedChats();
+
+    expect(blockedChatIds()).toEqual([]);
+    expect(blockedChatRecoveryPaused()).toBe(true);
+    expect(await readDurableResult('blocked-chats', 'backup')).toMatchObject({ kind: 'valid' });
+  });
+
+  it('treats a missing primary with surviving backup evidence as recovery-required, not first-run empty', async () => {
+    await setChatBlocked(ROGUE, true);
+    resetBlockedChatsForTests();
+    resetDurableRecoveryForTests();
+    await fs.rm(path.join(dir, 'state', 'blocked-chats.json'), { force: true });
+
+    await restoreBlockedChats();
+
+    expect(blockedChatIds()).toEqual([]);
+    expect(blockedChatRecoveryPaused()).toBe(true);
+    expect(durableRecoveryIncidents('blocked-tools')).toEqual([
+      expect.objectContaining({ copy: 'primary', failure: 'orphan_backup', disposition: 'pause' })
+    ]);
   });
 });
