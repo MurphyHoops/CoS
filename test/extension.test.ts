@@ -485,6 +485,7 @@ interface WorkerHarness {
   tabsSendMessage: ReturnType<typeof vi.fn>;
   tabsRemove: ReturnType<typeof vi.fn>;
   tabsReload: ReturnType<typeof vi.fn>;
+  runtimeReload: ReturnType<typeof vi.fn>;
   windowsUpdate: ReturnType<typeof vi.fn>;
   scriptingExecuteScript: ReturnType<typeof vi.fn>;
   scriptingInsertCSS: ReturnType<typeof vi.fn>;
@@ -540,6 +541,7 @@ function loadWorker(options: {
   const tabsSendMessage = vi.fn(options.tabsSendMessage ?? (async () => ({ ok: true })));
   const tabsRemove = vi.fn(async () => undefined);
   const tabsReload = vi.fn(async () => undefined);
+  const runtimeReload = vi.fn(() => undefined);
   const scriptingExecuteScript = vi.fn(async () => []);
   const scriptingInsertCSS = vi.fn(async () => undefined);
   const alarmCreate = vi.fn(() => undefined);
@@ -560,6 +562,7 @@ function loadWorker(options: {
     storage: { local: options.local, session: options.session },
     runtime: {
       getManifest: () => ({ version: '1.6.0' }),
+      reload: runtimeReload,
       onMessage: {
         addListener(fn: typeof listener) {
           listener = fn;
@@ -635,6 +638,7 @@ function loadWorker(options: {
     tabsSendMessage,
     tabsRemove,
     tabsReload,
+    runtimeReload,
     windowsUpdate,
     scriptingExecuteScript,
     scriptingInsertCSS,
@@ -747,6 +751,44 @@ function journalOf(session: FakeStorageArea): any[] {
   const value = session.data.journal;
   return Array.isArray(value) ? value : [];
 }
+
+describe('companion self-refresh after an app update', () => {
+  it('reloads once per transition, clears the fence after a matching build, and prevents stale-source loops', async () => {
+    const local = new FakeStorageArea();
+    const app = (companionBuildId: string) => async () => response(200, {
+        app: 'chat-on-steroids',
+        version: '9.9.9',
+        paired: false,
+        companionBuildId
+      });
+    const first = loadWorker({
+      local,
+      session: new FakeStorageArea(),
+      fetch: app('cos-next-companion-build')
+    });
+
+    await first.send({ type: 'status' });
+    expect(first.runtimeReload).toHaveBeenCalledTimes(1);
+    expect((await local.get('clfAutoReloadedForCompanionBuild')).clfAutoReloadedForCompanionBuild)
+      .toBe('cos-next-companion-build');
+
+    // A second stale worker from the wrong unpacked directory must diagnose, not loop.
+    const stillStale = loadWorker({ local, session: new FakeStorageArea(), fetch: app('cos-next-companion-build') });
+    await stillStale.send({ type: 'status' });
+    expect(stillStale.runtimeReload).not.toHaveBeenCalled();
+
+    // A successful transition observes this worker's own build and retires the durable fence.
+    const matched = loadWorker({ local, session: new FakeStorageArea(), fetch: app(COMPANION_BUILD_ID) });
+    await matched.send({ type: 'status' });
+    expect(matched.runtimeReload).not.toHaveBeenCalled();
+    expect((await local.get('clfAutoReloadedForCompanionBuild')).clfAutoReloadedForCompanionBuild).toBeNull();
+
+    // The same A→B expectation later is a new transition and gets one new attempt.
+    const later = loadWorker({ local, session: new FakeStorageArea(), fetch: app('cos-next-companion-build') });
+    await later.send({ type: 'status' });
+    expect(later.runtimeReload).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('accepted helper tab cleanup', () => {
   for (const outcome of ['accepted', 'rejected', 'navigated', 'pinned', 'busy', 'draft', 'pinned-during-proof'] as const) {

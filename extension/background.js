@@ -44,7 +44,7 @@ const TIMED_OUT = 'the app took too long to answer';
 /** Bumped only when the request/response shape changes; the app compares it. */
 const BRIDGE_PROTOCOL = 15;
 /** Must match companion-build.txt; packaging/tests enforce this release identity. */
-const COMPANION_BUILD_ID = 'cos-3.1.2-companion-diagnostics-v1';
+const COMPANION_BUILD_ID = 'cos-3.1.3-companion-autorefresh-v1';
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a
@@ -55,6 +55,8 @@ const MAX_JOURNAL = 4000;
 const MAX_JOURNAL_BYTES = 4 * 1024 * 1024;
 const BATCH = 100;
 const RETRY_ALARM = 'clf-bridge-drain';
+/** One self-reload per app companion build prevents a stale source from creating a reload loop. */
+const AUTO_RELOAD_BUILD_KEY = 'clfAutoReloadedForCompanionBuild';
 /**
  * How long the worker sleeps between maintenance passes, in minutes.
  *
@@ -1006,6 +1008,41 @@ function versionHeaders() {
 }
 
 /**
+ * An installed app refreshes the stable unpacked-extension folder before its bridge starts.
+ * If this still-running worker belongs to the previous app build, reload the extension from that
+ * same stable folder exactly once. Chrome then starts the new worker and our startup recovery
+ * reinjects dead content scripts into already-open ChatGPT tabs.
+ *
+ * The persisted build fence is essential: a browser that was deliberately loaded from some other
+ * stale unpacked directory would otherwise reload itself forever. In that exceptional case one
+ * automatic attempt is made and the existing source-mismatch UI remains the manual recovery path.
+ */
+async function reloadForExpectedCompanionBuild(body) {
+  const expected = typeof body?.companionBuildId === 'string' ? body.companionBuildId : null;
+  if (!expected) return false;
+  try {
+    const stored = await chrome.storage.local.get(AUTO_RELOAD_BUILD_KEY);
+    if (expected === COMPANION_BUILD_ID) {
+      // The requested transition completed. Retire its durable fence so a later A→B transition
+      // (for example after browser profile restore or downgrade/upgrade) gets one fresh attempt.
+      if (stored?.[AUTO_RELOAD_BUILD_KEY] != null) {
+        await chrome.storage.local.set({ [AUTO_RELOAD_BUILD_KEY]: null });
+      }
+      return false;
+    }
+    if (typeof chrome.runtime?.reload !== 'function') return false;
+    if (stored?.[AUTO_RELOAD_BUILD_KEY] === expected) return false;
+    await chrome.storage.local.set({ [AUTO_RELOAD_BUILD_KEY]: expected });
+    chrome.runtime.reload();
+    return true;
+  } catch {
+    // Storage or reload may be unavailable in a constrained browser. Keep the ordinary mismatch
+    // diagnosis alive rather than turning recovery into another transport failure.
+    return false;
+  }
+}
+
+/**
  * Finds the app, preferring the port that worked last time.
  *
  * A recent confirmation is believed rather than re-checked. The alternative was a
@@ -1019,6 +1056,7 @@ async function discover(force = false) {
     if (Date.now() - portCheckedAt < PORT_TRUST_MS) return { port, paired: token !== null, compatible: portCompatible !== false, version: appVersion, bridge: appProtocol, companionBuildId: appCompanionBuildId };
     const body = await hello(port);
     if (body) {
+      if (await reloadForExpectedCompanionBuild(body)) return null;
       if (body.disconnected === true) await latchAppDisconnect();
       portCheckedAt = Date.now();
       portCompatible = body.compatible !== false && body.bridge === BRIDGE_PROTOCOL;
@@ -1031,6 +1069,7 @@ async function discover(force = false) {
   for (const candidate of PORTS) {
     const body = await hello(candidate);
     if (body) {
+      if (await reloadForExpectedCompanionBuild(body)) return null;
       if (body.disconnected === true) await latchAppDisconnect();
       port = candidate;
       portCheckedAt = Date.now();
