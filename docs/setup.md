@@ -10,14 +10,17 @@ Install the CoS desktop app and use the companion extension shipped with the sam
 
 After updating either component:
 - restart/reopen CoS;
-- reload the unpacked companion extension from the **extension folder opened by that exact app build**;
+- from CoS 3.1.3 onward, the app refreshes its stable unpacked companion folder before the bridge starts and a previously current companion self-reloads once when it sees the new build;
+- refresh the affected ChatGPT tab if its page UI was already open during the update;
 - refresh/reconnect the CoS custom app in ChatGPT if the MCP schema changed.
 
 Version equality alone does not prove Chrome is running the right unpacked directory. CoS 3.1.1
-also compares an opaque companion-build identity. If the app or extension says **Loaded copy
-mismatch**, open **Setup → Open extension folder**, then in `chrome://extensions` remove/reload
-the companion from that exact folder. App/extension protocol or companion-build mismatch is a
-configuration error, not a recovery condition.
+also compares an opaque companion-build identity. CoS 3.1.3 uses that identity to perform one
+automatic reload per new app build when Chrome is already using the stable CoS extension folder.
+If the app or extension still says **Loaded copy mismatch** after that attempt, Chrome is likely
+loaded from some other unpacked directory; open **Setup → Open extension folder**, then in
+`chrome://extensions` remove/reload the companion from that exact folder. That exceptional source
+mismatch remains a configuration error rather than something the app should loop on.
 
 ## 2. Approve workspace capabilities
 

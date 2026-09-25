@@ -9,10 +9,24 @@ CoS 3.x is the current standalone durable-runtime line. Entries before 3.0 are p
 historical release records; their repository links, terminology and implementation descriptions
 document what was true at the time and are not the current architecture contract.
 
-The app and the `extension/` companion are versioned together. **Reload the
-extension after updating the app**. If their bridge protocols or exact companion-build
-identities do not match, the app reports the mismatch and asks you to reload the copy shipped
-with the current app.
+The app and the `extension/` companion are versioned together. Starting with 3.1.3, the app
+refreshes the stable unpacked-extension folder before the browser bridge starts and the companion
+self-reloads once when it sees a newer expected build. Existing ChatGPT tabs are repaired after
+that reload; a normal page refresh is sufficient if a tab still shows stale UI. Manual
+chrome://extensions reload remains the fallback only for an intentionally different unpacked path.
+
+## [3.1.3] — 2026-09-25
+
+### Stable companion refresh and current release packaging
+
+- Fixed the recurring post-update companion failure by materializing the bundled extension eagerly before bridge startup instead of waiting for the Setup renderer to ask for its path.
+- Stopped replacing the Chrome-visible unpacked-extension root directory during updates. New files are staged and verified first, then synchronized into the existing root so the registered path never disappears during a normal refresh.
+- Added one-shot companion self-reload keyed by the app's expected companion-build identity. Future app updates can advance the unpacked companion automatically without a remove/re-load cycle; open ChatGPT tabs are reinjected by the existing extension-reload recovery path.
+- Added regression coverage for eager startup materialization, stable root identity on POSIX, interrupted in-place refresh recovery, and reload-loop fencing.
+- Updated the pinned OpenAI tunnel-client from **v0.0.14** to **v0.0.15** with all six platform/architecture SHA-256 pins, fixing the release preflight that blocked v3.1.2 publishing.
+- Bumped the app and companion release version to **3.1.3**; bridge protocol remains **15**.
+
+See [the 3.1.3 release notes](docs/release-notes/v3.1.3.md).
 
 ## [3.1.2] — 2026-09-25
 

@@ -16,6 +16,7 @@ import { unifiedExecManager } from './codex/manager.js';
 import { initSecretsPath } from './secrets.js';
 import { pluginManager } from './plugins/manager.js';
 import { setBrowserOpener, setBrowserWorkArea, shutdownBridge, startBridge } from './bridge.js';
+import { extensionDir } from './extension-path.js';
 import { flushSessions, initSessionStore } from './session/store.js';
 import { initSkillsPath } from './skills.js';
 import { usageOverview } from './session/usage.js';
@@ -433,6 +434,15 @@ void app.whenReady().then(async () => {
   tray.on('click', windowActivation.request);
   refreshTray();
   onStatusChange(refreshTray);
+
+  // Materialize the bundled companion before the bridge can accept an old service worker.
+  // This used to happen lazily when the renderer painted the Setup path, so a background/tray
+  // restart after an app update could leave Chrome reloading yesterday's files indefinitely.
+  // The Chrome-visible path is stable; extensionDir() refreshes its contents to this app build.
+  const preparedExtension = extensionDir();
+  if (app.isPackaged && !preparedExtension) {
+    logWarn('browser companion: packaged extension could not be materialized at startup');
+  }
 
   logInfo('app started');
 

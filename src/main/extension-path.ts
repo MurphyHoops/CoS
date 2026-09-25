@@ -27,6 +27,8 @@ import path from 'node:path';
 import { app } from 'electron';
 
 const MATERIALIZED_FINGERPRINT = '.chat-on-steroids-source';
+const MATERIALIZATION_IN_PROGRESS = '.chat-on-steroids-refreshing';
+const MATERIALIZATION_NEXT_PREFIX = '.chat-on-steroids-next-';
 
 function extensionFingerprint(root: string): string {
   const hash = createHash('sha256');
@@ -34,6 +36,7 @@ function extensionFingerprint(root: string): string {
     const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
     for (const entry of entries) {
       const relative = relativeDir ? path.posix.join(relativeDir, entry.name) : entry.name;
+      if (relative === MATERIALIZED_FINGERPRINT || relative === MATERIALIZATION_IN_PROGRESS) continue;
       const absolute = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         hash.update(`d\0${relative}\0`);
@@ -53,6 +56,68 @@ function extensionFingerprint(root: string): string {
   return hash.digest('hex');
 }
 
+function directoryExists(dir: string): boolean {
+  try {
+    return statSync(dir).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Synchronize one complete staged tree into the directory Chrome already loaded without ever
+ * replacing that root directory itself.
+ *
+ * Replacing the loaded root with `rename(old, backup); rename(stage, old)` creates a real interval
+ * in which Chrome's registered unpacked path does not exist, and it also changes the root's
+ * filesystem identity. Chromium's explicit Reload re-opens the registered path, but avoiding the
+ * disappearing/replaced root is the stronger invariant for browser and OS observers alike.
+ *
+ * The package is first staged and verified elsewhere. We then replace children only. Top-level
+ * files are copied to temporary siblings before publication (an atomic rename on POSIX), while
+ * directories are fully copied to a temporary sibling before the old child is retired. The
+ * manifest and fingerprint publish last, and an already-running service worker keeps using its
+ * loaded code until Chrome reloads the extension.
+ */
+function syncContentsKeepingRoot(source: string, destination: string): void {
+  mkdirSync(destination, { recursive: true });
+  const sourceEntries = readdirSync(source, { withFileTypes: true });
+  const wanted = new Set(sourceEntries.map((entry) => entry.name));
+
+  for (const entry of readdirSync(destination, { withFileTypes: true })) {
+    if (entry.name === MATERIALIZATION_IN_PROGRESS) continue;
+    if (entry.name.startsWith(MATERIALIZATION_NEXT_PREFIX)) {
+      rmSync(path.join(destination, entry.name), { recursive: true, force: true });
+      continue;
+    }
+    if (!wanted.has(entry.name)) rmSync(path.join(destination, entry.name), { recursive: true, force: true });
+  }
+
+  const ordered = sourceEntries.sort((a, b) => {
+    const rank = (name: string): number =>
+      name === MATERIALIZED_FINGERPRINT ? 2 : name === 'manifest.json' ? 1 : 0;
+    return rank(a.name) - rank(b.name) || a.name.localeCompare(b.name);
+  });
+
+  for (const entry of ordered) {
+    if (entry.name === MATERIALIZATION_IN_PROGRESS) continue;
+    const from = path.join(source, entry.name);
+    const to = path.join(destination, entry.name);
+    const next = path.join(destination, `${MATERIALIZATION_NEXT_PREFIX}${entry.name}`);
+    if (!entry.isDirectory() && !entry.isFile()) throw new Error(`Unsupported extension entry: ${entry.name}`);
+    rmSync(next, { recursive: true, force: true });
+    cpSync(from, next, { recursive: entry.isDirectory(), force: true });
+    if (entry.isDirectory() || process.platform === 'win32' || directoryExists(to)) {
+      // Node cannot portably replace a non-empty directory (and Windows cannot replace an open
+      // file) with rename. The verified replacement already exists beside it, so the exposed
+      // child-only gap is bounded to these two synchronous filesystem operations. The stable root
+      // itself never disappears, and the refresh marker + backup make a crash here recoverable.
+      rmSync(to, { recursive: true, force: true });
+    }
+    renameSync(next, to);
+  }
+}
+
 function validExtension(dir: string): boolean {
   try {
     return statSync(path.join(dir, 'manifest.json')).isFile();
@@ -69,14 +134,31 @@ function materializedFingerprint(dir: string): string | null {
   }
 }
 
+function usableMaterializedExtension(dir: string): boolean {
+  return validExtension(dir) && !existsSync(path.join(dir, MATERIALIZATION_IN_PROGRESS));
+}
+
 function recoverInterruptedMaterialization(stable: string, stage: string, backup: string): void {
-  if (validExtension(stable)) return;
+  const refreshInterrupted = existsSync(path.join(stable, MATERIALIZATION_IN_PROGRESS));
+  if (validExtension(stable) && !refreshInterrupted) {
+    rmSync(stage, { recursive: true, force: true });
+    rmSync(backup, { recursive: true, force: true });
+    return;
+  }
 
   // The backup is authoritative over staging: it was the previously published Chrome folder,
-  // whereas `.new` may have been copied but not yet promoted when the process stopped.
+  // whereas `.new` may have been copied but not yet published when the process stopped. Preserve
+  // the Chrome-visible root when it still exists; legacy builds may instead have crashed after
+  // renaming the root away, in which case a one-time root restoration is unavoidable.
   if (validExtension(backup)) {
-    if (existsSync(stable)) rmSync(stable, { recursive: true, force: true });
-    renameSync(backup, stable);
+    if (directoryExists(stable)) {
+      syncContentsKeepingRoot(backup, stable);
+      rmSync(path.join(stable, MATERIALIZATION_IN_PROGRESS), { force: true });
+      rmSync(backup, { recursive: true, force: true });
+    } else {
+      if (existsSync(stable)) rmSync(stable, { recursive: true, force: true });
+      renameSync(backup, stable);
+    }
     rmSync(stage, { recursive: true, force: true });
     return;
   }
@@ -85,20 +167,27 @@ function recoverInterruptedMaterialization(stable: string, stage: string, backup
   // our fingerprint marker was written, which happens after the recursive copy and manifest
   // validation complete. A partial `.new` without that marker is never promoted.
   if (validExtension(stage) && materializedFingerprint(stage) !== null) {
-    if (existsSync(stable)) rmSync(stable, { recursive: true, force: true });
-    renameSync(stage, stable);
+    if (directoryExists(stable)) {
+      syncContentsKeepingRoot(stage, stable);
+      rmSync(path.join(stable, MATERIALIZATION_IN_PROGRESS), { force: true });
+      rmSync(stage, { recursive: true, force: true });
+    } else {
+      if (existsSync(stable)) rmSync(stable, { recursive: true, force: true });
+      renameSync(stage, stable);
+    }
   }
 }
 
 /**
- * Refreshes the Chrome-visible copy transactionally while keeping its pathname stable.
+ * Refreshes the Chrome-visible copy transactionally while keeping its directory identity stable.
  *
  * Copying package files directly into a folder Chrome already remembers makes an update
  * destructive before it is known-good: a stale destination shape, disk error, or interrupted
- * copy can leave a mixture of two extension versions. Stage the complete source beside the live
- * directory, then rename it into place. Directory rename is atomic on the same filesystem. The
- * backup makes the two-rename replacement recoverable, and a failed refresh keeps serving the
- * previous valid copy instead of disabling the extension-folder UI.
+ * copy can leave a mixture of two extension versions. Stage and fingerprint the complete source
+ * beside the live directory first. For an already-published copy, preserve the Chrome-loaded root
+ * and synchronize only its children; a backup makes an interrupted child refresh recoverable. A
+ * failed refresh keeps serving or restores the previous valid copy instead of disabling the
+ * extension-folder UI.
  */
 function materializePackagedExtension(bundled: string, stable: string): string | null {
   const stage = `${stable}.new`;
@@ -109,46 +198,58 @@ function materializePackagedExtension(bundled: string, stable: string): string |
   // The package is the update source, not the only usable copy. If an installed resource is
   // damaged after a successful earlier materialization, keep exposing the last-known-good stable
   // folder so Chrome and Finder do not lose a working extension merely because refresh is broken.
-  if (!validExtension(bundled)) return validExtension(stable) ? stable : null;
+  if (!validExtension(bundled)) return usableMaterializedExtension(stable) ? stable : null;
   const fingerprint = extensionFingerprint(bundled);
   if (validExtension(stable) && materializedFingerprint(stable) === fingerprint) return stable;
   rmSync(stage, { recursive: true, force: true });
 
-  let oldMoved = false;
   try {
     cpSync(bundled, stage, { recursive: true, force: true });
     if (!validExtension(stage)) throw new Error('Staged extension is missing manifest.json');
     writeFileSync(path.join(stage, MATERIALIZED_FINGERPRINT), fingerprint, { encoding: 'utf8', mode: 0o600 });
 
-    // Only now do we have both a complete replacement and whatever last-known-good published
-    // copy survived recovery above. It is safe to retire a stale backup from an older transaction.
-    rmSync(backup, { recursive: true, force: true });
-    if (existsSync(stable)) {
-      if (validExtension(stable)) {
-        renameSync(stable, backup);
-        oldMoved = true;
-      } else {
-        // Never preserve a known-corrupt directory as the rollback authority. This removal is
-        // delayed until the new staged tree has been completely copied and fingerprinted.
-        rmSync(stable, { recursive: true, force: true });
-      }
-    }
-    try {
+    // First install: no browser can already be watching this root, so the staged tree may become
+    // the stable root in one rename. Every later update deliberately keeps the existing root.
+    if (!directoryExists(stable)) {
+      if (existsSync(stable)) rmSync(stable, { recursive: true, force: true });
       renameSync(stage, stable);
+      return stable;
+    }
+
+    // Only now do we have a complete new tree. Snapshot the last-known-good published copy before
+    // mutating any child in the Chrome-visible directory, then mark the refresh so restart recovery
+    // knows a valid-looking stable tree may still be mixed.
+    rmSync(backup, { recursive: true, force: true });
+    if (validExtension(stable)) cpSync(stable, backup, { recursive: true, force: true });
+    writeFileSync(path.join(stable, MATERIALIZATION_IN_PROGRESS), fingerprint, { encoding: 'utf8', mode: 0o600 });
+    try {
+      syncContentsKeepingRoot(stage, stable);
+      if (!validExtension(stable) || extensionFingerprint(stable) !== fingerprint) {
+        throw new Error('Published extension did not match the staged package');
+      }
+      rmSync(path.join(stable, MATERIALIZATION_IN_PROGRESS), { force: true });
     } catch (error) {
-      if (oldMoved && !existsSync(stable) && existsSync(backup)) renameSync(backup, stable);
+      if (validExtension(backup)) {
+        syncContentsKeepingRoot(backup, stable);
+        rmSync(path.join(stable, MATERIALIZATION_IN_PROGRESS), { force: true });
+      }
       throw error;
     }
-    if (oldMoved) rmSync(backup, { recursive: true, force: true });
+    rmSync(stage, { recursive: true, force: true });
+    rmSync(backup, { recursive: true, force: true });
     return stable;
   } catch {
     // If rollback succeeded, the stale/partial stage is disposable. If no published copy exists,
     // preserve a completed stage or backup for the next startup's recovery instead of deleting
     // the only remaining recoverable material.
-    if (validExtension(stable)) rmSync(stage, { recursive: true, force: true });
-    // Promotion never mutates the old directory in place. If it is still valid, keeping it is a
-    // strictly safer recovery than telling the user the extension disappeared during an update.
-    return validExtension(stable) ? stable : null;
+    if (usableMaterializedExtension(stable)) {
+      rmSync(stage, { recursive: true, force: true });
+      rmSync(backup, { recursive: true, force: true });
+    }
+    // A marker-bearing tree may have a manifest but still contain a mixture of two builds. Do not
+    // advertise it as healthy or delete its recovery authority. A later launch retries from .old
+    // or the complete .new stage that remains beside it.
+    return usableMaterializedExtension(stable) ? stable : null;
   }
 }
 
@@ -169,7 +270,7 @@ export function extensionDir(): string | null {
       // Fingerprinting itself can fail if the packaged resource is damaged. A previously
       // materialized extension remains useful and must not be hidden merely because the update
       // source is unreadable.
-      return validExtension(stable) ? stable : null;
+      return usableMaterializedExtension(stable) ? stable : null;
     }
   }
 
