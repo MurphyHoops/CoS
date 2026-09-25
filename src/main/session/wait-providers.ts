@@ -1,4 +1,5 @@
 import { runCommand } from '../exec.js';
+import { locateGitHubCli } from '../github-cli.js';
 import { backgroundExecObligations, execOwner } from '../codex/ownership.js';
 import type { LongRunWaitContract, LongRunWaitKind } from './long-run.js';
 
@@ -43,8 +44,15 @@ registerLongRunWaitProvider({
   requiresConnectivity: true,
   describe: describeGithub,
   async inspect(wait) {
+    const gh = locateGitHubCli();
+    if (!gh) {
+      return {
+        kind: 'error',
+        error: 'GitHub CLI (gh) was not found. Install gh or add it to a standard executable location.'
+      };
+    }
     const result = await runCommand(
-      'gh',
+      gh,
       ['run', 'view', String(wait.runId), '--repo', wait.repository!, '--json', 'status,conclusion'],
       process.cwd(),
       10_000

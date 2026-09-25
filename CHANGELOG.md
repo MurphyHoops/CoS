@@ -14,6 +14,18 @@ extension after updating the app**. If their bridge protocols or exact companion
 identities do not match, the app reports the mismatch and asks you to reload the copy shipped
 with the current app.
 
+## [3.1.2] — 2026-09-25
+
+### Reliable GitHub waits from the installed macOS app
+
+- Fixed `session_wait(kind=github_run)` failing with `spawn gh ENOENT` when the packaged macOS app is launched with the minimal GUI PATH.
+- GitHub wait monitoring now resolves `gh` from the inherited PATH and standard platform locations, including Apple Silicon and Intel Homebrew, before invoking the exact run check.
+- Preserved fail-closed durable semantics: an unavailable GitHub CLI or unverifiable run never becomes a guessed success.
+- Added regression coverage for Finder/Applications-style macOS PATH discovery and absolute `gh` dispatch.
+- Bumped the app and companion release version to **3.1.2**; bridge protocol remains **15**.
+
+See [the 3.1.2 release notes](docs/release-notes/v3.1.2.md).
+
 ## [3.1.1] — 2026-09-24
 
 ### Durable Compact & Resume opening and companion diagnostics
