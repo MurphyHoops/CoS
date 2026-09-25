@@ -13,6 +13,7 @@
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import { recordLoopMcpProof } from './goal-mcp-proof.js';
 import * as prompts from '../src/shared/goal.js';
 
@@ -164,7 +165,7 @@ it('publishes a per-chat Goal switch only after its durable generation commits',
 it('publishes accepted Goal reply debt only after its durable generation commits', async () => {
   const conversationId = 'reply-accept-commit-order';
   const session = await createSession({ conversationId });
-  const target = `${dir}/state/goal-replies.json`;
+  const target = path.join(dir, 'state', 'goal-replies.json');
   const realRename = fs.rename.bind(fs);
   let entered!: () => void;
   let release!: () => void;
@@ -198,7 +199,7 @@ it('keeps rejected Goal reply acceptance out of live and later durable state', a
   const { flushDurable, readDurable } = await import('../src/main/durable.js');
   const conversationId = 'reply-accept-failure';
   const session = await createSession({ conversationId });
-  const target = `${dir}/state/goal-replies.json`;
+  const target = path.join(dir, 'state', 'goal-replies.json');
   const realRename = fs.rename.bind(fs);
   let failed = false;
   const rename = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
@@ -225,7 +226,7 @@ it('moves Goal reply debt to a replacement chat only after its durable generatio
   await goal.acceptGoalReplyNow({
     conversationId: from, sessionId: session.id, replyId: 'move-final', turnId: 'move-turn', eventSeq: 1, blocked: false
   });
-  const target = `${dir}/state/goal-replies.json`;
+  const target = path.join(dir, 'state', 'goal-replies.json');
   const realRename = fs.rename.bind(fs);
   let entered!: () => void;
   let release!: () => void;
@@ -258,7 +259,7 @@ it('serializes provider-pause durability behind an in-flight Goal reply acceptan
   const { readDurable } = await import('../src/main/durable.js');
   const conversationId = 'reply-pause-serialized';
   const session = await createSession({ conversationId });
-  const target = `${dir}/state/goal-replies.json`;
+  const target = path.join(dir, 'state', 'goal-replies.json');
   const realRename = fs.rename.bind(fs);
   let entered!: () => void;
   let release!: () => void;

@@ -26,9 +26,9 @@ describe('GitHub CLI discovery', () => {
   it('prefers an executable already present on PATH', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cos-gh-'));
     temporary.push(dir);
-    const executable = path.join(dir, 'gh');
-    await fs.writeFile(executable, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const executable = path.join(dir, process.platform === 'win32' ? 'gh.exe' : 'gh');
+    await fs.writeFile(executable, process.platform === 'win32' ? '' : '#!/bin/sh\nexit 0\n', { mode: 0o755 });
 
-    expect(locateGitHubCli('darwin', { PATH: dir, HOME: '/Users/test' }, '/Users/test')).toBe(executable);
+    expect(locateGitHubCli(process.platform, { PATH: dir, HOME: '/Users/test', USERPROFILE: dir }, dir)).toBe(executable);
   });
 });

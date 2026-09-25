@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { downloadReviewedSource, SOURCE_DOWNLOAD_CONCURRENCY } from './native-source-download.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const noticeDirectory = path.join(root, 'docs', 'licenses', 'native');
@@ -38,7 +39,7 @@ const archives = path.join(output, 'archives');
 await fs.mkdir(archives, { recursive: true });
 let index = 0;
 let completed = 0;
-await Promise.all(Array.from({ length: 8 }, async () => {
+await Promise.all(Array.from({ length: SOURCE_DOWNLOAD_CONCURRENCY }, async () => {
   while (index < inventory.sources.length) {
     const source = inventory.sources[index++];
     const destination = path.join(archives, source.file);
@@ -46,16 +47,7 @@ await Promise.all(Array.from({ length: 8 }, async () => {
     try { bytes = await fs.readFile(destination); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
     if (!bytes) {
-      const response = await fetch(source.url, { signal: AbortSignal.timeout(180_000) });
-      if (!response.ok) throw new Error(`Native source download failed: ${source.file}: HTTP ${response.status}`);
-      const chunks = [];
-      let size = 0;
-      for await (const chunk of response.body) {
-        size += chunk.length;
-        if (size > source.bytes) throw new Error(`Native source exceeds reviewed size: ${source.file}`);
-        chunks.push(chunk);
-      }
-      bytes = Buffer.concat(chunks);
+      bytes = await downloadReviewedSource(source);
     }
     if (bytes.length !== source.bytes || createHash('sha256').update(bytes).digest('hex') !== source.sha256) {
       throw new Error(`Native source checksum mismatch: ${source.file}`);
