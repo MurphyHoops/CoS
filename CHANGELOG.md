@@ -20,7 +20,7 @@ chrome://extensions reload remains the fallback only for an intentionally differ
 ### Cross-platform release hardening
 
 - Fixed the Windows release verification regressions exposed by the first 3.1.3 publish attempt: GitHub CLI PATH discovery tests now use the host platform's executable/path semantics, and Goal durability fault-injection tests build their target state path with `path.join` instead of POSIX-only separators.
-- Hardened the native-source release job against transient upstream archive rejection/rate responses by using an explicit source-verifier User-Agent, bounded retries/backoff, and lower download concurrency while retaining the reviewed byte-size and SHA-256 checks as the final authority.
+- Hardened the native-source release job against upstream archive rejection/rate responses by using an explicit source-verifier User-Agent, bounded Node/Undici retries/backoff, lower download concurrency, and one bounded same-URL `curl` transport attempt only after retryable fetch failures are exhausted, while retaining the reviewed byte-size and SHA-256 checks as the final authority.
 - Closed a completion-remount race exposed by the macOS x64 release runner: a just-detached chronological-stream record now remains reclaimable only for the existing bounded remount grace, so React can replace an assistant section without losing opened tool-group identity before canonical completion ownership arrives.
 - Preserved the 3.1.3 companion self-healing design unchanged: stable unpacked-extension root, eager startup materialization, one-shot build-ID reload fencing, rollback recovery, and page-refresh recovery remain the supported update path.
 - Bumped app and companion to **3.1.4**; bridge protocol remains **15**.

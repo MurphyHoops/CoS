@@ -40,15 +40,66 @@ describe('native source release downloads', () => {
     expect([...bytes]).toEqual([1, 2, 3]);
   });
 
+  it('falls back to a second transport only after retryable fetch attempts are exhausted', async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValue(new Response('blocked', { status: 406 }));
+    const fallbackTransport = vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3]));
+
+    const bytes = await downloadReviewedSource(source, {
+      fetchImpl,
+      fallbackTransport,
+      attempts: 2,
+      sleep: async () => {}
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(fallbackTransport).toHaveBeenCalledTimes(1);
+    expect(fallbackTransport).toHaveBeenCalledWith(source);
+    expect([...bytes]).toEqual([1, 2, 3]);
+  });
+
+  it('does not let the fallback transport bypass the reviewed size bound', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response('blocked', { status: 406 }));
+    const fallbackTransport = vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3, 4]));
+
+    await expect(downloadReviewedSource(source, {
+      fetchImpl,
+      fallbackTransport,
+      attempts: 1,
+      sleep: async () => {}
+    })).rejects.toThrow('exceeds reviewed size');
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fallbackTransport).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces fallback transport failure after retryable fetch attempts are exhausted', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response('blocked', { status: 406 }));
+    const fallbackTransport = vi.fn().mockRejectedValue(new Error('curl exited 22'));
+
+    await expect(downloadReviewedSource(source, {
+      fetchImpl,
+      fallbackTransport,
+      attempts: 2,
+      sleep: async () => {}
+    })).rejects.toThrow('fallback transport');
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(fallbackTransport).toHaveBeenCalledTimes(1);
+  });
+
   it('does not retry non-transient HTTP failures or oversized content', async () => {
+    const fallbackTransport = vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3]));
     const notFound = vi.fn().mockResolvedValue(new Response('missing', { status: 404 }));
-    await expect(downloadReviewedSource(source, { fetchImpl: notFound, sleep: async () => {} }))
+    await expect(downloadReviewedSource(source, { fetchImpl: notFound, fallbackTransport, sleep: async () => {} }))
       .rejects.toThrow('HTTP 404');
     expect(notFound).toHaveBeenCalledTimes(1);
+    expect(fallbackTransport).not.toHaveBeenCalled();
 
     const oversized = vi.fn().mockResolvedValue(new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 }));
-    await expect(downloadReviewedSource(source, { fetchImpl: oversized, sleep: async () => {} }))
+    await expect(downloadReviewedSource(source, { fetchImpl: oversized, fallbackTransport, sleep: async () => {} }))
       .rejects.toThrow('exceeds reviewed size');
     expect(oversized).toHaveBeenCalledTimes(1);
+    expect(fallbackTransport).not.toHaveBeenCalled();
   });
 });

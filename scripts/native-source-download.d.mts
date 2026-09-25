@@ -10,6 +10,7 @@ export interface NativeSourceDownloadOptions {
   fetchImpl?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
   attempts?: number;
+  fallbackTransport?: false | ((source: ReviewedNativeSource) => Promise<Uint8Array>);
 }
 
 export function downloadReviewedSource(
