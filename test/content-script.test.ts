@@ -3360,6 +3360,10 @@ describe('the app-owned chronological stream', () => {
     // durable local turn and introduces the public prose that divides the two call runs.
     const replacement = assistantTurn(live.document, 'read20-remount-final-page', []);
     section.replaceWith(replacement); section = replacement;
+    // A transcript MutationObserver may repaint after React detaches the old section but
+    // before Fiber/canonical completion identity is available on the replacement. That
+    // intermediate paint must not discard the just-detached record needed for exact remount.
+    live.hook.renderStreams();
     completed = true;
     await bind(); await live.hook.pullActivity();
 
@@ -3370,6 +3374,40 @@ describe('the app-owned chronological stream', () => {
     expect(section.querySelectorAll('[data-clf-call]')).toHaveLength(20);
     expect(live.document.querySelectorAll('.clf-stream-tool-group')).toHaveLength(2);
     expect(live.hook.streamRootKeys()).toEqual([owner]);
+  });
+
+  it('keeps a detached stream record only through the bounded completion-remount grace', async () => {
+    const owner = 'detached-remount-grace-owner';
+    const stream = [
+      { seq: 1, time: 100, kind: 'turn_start', turnId: owner },
+      { seq: 2, time: 110, kind: 'assistant_message', turnId: owner,
+        messageId: 'detached-remount-start', text: 'START', final: false },
+      { seq: 3, time: 120, kind: 'tool_call', turnId: owner,
+        callId: 'detached-remount-1', tool: 'read', outcome: 'ok', summary: { kind: 'read', title: 'Read 1' } },
+      { seq: 4, time: 130, kind: 'tool_call', turnId: owner,
+        callId: 'detached-remount-2', tool: 'read', outcome: 'ok', summary: { kind: 'read', title: 'Read 2' } },
+      { seq: 5, time: 140, kind: 'assistant_message', turnId: owner,
+        messageId: 'detached-remount-final', text: 'DONE', final: true }
+    ];
+    live = await harness(undefined, { activity: () => ({ ok: true, data: { entries: [], stream } }) });
+    renderingOn();
+    const section = assistantTurn(live.document, 'detached-remount-page', []);
+    await bindRenderedFiberTurns([{ section, turn: { turnId: section.dataset.turnId, messages: [
+      { messageId: 'detached-remount-start', rawMessageId: 'detached-remount-start', stable: true,
+        rawText: 'START', renderedHtml: '<p>START</p>' },
+      { messageId: 'detached-remount-final', rawMessageId: 'detached-remount-final', stable: true,
+        rawText: 'DONE', renderedHtml: '<p>DONE</p>' }
+    ] } }]);
+    await live.hook.pullActivity(); live.hook.renderStreams();
+    expect(live.hook.streamRootKeys()).toEqual([owner]);
+
+    section.remove();
+    live.hook.renderStreams();
+    expect(live.hook.streamRootKeys()).toEqual([owner]);
+
+    live.advance(8_000);
+    live.hook.renderStreams();
+    expect(live.hook.streamRootKeys()).toEqual([]);
   });
 
   it('reclaims only one current exact call owner and rejects neighbors, conflicts and ambiguity', async () => {
