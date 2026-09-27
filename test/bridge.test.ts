@@ -111,7 +111,7 @@ const { completeProcessCall, createSession, deleteSession, findSessionByConversa
   '../src/main/session/store.js'
 );
 const sessionStoreModule = await import('../src/main/session/store.js');
-const { closeConversation, liveConversations, noteChatOrigin, recordChatObservations, recordProgress, recordToolCall, REQUEST_ID_GRACE_MS, resetRecorderForTests } = await import('../src/main/session/recorder.js');
+const { closeConversation, liveConversations, noteChatOrigin, recordChatObservations, recordNote, recordProgress, recordToolCall, REQUEST_ID_GRACE_MS, resetRecorderForTests } = await import('../src/main/session/recorder.js');
 const { resetBlockedChatsForTests, setChatBlocked } = await import('../src/main/session/blocked-chats.js');
 const {
   CONTINUATIONS_STATE,
@@ -125,6 +125,7 @@ const {
   setContinuationRecoveryHooks,
   restoreContinuations
 } = await import('../src/main/session/continuation.js');
+const { nativeHandoffPrompt } = await import('../src/main/session/handoff-prompt.js');
 const {
   acknowledgeOffers,
   agentInfoForOwnedConversation,
@@ -2631,6 +2632,101 @@ describe('automatic compaction', () => {
     expect(continuationByToken(token)).toMatchObject({ state: 'aborted', error: 'handoff_never_sent' });
     expect(continuationForSession(filed.body.sessionId as string)).toBeNull();
     expect((await request('POST', '/compact', { body: { conversationId, token, sourceDispatch: true } })).status).toBe(409);
+  });
+
+  it('keeps an exact cancelled source draft cleanup durable after source dispatch and retires it only on ACK', async () => {
+    await pair();
+    const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ac18';
+    await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [{ kind: 'user_message', time: Date.now(), text: 'compact this exact chat', messageId: 'm-cleanup' }]
+      }
+    });
+
+    const opened = await request('POST', '/compact', { body: { conversationId } });
+    expect(opened.status).toBe(202);
+    const token = opened.body.token as string;
+    const sessionId = opened.body.sessionId as string;
+    const prompt = opened.body.prompt as string;
+    expect(prompt).toContain(`[[CLF-HANDOFF:${token}]]`);
+    expect(continuationByToken(token)).toMatchObject({ sourcePrompt: prompt });
+
+    expect((await request('POST', '/compact', {
+      body: { conversationId, token, sourceAttempt: true }
+    })).body.allowed).toBe(true);
+    expect((await request('POST', '/compact', {
+      body: { conversationId, token, sourceDispatch: true }
+    })).body.armed).toBe(true);
+
+    const cancelled = await request('POST', '/compact', { body: { conversationId, cancel: true } });
+    expect(cancelled.status).toBe(200);
+    expect(resumeJobFor(sessionId)).toMatchObject({
+      stage: 'failed',
+      error: 'cancelled',
+      abandonedSourceDraft: prompt
+    });
+
+    // Simulate an app restart from the exact durable continuation snapshot. The in-memory
+    // session-token hint is not required: the pending cleanup itself must rediscover the row.
+    const { snapshotContinuations } = await import('../src/main/session/continuation.js');
+    const snapshot = snapshotContinuations();
+    expect(await restoreContinuations(snapshot)).toBe(true);
+    expect(resumeJobFor(sessionId)).toMatchObject({
+      stage: 'failed',
+      abandonedSourceDraft: prompt
+    });
+
+    const probe = await request('POST', '/compact', {
+      body: { conversationId, token, sourceDraftProbe: true }
+    });
+    expect(probe.status).toBe(200);
+    expect(probe.body).toMatchObject({ allowed: true, token, durable: true });
+    expect(probe.body.drafts).toEqual([prompt]);
+
+    const cleared = await request('POST', '/compact', {
+      body: { conversationId, token, sourceDraftCleared: true }
+    });
+    expect(cleared.status).toBe(200);
+    expect(cleared.body.cleared).toBe(true);
+    expect(resumeJobFor(sessionId)?.abandonedSourceDraft).toBeUndefined();
+  });
+
+  it('recovers a legacy cancelled CoS draft from session history after its continuation WAL row is gone', async () => {
+    await pair();
+    const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ac19';
+    await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [{ kind: 'user_message', time: Date.now(), text: 'legacy compact', messageId: 'm-legacy-cleanup' }]
+      }
+    });
+    const session = await findSessionByConversation(conversationId, { requireUnique: true });
+    expect(session).not.toBeNull();
+    const token = '9A_T5dJf-5BWDY80giljzg';
+    await recordNote(session!.id, 'Compact & Resume abandoned — cancelled', token);
+
+    const probe = await request('POST', '/compact', {
+      body: { conversationId, token, sourceDraftProbe: true }
+    });
+    expect(probe.status).toBe(200);
+    expect(probe.body).toMatchObject({ allowed: true, token, durable: false });
+    expect(probe.body.drafts).toEqual([
+      nativeHandoffPrompt(token, true),
+      nativeHandoffPrompt(token, false)
+    ]);
+
+    const cleared = await request('POST', '/compact', {
+      body: { conversationId, token, sourceDraftCleared: true }
+    });
+    expect(cleared.status).toBe(200);
+    expect(cleared.body.cleared).toBe(true);
+
+    const secondProbe = await request('POST', '/compact', {
+      body: { conversationId, token, sourceDraftProbe: true }
+    });
+    expect(secondProbe.status).toBe(409);
+    expect(secondProbe.body.error).toBe('source_draft_cleanup_not_authorized');
   });
 
   it('does not immediately refile a rejected automatic compaction in the same working turn', async () => {

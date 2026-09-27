@@ -92,6 +92,89 @@ function fixture(versionCaption = '', closeDelay: number | null = 0) {
   win.eval(fiberSource); win.eval(domSource);
   return { api: (win as any).CLF_DOM, state, props, selections, actions, freeze: () => { frozen = true; } };
 }
+
+function currentPickerFixture() {
+  page = new JSDOM(
+    '<form><div data-composer-body><div data-composer-markdown contenteditable="true" role="textbox"></div></div>' +
+    '<button type="button" aria-haspopup="menu" aria-controls="provider-model-picker" data-codex-intelligence-trigger="true">Reasoning</button></form>',
+    { url: 'https://chatgpt.com/', runScripts: 'outside-only' }
+  );
+  const win = page.window, doc = win.document;
+  Object.defineProperty(win.HTMLElement.prototype, 'getClientRects', { value: () => [{}] });
+  win.postMessage = (data: unknown) => queueMicrotask(() =>
+    win.dispatchEvent(new win.MessageEvent('message', { data, source: win as unknown as Window, origin: win.location.origin })));
+
+  const versions = [
+    { id: '5.6', label: 'GPT-5.6 Sol', selected: true, disabled: false },
+    { id: '5.5', label: 'GPT-5.5', selected: false, disabled: false }
+  ];
+  const selection = (powerSettingIndex: number, model: string, reasoningEffort: string, sliderLabel: string) => ({
+    id: `${model}:${reasoningEffort}`, powerSettingIndex, model, modelLabel: '5.6', reasoningEffort, sliderLabel, isMaximum: false
+  });
+  const byVersion: Record<string, any[]> = {
+    '5.6': [
+      selection(0, 'gpt-5-6', 'none', 'Instant'),
+      selection(1, 'gpt-5-6-thinking', 'medium', 'Medium'),
+      selection(2, 'gpt-5-6-thinking', 'high', 'High')
+    ],
+    '5.5': [
+      selection(0, 'gpt-5-5-instant', 'none', 'Instant'),
+      selection(1, 'gpt-5-5-thinking', 'medium', 'Medium'),
+      selection(2, 'gpt-5-5-thinking', 'high', 'High')
+    ]
+  };
+  const props: any = {
+    modelListConfig: { options: versions },
+    powerSelections: byVersion['5.6']!,
+    selectedPowerSelection: byVersion['5.6']![1]!,
+    modelSelectionDisabled: false
+  };
+  const trigger = doc.querySelector('[data-codex-intelligence-trigger]') as HTMLElement;
+  (trigger as any).__reactFiber$test = { memoizedProps: props, return: null };
+
+  const renderEffort = () => {
+    doc.getElementById('provider-model-picker')?.remove();
+    const menu = doc.createElement('div');
+    menu.id = 'provider-model-picker'; menu.setAttribute('role', 'menu'); menu.setAttribute('data-state', 'open');
+    menu.innerHTML = '<div data-model-picker-view="simple"><div role="menuitem" data-model-picker-view-toggle="true">Model</div>' +
+      '<div role="menuitem" aria-keyshortcuts="ArrowLeft ArrowRight">Power</div></div>';
+    (menu as any).__reactFiber$test = { memoizedProps: props, return: null };
+    doc.body.append(menu);
+    menu.querySelector('[data-model-picker-view-toggle]')!.addEventListener('click', () => {
+      const current = versions.find(version => version.selected)!;
+      menu.innerHTML = '';
+      for (const version of versions) {
+        const row = doc.createElement('div'); row.setAttribute('role', 'menuitemradio'); row.textContent = version.label;
+        row.setAttribute('aria-checked', String(version === current));
+        row.addEventListener('keydown', event => {
+          if (event.key !== 'Enter') return;
+          for (const item of versions) item.selected = item === version;
+          props.powerSelections = byVersion[version.id];
+          props.selectedPowerSelection = props.powerSelections[0];
+          renderEffort();
+        });
+        menu.append(row);
+      }
+    });
+    menu.querySelector('[aria-keyshortcuts]')!.addEventListener('keydown', (event: any) => {
+      const at = props.powerSelections.indexOf(props.selectedPowerSelection) + (event.key === 'ArrowRight' ? 1 : -1);
+      if (props.powerSelections[at]) props.selectedPowerSelection = props.powerSelections[at];
+    });
+  };
+  trigger.addEventListener('keydown', event => { if (event.key === 'Enter') renderEffort(); });
+  doc.addEventListener('keydown', event => { if (event.key === 'Escape') doc.getElementById('provider-model-picker')?.remove(); });
+  win.eval(fiberSource); win.eval(domSource);
+  return { api: (win as any).CLF_DOM, props, versions, renderEffort };
+}
+
+it('selects the current provider model picker after prompt-textarea and the old picker test id disappear', async () => {
+  const f = currentPickerFixture();
+  expect(page.window.document.querySelector('#prompt-textarea')).toBeNull();
+  expect(page.window.document.querySelector('[data-testid="composer-intelligence-picker-content"]')).toBeNull();
+  expect(await f.api.selectModelSettings('5.6', 'high')).toBe(true);
+  expect(f.props.selectedPowerSelection).toMatchObject({ model: 'gpt-5-6-thinking', reasoningEffort: 'high', powerSettingIndex: 2 });
+  expect(page.window.document.getElementById('provider-model-picker')).toBeNull();
+});
 it('waits for the model picker to close before allowing composer insertion', async () => {
   const f = fixture('', 30);
   expect(await f.api.selectModelSettings('future-model', 'ultra')).toBe(true);

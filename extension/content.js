@@ -36,9 +36,15 @@
   // before touching the shared DOM. Otherwise old and new composer observers can continually
   // remove and reinsert each other's controls, starving transport/timers and freezing the tab.
   // A healthy incumbent in this context still wins the static/recovery injection race.
-  const RECORDER_VERSION = 13;
+  const RECORDER_VERSION = 14;
+  // Exact content-script build identity. A protocol version says what this recorder speaks;
+  // the build id proves it is the recorder shipped with the currently running companion.
+  // Both are required because a behavioral change can keep the same protocol surface while
+  // still requiring already-open ChatGPT pages to replace their old isolated-world script.
+  const RECORDER_BUILD_ID = 'cos-3.1.15-companion-provider-picker-v1';
   const recorderHandle = {
     version: RECORDER_VERSION,
+    buildId: RECORDER_BUILD_ID,
     healthy: () => false,
     stop: () => undefined
   };
@@ -52,7 +58,9 @@
       // A handle that throws is not a working recorder.
       incumbentHealthy = false;
     }
-    if (incumbentHealthy && (incumbent.version || 0) >= RECORDER_VERSION) return;
+    if (incumbentHealthy &&
+        (incumbent.version || 0) >= RECORDER_VERSION &&
+        incumbent.buildId === RECORDER_BUILD_ID) return;
     if (incumbent && typeof incumbent.stop === 'function') {
       try {
         incumbent.stop();
@@ -6215,6 +6223,13 @@
       const nextSince = Number(data.nextSince);
       if (Number.isFinite(nextSince) && nextSince > since) since = nextSince;
       job = data.job || null;
+      if (clearAbortedCompactionDraft(job)) {
+        localError = '';
+        if (job?.token && conversationId) {
+          void ask({ type: 'compact', conversationId, token: job.token, sourceDraftCleared: true }).catch(() => undefined);
+        }
+      }
+      await maybeClearLegacyAbandonedCompactionDraft();
       operationProgress = data.progress || null;
       pendingTools = Number.isFinite(Number(data.pendingTools)) ? Number(data.pendingTools) : 0;
       // The generation this chat has open in the app, if any. Only ever *read* by
@@ -8636,6 +8651,15 @@
       nativePhase = 'prompting';
       renderControl();
       const squeeze = (value) => String(value || '').replace(/\s+/g, '');
+      // A prior cancelled compaction can leave its exact CoS-authored HANDOFF prompt in
+      // ChatGPT's autosaved composer across reloads and browser restarts. Resolve that stale
+      // durable state exactly where a new compaction collides with it instead of relying on a
+      // background activity poll having happened first. App token proof + exact whole-text
+      // match + no attachments are still mandatory; the current token is explicitly excluded.
+      if ((CLF_DOM.composer()?.textContent || '').trim() && !CLF_DOM.hasComposerAttachments()) {
+        await maybeClearLegacyAbandonedCompactionDraft({ allowWhileJob: true, excludeToken: token });
+        if (!current()) return;
+      }
       const existing = CLF_DOM.composer();
       const occupiedByOtherDraft =
         Boolean(existing && (existing.textContent || '').trim()) &&
@@ -8728,6 +8752,85 @@
 
   const CONTINUATION_MARKER = /^\s*\[\[CLF-(HANDOFF|RESUME)(?:\\)?:([A-Za-z0-9_-]{16,64})\]\](?:\s|$)/;
   const EMERGENCY_RESUME_MARKER = /^\s*\[\[CLF-EMERGENCY-RESUME(?:\\)?:([0-9a-f-]{8,64})\]\](?:\s|$)/i;
+
+  /**
+   * Clears only a terminally abandoned CoS source prompt that the app can reproduce exactly.
+   *
+   * ChatGPT restores unsent composer drafts across browser restarts. If an old build crossed
+   * the durable source-dispatch fence but never found/clicked the provider Send button, an
+   * explicit Cancel leaves that exact generated prompt in the restored editor forever. It then
+   * blocks both normal desktop input and the next compaction as an ordinary unsent draft.
+   *
+   * The app exposes the prompt only for the terminal cancelled + dispatched-unresolved case.
+   * clearPromptExact adds the second proof: every character must still be the app-authored
+   * prompt. Attachments forbid cleanup as well. A user edit, pasted marker, changed prompt,
+   * active transaction, or unrelated draft therefore survives untouched.
+   */
+  function clearAbortedCompactionDraft(view) {
+    const exact = typeof view?.abandonedSourceDraft === 'string' ? view.abandonedSourceDraft : '';
+    if (!exact || view?.busy || view?.stage !== 'failed' || view?.error !== 'cancelled') return false;
+    if (CLF_DOM.hasComposerAttachments()) return false;
+    const composer = CLF_DOM.composer();
+    if (!composer) return false;
+    // Empty means the stale draft is already gone (for example the user cleared it manually).
+    // ACKing that fact is safe and lets a durable cleanup obligation retire after a lost ACK.
+    if (!(composer.textContent || '').trim()) return true;
+    return CLF_DOM.clearPromptExact(exact) === true;
+  }
+
+  /**
+   * Migration for builds that retired the terminal continuation before ChatGPT forgot its
+   * autosaved source prompt. A marker alone is never authority: the app must prove that exact
+   * token was durably cancelled in this session, then this page must prove whole-text equality
+   * against an app-generated candidate before it may delete anything.
+   */
+  async function maybeClearLegacyAbandonedCompactionDraft({ allowWhileJob = false, excludeToken = null } = {}) {
+    // Periodic migration stays out of a live continuation. The two actual composer-conflict
+    // points may opt in, but only to clear a *different* historical token that the app proves
+    // was cancelled. The current continuation token is never cleanup authority for itself.
+    if (job && !allowWhileJob) return false;
+    if (!conversationId || CLF_DOM.hasComposerAttachments()) return false;
+    const composer = CLF_DOM.composer();
+    const text = String(composer?.textContent || '');
+    if (!text.trim()) return false;
+    const marker = text.match(CONTINUATION_MARKER);
+    if (!marker || marker[1] !== 'HANDOFF') return false;
+    const token = marker[2];
+    if (excludeToken && token === excludeToken) return false;
+    const probe = await ask({
+      type: 'compact',
+      conversationId,
+      token,
+      sourceDraftProbe: true
+    }).catch(() => null);
+    const drafts = probe?.ok === true && Array.isArray(probe.data?.drafts)
+      ? probe.data.drafts.filter(value => typeof value === 'string' && value)
+      : [];
+    if (!drafts.length || CLF_DOM.hasComposerAttachments()) return false;
+
+    let cleared = false;
+    for (const exact of drafts) {
+      if (CLF_DOM.clearPromptExact(exact) === true) {
+        cleared = true;
+        break;
+      }
+    }
+    // If an earlier exact clear won but its ACK was lost, an empty composer is enough proof
+    // that the abandoned CoS draft is no longer present. Any different non-empty draft stays.
+    const after = CLF_DOM.composer();
+    if (!cleared && after && !(after.textContent || '').trim() && !CLF_DOM.hasComposerAttachments()) {
+      cleared = true;
+    }
+    if (!cleared) return false;
+    const ack = await ask({
+      type: 'compact',
+      conversationId,
+      token,
+      sourceDraftCleared: true
+    }).catch(() => null);
+    if (ack?.ok === true) localError = '';
+    return ack?.ok === true;
+  }
   const continuationReconciliations = new Map();
   /**
    * Proof key → how the app answered the marker: `committed` is ownership proof for the
@@ -10805,11 +10908,19 @@
       if (input?.silenceBoundary || input?.completedTurnId) { claimedSilence = input; sourceQuiet = true; }
       if (!input || !onTarget()) return false;
       const fail = async (error) => { await ask({ type: 'desktop_input', id: input.id, owner: input.owner, fail: true, error }); return false; };
+      // An abandoned CoS handoff is not a user draft. Resolve that one exact legacy state at
+      // the conflict point before refusing the claimed input. App history must authorize its
+      // token and the whole composer must still equal an app-generated HANDOFF candidate; a
+      // user edit, attachment, unrelated draft, or live compaction remains untouched.
+      if (!ownsFreshPage() && (composer.textContent || '').trim() && !CLF_DOM.hasComposerAttachments()) {
+        await maybeClearLegacyAbandonedCompactionDraft();
+        if (!onTarget()) return false;
+      }
       // ChatGPT restores its shared home draft even in a newly opened input tab.
       // This exact claimed bootstrap owns replacement text; existing chats and
       // attachment drafts remain protected. Re-evaluate after model selection,
       // since React can hydrate that autosaved text while the picker is open.
-      if ((!ownsFreshPage() && (composer.textContent || '').trim()) || CLF_DOM.hasComposerAttachments()) return fail('ChatGPT already contains an unsent draft. Send or clear that draft in Chrome before trying again.');
+      if ((!ownsFreshPage() && (CLF_DOM.composer()?.textContent || '').trim()) || CLF_DOM.hasComposerAttachments()) return fail('ChatGPT already contains an unsent draft. Send or clear that draft in Chrome before trying again.');
       if (message.directTurn) {
         // The offer only wakes this document. The just-committed outbox claim
         // authorizes interrupting this exact tool-free turn, like handoff's Stop
@@ -11170,7 +11281,7 @@
         return true;
       }
       if (message.type === 'clf-recorder-ping') {
-        sendResponse({ ok: true, recorderVersion: RECORDER_VERSION });
+        sendResponse({ ok: true, recorderVersion: RECORDER_VERSION, recorderBuildId: RECORDER_BUILD_ID });
         return false;
       }
       // Popup diagnostics. Ids and counters only — no prose, no transcript, no page text.
@@ -11178,6 +11289,7 @@
         sendResponse({
           ok: true,
           recorderVersion: RECORDER_VERSION,
+          recorderBuildId: RECORDER_BUILD_ID,
           runId: RUN_ID,
           conversationId,
           agent,
@@ -11462,6 +11574,7 @@
       renderStreamEnabled: () => RENDER_STREAM,
       setDesktopProjectInputForTest: (claim) => { desktopProjectInput = claim; },
       desktopProjectInputForTest: () => desktopProjectInput,
+      clearAbortedCompactionDraft,
       setShowTimes: (on) => {
         SHOW_TIMES = on === true;
       }

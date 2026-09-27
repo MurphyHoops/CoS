@@ -97,6 +97,7 @@ import {
   noteChatOrigin,
   recordAgentMessage,
   recordChatObservations,
+  recordNote,
   recordRequestEvidence,
   recordProgress,
   restoreRecordedConversation,
@@ -113,6 +114,7 @@ import {
   indexedSessions,
   readSessionPlan,
   listUsageSessions,
+  readEvents,
   readRecentEvents,
   readLatestUserMessage,
   readCompletedFinal,
@@ -176,6 +178,7 @@ import {
   abortContinuation,
   abortContinuationNow,
   abortContinuationSourceBeforeSendNow,
+  acknowledgeContinuationSourceDraftCleanupNow,
   attachSummary,
   beginContinuationDestinationSendNow,
   beginContinuationSourceSendNow,
@@ -185,6 +188,7 @@ import {
   continuationClaimedBy,
   commitContinuationResult,
   continuationByToken,
+  continuationCleanupForSession,
   continuationRecoveryPaused,
   continuationProviderAskedAt,
   continuationForSession,
@@ -194,6 +198,7 @@ import {
   supersededSourceConversations,
   dispatchContinuationDestinationSendNow,
   dispatchContinuationSourceSendNow,
+  ensureContinuationSourcePromptNow,
   normalizeProjectId,
   openContinuationNow,
   releaseContinuationDestinationSendNow,
@@ -289,6 +294,12 @@ const STALE_SWARM_SWEEP_MS = 30_000;
 let observationWritesInFlight = 0;
 /** Requests allowed per rolling minute, across all routes. */
 const RATE_LIMIT = 900;
+/**
+ * Browser-control is the recovery/control plane and must not compete with high-volume
+ * ChatGPT activity/events traffic for the same budget. Keep its own generous loopback-only
+ * authenticated budget so a thundering herd of restored tabs cannot starve command pickup.
+ */
+const BROWSER_CONTROL_RATE_LIMIT = 3600;
 
 /**
  * How long the app waits for the tab it opened to do the job, before failing it.
@@ -649,6 +660,7 @@ const commandWrites = new Map<string, Promise<boolean>>();
 /** Serializes the broker-claim + browser-lease half of one revival redeem. */
 const commandRedeems = new Map<string, Promise<void>>();
 let requestWindow = { start: Date.now(), count: 0 };
+let browserControlRequestWindow = { start: Date.now(), count: 0 };
 const listeners = new Set<() => void>();
 let extensionVersion: string | null = null;
 let extensionBuildId: string | null = null;
@@ -892,6 +904,21 @@ function rateLimited(): boolean {
   if (now - requestWindow.start > 60_000) requestWindow = { start: now, count: 0 };
   requestWindow.count += 1;
   return requestWindow.count > RATE_LIMIT;
+}
+
+function browserControlRateLimited(): boolean {
+  const now = Date.now();
+  if (now - browserControlRequestWindow.start > 60_000) {
+    browserControlRequestWindow = { start: now, count: 0 };
+  }
+  browserControlRequestWindow.count += 1;
+  return browserControlRequestWindow.count > BROWSER_CONTROL_RATE_LIMIT;
+}
+
+function priorityBrowserRoute(route: string, method: string | undefined): boolean {
+  if (method !== 'POST') return false;
+  if (route === '/browser-control' || route === '/status') return true;
+  return route.startsWith('/input/');
 }
 
 // ---------------------------------------------------------------- validation
@@ -1907,12 +1934,17 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       origin
     );
   }
-  // Charge only an authenticated extension. A random local process must not be able to
-  // consume the browser's shared budget before failing origin/authentication.
-  if (rateLimited()) return json(res, 429, { error: 'rate_limited' }, origin);
+  // Charge only an authenticated extension. Browser control is the recovery/control plane and
+  // has an independent budget: activity bursts from many restored ChatGPT tabs must never starve
+  // the very command path needed to repair those tabs.
+  const browserControlRoute = route === '/browser-control' && req.method === 'POST';
+  const priorityRoute = priorityBrowserRoute(route, req.method);
+  if (priorityRoute ? browserControlRateLimited() : rateLimited()) {
+    return json(res, 429, { error: 'rate_limited' }, origin);
+  }
   if (noteBrowserSeen()) changed();
 
-  if (route === '/browser-control' && req.method === 'POST') {
+  if (browserControlRoute) {
     const body = await readBody(req) as Record<string, unknown>;
     if (!body || typeof body.browserId !== 'string' || !/^[a-f\d-]{36}$/i.test(body.browserId))
       return json(res, 400, { error: 'invalid_browser_request' }, origin);
@@ -2963,6 +2995,57 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     const id = conversationId(body['conversationId']);
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    if (body['sourceDraftProbe'] === true) {
+      const session = await findSessionByConversation(id, { requireUnique: true });
+      if (!session || !/^[A-Za-z0-9_-]{16,64}$/.test(checkpointToken)) {
+        return json(res, 409, { error: 'source_draft_cleanup_not_authorized' }, origin);
+      }
+      const cleanup = continuationCleanupForSession(session.id);
+      if (cleanup?.token === checkpointToken && cleanup.from === id) {
+        return json(
+          res,
+          200,
+          {
+            allowed: true,
+            token: checkpointToken,
+            drafts: abandonedSourceDraftCandidates(cleanup),
+            durable: true
+          },
+          origin
+        );
+      }
+      const legacy = await legacyAbandonedSourceDraft(session.id, checkpointToken);
+      return legacy
+        ? json(
+            res,
+            200,
+            { allowed: true, token: checkpointToken, drafts: legacy, durable: false },
+            origin
+          )
+        : json(res, 409, { error: 'source_draft_cleanup_not_authorized' }, origin);
+    }
+    if (body['sourceDraftCleared'] === true) {
+      const entry = continuationByToken(checkpointToken);
+      if (entry?.from === id) {
+        const cleared = await acknowledgeContinuationSourceDraftCleanupNow(checkpointToken);
+        return json(
+          res,
+          cleared ? 200 : 409,
+          cleared ? { cleared: true, sessionId: entry.sessionId, job: resumeJobFor(entry.sessionId) }
+            : { error: 'source_draft_cleanup_not_pending' },
+          origin
+        );
+      }
+      // 3.1.10 and earlier could discard the terminal continuation before ChatGPT discarded
+      // its autosaved composer. Session history is longer-lived than that retired WAL row, so
+      // accept one migration ACK only when the exact cancelled token is still outstanding.
+      const session = await findSessionByConversation(id, { requireUnique: true });
+      if (!session || !(await legacyAbandonedSourceDraft(session.id, checkpointToken))) {
+        return json(res, 409, { error: 'source_draft_cleanup_not_pending' }, origin);
+      }
+      await recordNote(session.id, ABANDONED_SOURCE_DRAFT_CLEARED_NOTE, checkpointToken);
+      return json(res, 200, { cleared: true, sessionId: session.id, job: resumeJobFor(session.id) }, origin);
+    }
     if (body['sourceLost'] === true) {
       const entry = continuationByToken(checkpointToken);
       if (!entry || entry.from !== id) return json(res, 409, { error: 'no_such_continuation' }, origin);
@@ -3266,10 +3349,21 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     const already = continuationForSession(sessionId);
     if (already) {
-      const prompt =
-        already.state === 'awaiting-summary' && sendUnattempted(already.sourceSend)
-          ? nativeHandoffPrompt(already.token, getConfig().goal.includeToolCalls === true)
-          : null;
+      let prompt: string | null = null;
+      if (already.state === 'awaiting-summary' && sendUnattempted(already.sourceSend)) {
+        prompt = already.sourcePrompt;
+        if (!prompt) {
+          try {
+            prompt = await ensureContinuationSourcePromptNow(
+              already.token,
+              nativeHandoffPrompt(already.token, getConfig().goal.includeToolCalls === true)
+            );
+          } catch (err) {
+            logWarn(`bridge: could not durably freeze Compact & Resume prompt for ${sessionId} — ${err instanceof Error ? err.message : String(err)}`);
+            return json(res, 503, { error: 'source_prompt_not_durable', retryable: true, sessionId }, origin);
+          }
+        }
+      }
       return json(
         res,
         prompt ? 202 : 200,
@@ -3297,6 +3391,19 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // nothing about the compaction it just watched fail.
     rememberToken(sessionId, opened.token);
     changed();
+    let sourcePrompt: string | null = null;
+    try {
+      sourcePrompt = await ensureContinuationSourcePromptNow(
+        opened.token,
+        nativeHandoffPrompt(opened.token, getConfig().goal.includeToolCalls === true)
+      );
+    } catch (err) {
+      logWarn(`bridge: could not durably freeze Compact & Resume prompt for ${sessionId} — ${err instanceof Error ? err.message : String(err)}`);
+      return json(res, 503, { error: 'source_prompt_not_durable', retryable: true, sessionId }, origin);
+    }
+    if (!sourcePrompt) {
+      return json(res, 503, { error: 'source_prompt_not_durable', retryable: true, sessionId }, origin);
+    }
     logInfo(`bridge: browser started Compact & Resume for ${sessionId} (${opened.token.slice(0, 8)})`);
     return json(
       res,
@@ -3307,7 +3414,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         token: opened.token,
         sourceSend: opened.sourceSend,
         // The prompt the page injects as the compaction turn. Its answer is the brief.
-        prompt: nativeHandoffPrompt(opened.token, getConfig().goal.includeToolCalls === true),
+        prompt: sourcePrompt,
         job: resumeJobFor(sessionId)
       },
       origin
@@ -6038,6 +6145,12 @@ export interface ResumeJobView {
     messageId: string | null;
   };
   error: string | null;
+  /**
+   * Exact app-authored source prompt that may still be sitting in ChatGPT's restored draft
+   * after an explicitly cancelled ambiguous Send. Present only for that terminal case. The
+   * page may clear it only by exact-text proof and only with no attachments.
+   */
+  abandonedSourceDraft?: string;
 }
 
 const RUNNING_STAGES = new Set<ResumeStage>(['handoff-pending', 'opening', 'waiting-for-browser']);
@@ -6063,7 +6176,8 @@ function rememberToken(sessionId: string, token: string): void {
 /** The job for a session, if there is one worth telling the page about. */
 export function resumeJobFor(sessionId: string): ResumeJobView | null {
   const token = sessionTokens.get(sessionId);
-  const entry = (token ? continuationByToken(token) : null) ?? continuationForSession(sessionId);
+  const cleanup = continuationCleanupForSession(sessionId);
+  const entry = (token ? continuationByToken(token) : null) ?? continuationForSession(sessionId) ?? cleanup;
   if (!entry) return null;
   const command = commands.find((cmd) => cmd.spec.type === 'resume' && cmd.spec.sessionId === sessionId);
   const stage: ResumeStage =
@@ -6086,8 +6200,48 @@ export function resumeJobFor(sessionId: string): ResumeJobView | null {
     handoffId: entry.handoffId,
     sourceSend: entry.sourceSend,
     destinationSend: entry.destinationSend,
-    error: entry.error
+    error: entry.error,
+    ...(cleanup
+      ? {
+          abandonedSourceDraft:
+            cleanup.sourcePrompt ?? nativeHandoffPrompt(cleanup.token, getConfig().goal.includeToolCalls === true)
+        }
+      : {})
   };
+}
+
+const ABANDONED_SOURCE_DRAFT_NOTE = 'Compact & Resume abandoned — cancelled';
+const ABANDONED_SOURCE_DRAFT_CLEARED_NOTE = 'Compact & Resume abandoned draft cleared';
+
+function abandonedSourceDraftCandidates(entry: ContinuationView): string[] {
+  if (entry.sourcePrompt) return [entry.sourcePrompt];
+  return [...new Set([
+    nativeHandoffPrompt(entry.token, true),
+    nativeHandoffPrompt(entry.token, false)
+  ])];
+}
+
+/**
+ * Backward-compatible cleanup proof for versions that retired the continuation WAL before
+ * ChatGPT retired its autosaved source draft. The session note carries the exact continuation
+ * token indefinitely; the page still has to prove exact full-text equality against one of the
+ * two historical prompt variants before it is allowed to clear anything.
+ */
+async function legacyAbandonedSourceDraft(sessionId: string, token: string): Promise<string[] | null> {
+  if (!/^[A-Za-z0-9_-]{16,64}$/.test(token)) return null;
+  const notes = await readEvents(sessionId, { kinds: ['note'] });
+  let abandonedSeq = -1;
+  let clearedSeq = -1;
+  for (const event of notes) {
+    if (event.kind !== 'note' || event.continuation !== token) continue;
+    if (event.message.text === ABANDONED_SOURCE_DRAFT_NOTE) abandonedSeq = Math.max(abandonedSeq, event.seq);
+    if (event.message.text === ABANDONED_SOURCE_DRAFT_CLEARED_NOTE) clearedSeq = Math.max(clearedSeq, event.seq);
+  }
+  if (abandonedSeq < 0 || clearedSeq >= abandonedSeq) return null;
+  return [...new Set([
+    nativeHandoffPrompt(token, true),
+    nativeHandoffPrompt(token, false)
+  ])];
 }
 
 /**
@@ -10730,6 +10884,7 @@ export function resetBridgeForTests(): void {
   extensionBuildId = null;
   versionWarned = false;
   requestWindow = { start: Date.now(), count: 0 };
+  browserControlRequestWindow = { start: Date.now(), count: 0 };
 }
 
 /** Deterministic test seam for the current connectivity-reconciliation transaction. */

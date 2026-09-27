@@ -193,6 +193,24 @@ async function browserInputAllowed(entry: InputEntry): Promise<boolean> {
   // Silence can leave the recorder's original turn open. Its durable ticket
   // proves the exact unchanged work; the native page must still be idle for Send.
   if (entry.silenceBoundary) return await eligibleStageEnd(entry) === entry.silenceBoundary.turnId;
+  // A terminally failed self-healing episode must not permanently lock the user's own
+  // recovery message out of the browser. At this point CoS has already concluded that the
+  // old turn is stalled, there is no replacement executor, and normal automatic recovery
+  // has exhausted its budget. A fresh manual browser input authored *after* that durable
+  // failure is the explicit user action that reopens the conversation. Require the recorded
+  // turn to be closed, no tool work to remain in flight, and no post-end tool call before
+  // ignoring a stale activity projection left by the failed page/reload episode.
+  if (manualInput(entry) && entry.transportIntent === 'browser' && entry.state === 'queued' &&
+      entry.owner === null && entry.offeredAt === undefined) {
+    const session = await getSession(entry.sessionId);
+    const recovery = session?.recovery;
+    const recoveryFailedUnlock = !!session?.conversationId && !session.activeTurnId &&
+      session.lastTurnOutcome === 'stalled' && recovery?.phase === 'recovery_failed' &&
+      recovery.previousConversationId === session.conversationId && recovery.replacementConversationId === null &&
+      entry.createdAt > recovery.updatedAt && inFlightToolCalls(session.conversationId) === 0 &&
+      (session.lastToolCallAt ?? -1) <= (session.lastTurnEndAt ?? -1);
+    if (recoveryFailedUnlock) return true;
+  }
   const policy = await sessionInputPolicy(entry.sessionId);
   if (entry.completedTurnId && await eligibleStageEnd(entry) !== entry.completedTurnId) return false;
   if (entry.directTurn) {

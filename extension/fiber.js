@@ -1521,11 +1521,17 @@
   function pickerSnapshot() {
     // The closed native trigger retains the same picker owner. Passive recording
     // must not depend on discovery opening its portal first.
-    const form = document.querySelector('#prompt-textarea')?.closest('form');
+    const editor = document.querySelector('#prompt-textarea') ||
+      document.querySelector('[data-composer-body] [data-composer-markdown][contenteditable="true"][role="textbox"]');
+    const form = editor?.closest('form');
     const triggers = [...(form?.querySelectorAll('button[aria-haspopup="menu"]') || [])]
       .filter(node => !node.closest(`${OWN_SURFACES},[hidden],[aria-hidden="true"],[inert]`) && node.getClientRects().length > 0 &&
         node.id !== 'composer-plus-btn' && node.getAttribute('data-testid') !== 'composer-plus-btn');
-    const node = document.querySelector('[data-testid="composer-intelligence-picker-content"]') || (triggers.length === 1 ? triggers[0] : null);
+    const trigger = triggers.length === 1 ? triggers[0] : null;
+    const controlledId = trigger?.getAttribute('aria-controls');
+    const controlled = controlledId ? document.getElementById(controlledId) : null;
+    const node = document.querySelector('[data-testid="composer-intelligence-picker-content"]') ||
+      (controlled?.matches('[role="menu"],[role="dialog"]') ? controlled : null) || trigger;
     let state = null;
     try { state = readPickerSnapshot(node); } catch { /* Unknown state invalidates prior proof. */ }
     const selected = state?.choices.find(choice => choice.bucket === state.currentBucket && choice.available) ||
@@ -1554,6 +1560,7 @@
   }
   function readPickerSnapshot(node) {
     let fiber = node && fiberOf(node);
+    let powerOwner = null;
     for (let up = 0; fiber && up < MAX_CLIMB; up++, fiber = fiber.return) {
       // The September composer retains the unmounted menu as dropdownContent.
       // Read that exact native child too; opening it is unnecessary for observation.
@@ -1588,8 +1595,56 @@
       const chosen = choices.find(c => c.bucket === currentBucket);
       if (selected?.modelSlug !== chosen.id || effortOf(selected) !== chosen.effort) return null;
       return { version, currentBucket, versions, choices };
+
+      // unreachable: retained below for the legacy shape above
     }
-    return null;
+    // The current ChatGPT picker no longer exposes composerIntelligencePickerState.
+    // Its model-picker owner carries an allowlisted serializable view instead:
+    // modelListConfig.options is the version list, powerSelections are the choices for
+    // the selected version, and selectedPowerSelection is the exact active bucket.
+    // Search the same bounded React ancestry but never copy callbacks/account state.
+    fiber = node && fiberOf(node);
+    for (let up = 0; fiber && up < MAX_CLIMB; up++, fiber = fiber.return) {
+      const owner = fiber.memoizedProps;
+      if (Array.isArray(owner?.powerSelections) && owner.powerSelections.length > 0 &&
+          Array.isArray(owner?.modelListConfig?.options) && owner.modelListConfig.options.length > 0 &&
+          owner?.selectedPowerSelection) {
+        powerOwner = owner;
+        break;
+      }
+    }
+    if (!powerOwner || powerOwner.powerSelections.length > 12 || powerOwner.modelListConfig.options.length > 20) return null;
+    const id = value => typeof value === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(value) ? value : null;
+    const groupId = value => typeof value === 'string' && /^[a-zA-Z0-9._ -]{1,80}$/.test(value) && value.trim() === value && value.trim() ? value : null;
+    const label = value => typeof value === 'string' && value.trim().length > 0 && value.length <= 80 ? value.trim() : null;
+    const versions = powerOwner.modelListConfig.options.map(version => ({
+      id: groupId(version?.id),
+      label: label(version?.label)
+    }));
+    const selectedVersions = powerOwner.modelListConfig.options.filter(version => version?.selected === true);
+    if (!versions.length || versions.some(version => !version.id || !version.label) ||
+        new Set(versions.map(version => version.id)).size !== versions.length || selectedVersions.length !== 1) return null;
+    const selectedVersion = selectedVersions[0];
+    const version = groupId(selectedVersion.id);
+    const familyLabel = label(selectedVersion.label);
+    if (!version || !familyLabel) return null;
+    const effort = value => ['none','minimal','low','medium','high','xhigh','max','ultra','pro'].includes(value) ? value : null;
+    const choices = powerOwner.powerSelections.map(choice => ({
+      bucket: choice?.powerSettingIndex,
+      id: id(choice?.model),
+      label: label(choice?.sliderLabel) || label(choice?.modelLabel),
+      effort: effort(choice?.reasoningEffort),
+      familyId: version,
+      familyLabel,
+      available: powerOwner.modelSelectionDisabled !== true && selectedVersion.disabled !== true && choice?.disabled !== true
+    }));
+    if (choices.some(choice => !Number.isInteger(choice.bucket) || !choice.id || !choice.label || !choice.effort) ||
+        new Set(choices.map(choice => choice.bucket)).size !== choices.length) return null;
+    const selected = powerOwner.selectedPowerSelection;
+    const currentBucket = selected?.powerSettingIndex;
+    const chosen = choices.find(choice => choice.bucket === currentBucket);
+    if (!chosen || chosen.id !== id(selected?.model) || chosen.effort !== effort(selected?.reasoningEffort)) return null;
+    return { version, currentBucket, versions, choices };
   }
 
   function copySchema(value, budget, depth = 0) {

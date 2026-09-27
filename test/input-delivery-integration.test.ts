@@ -32,7 +32,7 @@ vi.mock('../src/main/browser.js', () => ({ openInPreferredBrowser: async () => '
 const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath } = await import('../src/main/secrets.js');
 const { initDurableStore, flushDurable, resetDurableForTests, writeDurableNow } = await import('../src/main/durable.js');
-const { createSession, rebindSession, initSessionStore, resetSessionStoreForTests } = await import('../src/main/session/store.js');
+const { createSession, rebindSession, initSessionStore, resetSessionStoreForTests, setSessionRecoveryState } = await import('../src/main/session/store.js');
 const { registerIpc } = await import('../src/main/ipc.js');
 const { bridgePort, startBridge, stopBridge } = await import('../src/main/bridge.js');
 const input = await import('../src/main/session/input.js');
@@ -68,6 +68,29 @@ beforeEach(async () => {
   await writeDurableNow('plugin-refresh', []);
   goal.resetGoalStateForTests(); input.resetInputForTests(); pushed.mockClear();
   await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false } });
+});
+it('allows a fresh authored browser message to unlock a stalled recovery_failed session', async () => {
+  const conversationId = randomUUID();
+  const session = await createSession({ title: 'Recovery failed manual unlock', conversationId });
+  const now = Date.now();
+  await post('/events', { conversationId, events: [
+    { kind: 'turn_start', turnId: 'stalled-turn', time: now - 5000 },
+    { kind: 'turn_end', turnId: 'stalled-turn', outcome: 'stalled', detail: 'test stall', time: now - 4000 }
+  ] });
+  const episode = randomUUID();
+  expect(await setSessionRecoveryState(session.id, conversationId, {
+    phase: 'recovery_failed', failureEpisodeId: episode, recoveryGeneration: 1, recoveryAttempts: 2,
+    lastRecoveryAt: now - 3000, lastRecoveryBudgetAt: now - 3000, transportPausedAt: null,
+    lastProgressAt: now - 5000, previousConversationId: conversationId, replacementConversationId: null,
+    failureKind: 'silence', mutationSafety: 'mutating_or_ambiguous', agentLineage: null,
+    destinationSend: { state: 'attempted-unresolved', commandId: randomUUID(), dispatchedAt: null,
+      dispatchedBudgetAt: null, conversationId: null, messageId: null },
+    updatedAt: now - 2000, error: 'test recovery failed'
+  }, { failureEpisodeId: null, recoveryGeneration: null })).toBe(true);
+  const row = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto' });
+  expect(await input.pendingBrowserInputs()).toContainEqual(expect.objectContaining({ id: row.id, conversationId }));
+  expect((await post('/status', { openConversations: [conversationId] })).body.inputs)
+    .toContainEqual(expect.objectContaining({ id: row.id, conversationId }));
 });
 it.each([false, true])('retires Goal only when queued input commits its exact source, including restored aliases (%s)', async alias => {
   const store = await import('../src/main/session/store.js');

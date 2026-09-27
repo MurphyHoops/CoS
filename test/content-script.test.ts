@@ -18,6 +18,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { chronological } from '../src/shared/chronology.js';
 import { prependUserPrompt, userPromptText } from '../src/shared/user-prompt.js';
+import { nativeHandoffPrompt } from '../src/main/session/handoff-prompt.js';
 
 let domSource = '';
 let contentSource = '';
@@ -159,6 +160,7 @@ interface Hook {
   renderStreamEnabled(): boolean;
   setDesktopProjectInputForTest(claim: { id: string; owner: string } | null): void;
   desktopProjectInputForTest(): { id: string; owner: string } | null;
+  clearAbortedCompactionDraft(view: Record<string, any> | null): boolean;
   setShowTimes(on: boolean): void;
   /** How long Overwrite leaves a user-driven scroll completely presentation-stable. */
   PRESENTATION_SCROLL_IDLE_MS: number;
@@ -402,6 +404,8 @@ const startedCompactions = (harness: Harness): any[] =>
       !message.sourceAttempt &&
       !message.sourceLost &&
       !message.sourceDispatch &&
+      !message.sourceDraftProbe &&
+      !message.sourceDraftCleared &&
       !message.sourceMessageId &&
       !message.destinationAttempt &&
       !message.destinationDispatch &&
@@ -1213,6 +1217,59 @@ describe('desktop input delivery and helper ownership', () => {
     expect(selectSettings).toHaveBeenCalledWith('gpt-5.6-sol', 'high', expect.any(Function));
     expect(sent).toHaveBeenCalledTimes(confirmed ? 1 : 0);
     expect(live.sent.filter(message => message.type === 'desktop_input' && message.ack)).toHaveLength(confirmed ? 1 : 0);
+  });
+
+  it('clears an app-authorized abandoned handoff at the desktop-input conflict point', async () => {
+    const token = '9A_T5dJf-5BWDY80giljzg';
+    const exact = nativeHandoffPrompt(token, true);
+    live = await harness('https://chatgpt.com/c/' + chatA, {
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack || message.fail
+        ? { ok: true } : { input: claimed() } }),
+      compact: message => {
+        if (message.sourceDraftProbe) {
+          return { ok: true, data: { allowed: true, token, drafts: [exact], durable: false } };
+        }
+        if (message.sourceDraftCleared) return { ok: true, data: { cleared: true } };
+        return { ok: false, error: 'unexpected_compact_call' };
+      }
+    });
+    live.document.querySelector('#prompt-textarea')!.textContent = exact;
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+      userTurn(live!.document, 'after-abandoned-handoff', text, { sent: false });
+      live!.document.querySelector('#prompt-textarea')!.textContent = '';
+      live!.hook.observe();
+    });
+
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA })).toEqual({ ok: true });
+    expect(live.sent).toContainEqual(expect.objectContaining({
+      type: 'compact', conversationId: chatA, token, sourceDraftProbe: true
+    }));
+    expect(live.sent).toContainEqual(expect.objectContaining({
+      type: 'compact', conversationId: chatA, token, sourceDraftCleared: true
+    }));
+    expect(live.sent.some(message => message.type === 'desktop_input' && message.fail)).toBe(false);
+  });
+
+  it('preserves an edited historical handoff at the desktop-input conflict point', async () => {
+    const token = '9A_T5dJf-5BWDY80giljzg';
+    const exact = nativeHandoffPrompt(token, true);
+    const edited = exact + '\nmy own edit';
+    live = await harness('https://chatgpt.com/c/' + chatA, {
+      desktop_input: message => ({ ok: true, data: message.fail
+        ? { ok: true } : { input: claimed() } }),
+      compact: message => message.sourceDraftProbe
+        ? { ok: true, data: { allowed: true, token, drafts: [exact], durable: false } }
+        : { ok: true, data: { cleared: true } }
+    });
+    live.document.querySelector('#prompt-textarea')!.textContent = edited;
+
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA })).toEqual({ ok: false });
+    expect(composerText(live.document)).toBe(edited);
+    expect(live.sent.some(message => message.type === 'compact' && message.sourceDraftCleared === true)).toBe(false);
+    expect(live.sent).toContainEqual(expect.objectContaining({
+      type: 'desktop_input', owner: 'input-owner', fail: true,
+      error: expect.stringContaining('already contains an unsent draft')
+    }));
   });
 
   it('preserves an attachment-only user draft and fails its owned input promptly without sending', async () => {
@@ -11485,6 +11542,57 @@ describe('the Compact & resume control', () => {
     expect(live.document.querySelector('.clf-pill-text')!.textContent).toContain('would not stop');
   });
 
+  it('clears an older authorized handoff before writing a new compaction prompt', async () => {
+    const oldToken = '9A_T5dJf-5BWDY80giljzg';
+    const oldPrompt = nativeHandoffPrompt(oldToken, true);
+    const newToken = 'new-current-compaction-token';
+    const newPrompt = '[[CLF-HANDOFF:' + newToken + ']]\n\nWrite the replacement handoff brief.';
+    const currentJob = {
+      sessionId: 's-current-cleanup',
+      stage: 'handoff-pending',
+      automatic: false,
+      busy: true,
+      handoffId: null,
+      error: null,
+      sourceSend: { state: 'not-attempted', messageId: null }
+    };
+    live = await harness(undefined, {
+      activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null } }),
+      compact: message => {
+        if (message.sourceDraftProbe) {
+          return message.token === oldToken
+            ? { ok: true, data: { allowed: true, token: oldToken, drafts: [oldPrompt], durable: false } }
+            : { ok: false, error: 'source_draft_cleanup_not_authorized' };
+        }
+        if (message.sourceDraftCleared) return { ok: true, data: { cleared: true } };
+        if (message.sourceAttempt) return { ok: true, data: { allowed: true } };
+        if (message.sourceDispatch) return { ok: true, data: { armed: true } };
+        if (message.ticket) return { ok: true, data: { started: true, sourceSend: currentJob.sourceSend, job: currentJob } };
+        if (message.resume) return { ok: true, data: { started: true, token: newToken, prompt: newPrompt, sourceSend: currentJob.sourceSend, job: currentJob } };
+        if (message.cancel) return { ok: true, data: { cancelled: true } };
+        return { ok: false, error: 'unexpected_compact_call' };
+      }
+    });
+    live.hook.injectControl();
+    live.document.querySelector('#prompt-textarea')!.textContent = oldPrompt;
+    const sends = watchSend(live.document);
+    let submitted = '';
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+      submitted = composerText(live!.document);
+    });
+
+    await live.hook.startCompact();
+
+    expect(live.sent).toContainEqual(expect.objectContaining({
+      type: 'compact', token: oldToken, sourceDraftProbe: true
+    }));
+    expect(live.sent).toContainEqual(expect.objectContaining({
+      type: 'compact', token: oldToken, sourceDraftCleared: true
+    }));
+    expect(submitted.replace(/\s+/g, '')).toBe(newPrompt.replace(/\s+/g, ''));
+    expect(sends()).toBe(1);
+  });
+
   it('never overwrites a draft the user is writing', async () => {
     live = await harness(undefined, {
       activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null } }),
@@ -11637,6 +11745,83 @@ describe('the Compact & resume control', () => {
     expect(live.sent.some((message) => message.type === 'compact' && message.sourceAttempt === true)).toBe(false);
     expect(live.sent.some((message) => message.type === 'compact' && message.sourceDispatch === true)).toBe(false);
     expect(composerText(live.document)).toBe(stale);
+  });
+
+  it('clears only the exact app-authored draft of a terminally cancelled ambiguous handoff', async () => {
+    live = await harness();
+    const exact =
+      '[[CLF-HANDOFF:0123456789abcdef0123456789abcdef]]\n\n' +
+      'Chat On Steroids is compacting this conversation so a fresh chat can continue the work.';
+    const editor = live.document.querySelector('#prompt-textarea')!;
+    editor.textContent = exact;
+    const terminal = {
+      stage: 'failed', busy: false, error: 'cancelled', abandonedSourceDraft: exact
+    };
+    expect(live.hook.clearAbortedCompactionDraft({ ...terminal, busy: true })).toBe(false);
+    expect(composerText(live.document)).toBe(exact);
+    editor.textContent = `${exact}\nmy edit`;
+    expect(live.hook.clearAbortedCompactionDraft(terminal)).toBe(false);
+    expect(composerText(live.document)).toContain('my edit');
+    editor.textContent = exact;
+    expect(live.hook.clearAbortedCompactionDraft(terminal)).toBe(true);
+    expect(composerText(live.document)).toBe('');
+  });
+
+  it('migrates a legacy cancelled handoff draft only after app token proof and exact full-text match', async () => {
+    const token = '9A_T5dJf-5BWDY80giljzg';
+    const exact = nativeHandoffPrompt(token, true);
+    live = await harness(undefined, {
+      activity: () => ({
+        ok: true,
+        data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null }
+      }),
+      compact: (message) => {
+        if (message.sourceDraftProbe) {
+          return { ok: true, data: { allowed: true, token, drafts: [exact], durable: false } };
+        }
+        if (message.sourceDraftCleared) {
+          return { ok: true, data: { cleared: true } };
+        }
+        return { ok: false, error: 'unexpected_compact_call' };
+      }
+    });
+    live.hook.injectControl();
+    live.document.querySelector('#prompt-textarea')!.textContent = exact;
+
+    await live.hook.pullActivity();
+    await settle();
+
+    expect(composerText(live.document)).toBe('');
+    expect(live.sent).toContainEqual(expect.objectContaining({
+      type: 'compact', conversationId: expect.any(String), token, sourceDraftProbe: true
+    }));
+    expect(live.sent).toContainEqual(expect.objectContaining({
+      type: 'compact', conversationId: expect.any(String), token, sourceDraftCleared: true
+    }));
+  });
+
+  it('preserves a user-edited legacy handoff draft even when its historical token is authorized', async () => {
+    const token = '9A_T5dJf-5BWDY80giljzg';
+    const exact = nativeHandoffPrompt(token, true);
+    live = await harness(undefined, {
+      activity: () => ({
+        ok: true,
+        data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null }
+      }),
+      compact: (message) => message.sourceDraftProbe
+        ? { ok: true, data: { allowed: true, token, drafts: [exact], durable: false } }
+        : { ok: true, data: { cleared: true } }
+    });
+    live.hook.injectControl();
+    const edited = `${exact}\nmy own edit`;
+    live.document.querySelector('#prompt-textarea')!.textContent = edited;
+
+    await live.hook.pullActivity();
+    await settle();
+
+    expect(composerText(live.document)).toBe(edited);
+    expect(live.sent.some((message) => message.type === 'compact' && message.sourceDraftProbe === true)).toBe(true);
+    expect(live.sent.some((message) => message.type === 'compact' && message.sourceDraftCleared === true)).toBe(false);
   });
 
   it('does not submit a compaction prompt after the composer changes during its pre-send wait', async () => {
@@ -14599,7 +14784,8 @@ describe('one live isolated-world recorder per document', () => {
 
     await expect(live.runtimeMessage({ type: 'clf-recorder-ping' })).resolves.toEqual({
       ok: true,
-      recorderVersion: 13
+      recorderVersion: 14,
+      recorderBuildId: 'cos-3.1.15-companion-provider-picker-v1'
     });
   });
 

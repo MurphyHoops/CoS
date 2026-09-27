@@ -282,6 +282,14 @@ interface Continuation {
   project: string | null;
   sourceSend: ContinuationSendCheckpoint;
   destinationSend: ContinuationDestinationCheckpoint;
+  /** Exact app-authored source prompt frozen before it is ever returned to a page. */
+  sourcePrompt: string | null;
+  /**
+   * Cleanup authority only: an explicitly cancelled source prompt crossed the dispatch fence
+   * but may still be sitting in ChatGPT's autosaved composer. This never permits replay and
+   * stays durable until the exact app-authored draft is gone and the page ACKs that fact.
+   */
+  sourceDraftCleanupPending: boolean;
   error: string | null;
 }
 
@@ -329,6 +337,10 @@ interface ContinuationRecord {
   /** Absent only in a record written before the checkpoints existed. */
   sourceSend?: ContinuationSendCheckpoint;
   destinationSend?: ContinuationDestinationCheckpoint;
+  /** Exact prompt handed to chat A; absent in WALs written before prompt provenance was frozen. */
+  sourcePrompt?: string | null;
+  /** Absent in WALs written before durable abandoned-source-draft cleanup existed. */
+  sourceDraftCleanupPending?: boolean;
   error: string | null;
 }
 
@@ -422,6 +434,8 @@ function durableRecord(entry: Continuation): ContinuationRecord {
     claimedBy: entry.claimedBy,
     sourceSend: { ...entry.sourceSend },
     destinationSend: { ...entry.destinationSend },
+    sourcePrompt: entry.sourcePrompt,
+    ...(entry.sourceDraftCleanupPending ? { sourceDraftCleanupPending: true } : {}),
     error: entry.error
   };
 }
@@ -491,6 +505,9 @@ function decodeContinuationSnapshot(value: unknown): ContinuationSnapshot | null
         !validOptionalNullableFinite(row.deadlineAskedAt) ||
         !(row.project === undefined || row.project === null || typeof row.project === 'string') ||
         !(row.armed === undefined || typeof row.armed === 'boolean') ||
+        !(row.sourcePrompt === undefined || row.sourcePrompt === null ||
+          (typeof row.sourcePrompt === 'string' && row.sourcePrompt.length <= 64 * 1024)) ||
+        !(row.sourceDraftCleanupPending === undefined || typeof row.sourceDraftCleanupPending === 'boolean') ||
         !validSendCheckpoint(row.sourceSend, false, from) ||
         !validSendCheckpoint(row.destinationSend, true, from)) {
       return null;
@@ -640,6 +657,8 @@ function publishRecord(entry: Continuation, record: ContinuationRecord): void {
   entry.destinationSend = record.destinationSend
     ? { ...record.destinationSend }
     : { state: 'not-attempted', conversationId: null, messageId: null };
+  entry.sourcePrompt = typeof record.sourcePrompt === 'string' ? record.sourcePrompt : null;
+  entry.sourceDraftCleanupPending = record.sourceDraftCleanupPending === true;
   entry.error = record.error;
   if (entry.askedAt === null && handoffAsked(entry)) {
     const askedAt = typeof record.askedAt === 'number' && Number.isFinite(record.askedAt) ? record.askedAt : Date.now();
@@ -731,6 +750,8 @@ export interface ContinuationView {
   project: string | null;
   sourceSend: ContinuationSendCheckpoint;
   destinationSend: ContinuationDestinationCheckpoint;
+  /** Exact prompt frozen before page delivery; null for legacy rows or after proven send/cleanup. */
+  sourcePrompt: string | null;
 }
 
 const view = (entry: Continuation): ContinuationView => ({
@@ -748,7 +769,8 @@ const view = (entry: Continuation): ContinuationView => ({
   askedAt: entry.askedAt,
   project: entry.project,
   sourceSend: { ...entry.sourceSend },
-  destinationSend: { ...entry.destinationSend }
+  destinationSend: { ...entry.destinationSend },
+  sourcePrompt: entry.sourcePrompt
 });
 
 /** Whether the brief has been asked for: the request is on its way, went out, or was answered. */
@@ -818,8 +840,12 @@ function sweep(): void {
     if (entry.state === 'committing') continue;
     if (entry.state === 'committed' || entry.state === 'aborted') {
       // Kept briefly so a repeated ack can be answered with "already done" rather than with
-      // a fresh transaction, then forgotten.
-      if (Date.now() - entry.touchedAt > CONTINUATION_TTL_MS * 2) byToken.delete(entry.token);
+      // a fresh transaction, then forgotten. A pending source-draft cleanup is different:
+      // ChatGPT persists that editor across browser/app restarts, so its exact cleanup proof
+      // must outlive the ordinary terminal TTL and is retired only by an explicit page ACK.
+      if (!entry.sourceDraftCleanupPending && Date.now() - entry.touchedAt > CONTINUATION_TTL_MS * 2) {
+        byToken.delete(entry.token);
+      }
       continue;
     }
     if (expired(entry)) {
@@ -846,6 +872,32 @@ export function continuationByToken(token: string): ContinuationView | null {
   sweep();
   const entry = byToken.get(token);
   return entry ? view(entry) : null;
+}
+
+/** Latest terminal continuation that still owes exact source-draft cleanup for this session. */
+export function continuationCleanupForSession(sessionId: string): ContinuationView | null {
+  if (continuationRecoveryPaused()) return null;
+  sweep();
+  let latest: Continuation | null = null;
+  for (const entry of byToken.values()) {
+    if (entry.sessionId !== sessionId || !entry.sourceDraftCleanupPending) continue;
+    if (!latest || entry.openedAt > latest.openedAt) latest = entry;
+  }
+  return latest ? view(latest) : null;
+}
+
+/** Retires only the cleanup obligation; the ambiguous source Send checkpoint remains unchanged. */
+export async function acknowledgeContinuationSourceDraftCleanupNow(token: string): Promise<boolean> {
+  return withCheckpointLock(token, async () => {
+    const entry = byToken.get(token);
+    if (!entry || entry.state !== 'aborted' || !entry.sourceDraftCleanupPending) return false;
+    await transitionNow(entry, current => ({
+      ...current,
+      sourcePrompt: null,
+      sourceDraftCleanupPending: false
+    }));
+    return true;
+  });
 }
 
 /**
@@ -1077,6 +1129,8 @@ function makeContinuation(sessionId: string, fromConversationId: string, automat
     to: null,
     sourceSend: { state: 'not-attempted', messageId: null },
     destinationSend: { state: 'not-attempted', conversationId: null, messageId: null },
+    sourcePrompt: null,
+    sourceDraftCleanupPending: false,
     error: null
   };
 }
@@ -1155,6 +1209,24 @@ async function withCheckpointLock<T>(token: string, work: () => Promise<T>): Pro
   } finally {
     if (checkpointLocks.get(token) === current) checkpointLocks.delete(token);
   }
+}
+
+/**
+ * Freezes the exact app-authored source prompt before it is returned to ChatGPT.
+ *
+ * The continuation token alone is not enough durable provenance: the handoff instructions and
+ * include-tool-call setting can change across versions or settings while ChatGPT keeps an
+ * autosaved draft for hours. Persist the literal text first; every retry receives that same text.
+ */
+export async function ensureContinuationSourcePromptNow(token: string, prompt: string): Promise<string | null> {
+  if (!prompt || prompt.length > 64 * 1024) return null;
+  return withCheckpointLock(token, async () => {
+    const entry = byToken.get(token);
+    if (!entry || !isOpen(entry) || entry.state !== 'awaiting-summary') return null;
+    if (entry.sourcePrompt !== null) return entry.sourcePrompt;
+    await transitionNow(entry, current => ({ ...current, sourcePrompt: prompt }));
+    return entry.sourcePrompt;
+  });
 }
 
 /**
@@ -1254,7 +1326,8 @@ export async function bindContinuationSourceMessageNow(token: string, messageId:
     await transitionNow(entry, (current) => ({
       ...current,
       sourceProgress: Number.isSafeInteger(progress) && progress! >= 0 && progress! <= 4_000_000 ? progress! : 0,
-      sourceSend: { state: 'sent', messageId }
+      sourceSend: { state: 'sent', messageId },
+      sourcePrompt: null
     }));
     return true;
   });
@@ -1887,6 +1960,9 @@ export function abortContinuation(token: string, reason: string): boolean {
   const entry = byToken.get(token);
   if (!entry || entry.state === 'committing') return false;
   if (entry.state === 'committed' || entry.state === 'aborted') return false;
+  entry.sourceDraftCleanupPending ||= reason === 'cancelled' &&
+    entry.sourceSend.state === 'dispatched-unresolved' &&
+    entry.destinationSend.state === 'not-attempted';
   entry.state = 'aborted';
   entry.error = reason;
   endResumeClaim(entry.token);
@@ -1919,7 +1995,14 @@ export async function abortContinuationNow(token: string, reason: string): Promi
   const entry = byToken.get(token);
   if (!entry || entry.state === 'committing') return false;
   if (entry.state === 'committed' || entry.state === 'aborted') return false;
-  await transitionNow(entry, (current) => ({ ...current, state: 'aborted', error: reason }));
+  await transitionNow(entry, (current) => ({
+    ...current,
+    state: 'aborted',
+    sourceDraftCleanupPending: current.sourceDraftCleanupPending === true ||
+      (reason === 'cancelled' && current.sourceSend?.state === 'dispatched-unresolved' &&
+        current.destinationSend?.state === 'not-attempted'),
+    error: reason
+  }));
   cancelPrimeTransfer(entry.from);
   logWarn(`continuation ${entry.token.slice(0, 8)} durably abandoned — ${reason}`);
   noteAbandoned(entry, reason);
@@ -2030,8 +2113,17 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
                   : null
             }
           : { state: 'not-attempted', conversationId: null, messageId: null },
+      sourcePrompt: typeof raw.sourcePrompt === 'string' ? raw.sourcePrompt : null,
+      sourceDraftCleanupPending: raw.sourceDraftCleanupPending === true,
       error: typeof raw.error === 'string' ? raw.error : null
     };
+    // Migration for 3.1.10/3.1.11 WALs. This exact terminal shape is the only historical
+    // state that can have left the app-authored source prompt in ChatGPT's persistent editor.
+    if (raw.sourceDraftCleanupPending === undefined && entry.state === 'aborted' &&
+        entry.error === 'cancelled' && entry.sourceSend.state === 'dispatched-unresolved' &&
+        entry.destinationSend.state === 'not-attempted') {
+      entry.sourceDraftCleanupPending = true;
+    }
     if (handoffAsked(entry)) {
       // Preserve authored evidence separately from the provider-wait budget. A legacy record that
       // had no automatic deadline starts its budget at this restart without inventing old evidence.
