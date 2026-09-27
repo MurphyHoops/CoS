@@ -9,6 +9,7 @@ export function createBrowserControl(chrome, transport, protectedTab = () => fal
   const id = () => crypto.randomUUID();
   const cut = (s, n = 1000) => String(s ?? '').slice(0,n);
   const error = message => { throw new Error(message); };
+  const sleep = ms => new Promise(resolve => setTimeout(resolve,ms));
   const handle = tabId => `${browserId}:${tabId}`;
   async function cleanup(work) {
     let timer;
@@ -571,7 +572,17 @@ export function createBrowserControl(chrome, transport, protectedTab = () => fal
       if (!ack.ok && ack.status !== 409) return;
       receipt = null; await save();
     }
-    const poll = await transport('/browser-control',{method:'POST',body:JSON.stringify({action:'poll',browserId,name:/Edg\//.test(navigator.userAgent) ? 'Edge' : 'Chrome / Chromium',enabled})});
+    // Poll is read-only, so bounded retry is safe. This is deliberately local to browser-control:
+    // a reload can wake dozens of ChatGPT tabs at once and momentarily overload ordinary bridge
+    // traffic, but one transient 429/network miss must not strand the control plane until the next
+    // unrelated maintenance tick. Claims/results remain at-most-once and are never replayed here.
+    let poll;
+    const delays=[0,100,250,500,1000];
+    for (let attempt=0;attempt<delays.length;attempt++) {
+      if (delays[attempt]) await sleep(delays[attempt]);
+      poll = await transport('/browser-control',{method:'POST',body:JSON.stringify({action:'poll',browserId,name:/Edg\//.test(navigator.userAgent) ? 'Edge' : 'Chrome / Chromium',enabled})});
+      if (poll.ok || !([0,408,429].includes(poll.status) || poll.status >= 500)) break;
+    }
     if (!poll.ok) { if (poll.status === 401 || poll.status === 426) await revoke(); return; }
     policy = poll.data.policy;
     if (epoch !== poll.data.epoch) { await Promise.all([...tabs.values()].map(release)); epoch = poll.data.epoch; await save(); }

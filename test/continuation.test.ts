@@ -55,6 +55,7 @@ const {
   CONTINUATION_TTL_MS,
   abortContinuation,
   abortContinuationSourceBeforeSendNow,
+  acknowledgeContinuationSourceDraftCleanupNow,
   attachSummary,
   beginContinuationDestinationSendNow,
   beginContinuationSourceSendNow,
@@ -65,6 +66,7 @@ const {
   commitContinuationResult,
   compactingConversation,
   continuationByToken,
+  continuationCleanupForSession,
   continuationForSession,
   continuationRecoveryPaused,
   dispatchContinuationDestinationSendNow,
@@ -2354,6 +2356,37 @@ describe('the window in which a replacement chat is expected', () => {
  * The renewal is deliberately not a longer timeout. A chat that has genuinely gone quiet still
  * expires on the original clock, which the second test here is for.
  */
+describe('abandoned source draft cleanup is durable', () => {
+  it('migrates a 3.1.10 cancelled ambiguous source send, survives terminal TTL, and ACKs without replay authority', async () => {
+    vi.useFakeTimers();
+    try {
+      const session = await createSession({ title: 'abandoned source draft', conversationId: CHAT_A });
+      const opened = await openContinuationNow(session.id, CHAT_A);
+      expect(await beginContinuationSourceSendNow(opened.token)).toMatchObject({ allowed: true });
+      expect(await dispatchContinuationSourceSendNow(opened.token)).toBe(true);
+      expect(abortContinuation(opened.token, 'cancelled')).toBe(true);
+
+      const legacy = structuredClone(snapshotContinuations()) as any;
+      const row = legacy.entries.find((entry: any) => entry.token === opened.token);
+      expect(row.sourceSend.state).toBe('dispatched-unresolved');
+      expect(row.destinationSend.state).toBe('not-attempted');
+      delete row.sourceDraftCleanupPending;
+
+      resetContinuationsForTests();
+      expect(await restoreContinuations(legacy)).toBe(true);
+      expect(continuationCleanupForSession(session.id)?.token).toBe(opened.token);
+
+      vi.setSystemTime(Date.now() + CONTINUATION_TTL_MS * 3);
+      expect(continuationCleanupForSession(session.id)?.token).toBe(opened.token);
+
+      expect(await acknowledgeContinuationSourceDraftCleanupNow(opened.token)).toBe(true);
+      expect(continuationCleanupForSession(session.id)).toBeNull();
+      expect(continuationByToken(opened.token)?.sourceSend.state).toBe('dispatched-unresolved');
+      expect(await acknowledgeContinuationSourceDraftCleanupNow(opened.token)).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+});
+
 describe('an exact handoff response owns its waiting deadline', () => {
   it('survives growing output and restart but expires after unchanged snapshots', async () => {
     vi.useFakeTimers();

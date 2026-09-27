@@ -15,6 +15,17 @@ self-reloads once when it sees a newer expected build. Existing ChatGPT tabs are
 that reload; a normal page refresh is sufficient if a tab still shows stale UI. Manual
 chrome://extensions reload remains the fallback only for an intentionally different unpacked path.
 
+## [3.1.15] — 2026-09-27
+
+### Restore new-chat execution and harden browser recovery
+
+- Updated ChatGPT composer/model-picker discovery for the current provider UI and current React state, fixing fresh CoS chats that opened but failed with `Requested model or reasoning could not be confirmed`.
+- Gave authenticated browser-control recovery an independent budget plus bounded transient retry, and hardened Compact & Resume abandoned-draft cleanup / terminal manual recovery so stale recovery state cannot strand future work.
+- Hardened renderer event subscriptions against invalid cross-context listeners and added a bounded read-only 15-second state-refresh fallback for a missed contextBridge push.
+- Bumped app and companion to **3.1.15** with companion build `cos-3.1.15-companion-provider-picker-v1`; bridge protocol remains **15**.
+
+See [the 3.1.15 release notes](docs/release-notes/v3.1.15.md).
+
 ## [3.1.5] — 2026-09-26
 
 ### Packaging integrity and Windows ARM release stability

@@ -1931,7 +1931,11 @@ describe('extension command delivery', () => {
     const session = new FakeStorageArea();
     const worker = loadWorker({ local, session });
     worker.tabsQuery.mockResolvedValueOnce([{ id: 41 }]);
-    worker.tabsSendMessage.mockResolvedValueOnce({ ok: true, recorderVersion: 13 });
+    worker.tabsSendMessage.mockResolvedValueOnce({
+      ok: true,
+      recorderVersion: 14,
+      recorderBuildId: 'cos-3.1.15-companion-provider-picker-v1'
+    });
 
     await worker.installed('update');
 
@@ -1940,6 +1944,30 @@ describe('extension command delivery', () => {
       [{ target: { tabId: 41 }, world: 'MAIN', files: ['fiber.js'] }]
     ]);
     expect(worker.scriptingInsertCSS).not.toHaveBeenCalled();
+  });
+
+  it('re-injects a recorder from a stale companion build even when its recorder protocol matches', async () => {
+    const local = new FakeStorageArea(paired);
+    const session = new FakeStorageArea();
+    const worker = loadWorker({ local, session });
+    worker.tabsQuery.mockResolvedValueOnce([{ id: 41 }]);
+    worker.tabsSendMessage.mockResolvedValueOnce({
+      ok: true,
+      recorderVersion: 14,
+      recorderBuildId: 'cos-3.1.12-companion-durable-draft-cleanup-v1'
+    });
+
+    await worker.installed('update');
+
+    expect(worker.scriptingExecuteScript.mock.calls).toEqual([
+      [{ target: { tabId: 41 }, files: ['chatgpt-dom.js'] }],
+      [{ target: { tabId: 41 }, world: 'MAIN', files: ['fiber.js'] }],
+      [{ target: { tabId: 41 }, files: ['content.js'] }]
+    ]);
+    expect(worker.scriptingInsertCSS).toHaveBeenCalledWith({
+      target: { tabId: 41 },
+      files: ['overlay.css']
+    });
   });
 
   it('repairs a missing MAIN-world Fiber helper on demand for the sending tab only', async () => {
@@ -2062,7 +2090,11 @@ describe('extension revival delivery', () => {
 
   const liveRecorder = async (_tabId: number, message: Record<string, unknown>) =>
     message.type === 'clf-recorder-ping'
-      ? { ok: true, recorderVersion: 13 }
+      ? {
+          ok: true,
+          recorderVersion: 14,
+          recorderBuildId: 'cos-3.1.15-companion-provider-picker-v1'
+        }
       : { ok: true, claimed: true };
 
   it('scans before opening and routes to the oldest exact worker tab', async () => {

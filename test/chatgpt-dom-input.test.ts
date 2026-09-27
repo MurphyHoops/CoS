@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const source = readFileSync(new URL('../extension/chatgpt-dom.js', import.meta.url), 'utf8');
 interface DomApi {
+  composer(): HTMLElement | null;
+  composerVisible(): boolean;
   insertPrompt(text: string, mode?: boolean | 'append', failure?: (reason: string) => void): boolean;
   enterProject(entry: { id: string; sourceConversationId: string }, current?: () => boolean): Promise<boolean>;
   composerActions(): { host: HTMLElement; before: HTMLElement | null } | null;
@@ -36,6 +38,34 @@ beforeEach(() => {
   button = document.querySelector('[data-testid="send-button"]')!;
 });
 afterEach(() => { dom.window.close(); vi.useRealTimers(); });
+
+describe('composer identity', () => {
+  it('recognizes the current ChatGPT rich editor after prompt-textarea id removal', () => {
+    box.remove();
+    const body = document.createElement('div');
+    body.setAttribute('data-composer-body', '');
+    const current = document.createElement('div');
+    current.setAttribute('data-composer-markdown', '');
+    current.setAttribute('contenteditable', 'true');
+    current.setAttribute('role', 'textbox');
+    current.className = 'ProseMirror';
+    body.append(current); document.body.append(body);
+    expect(document.querySelector('#prompt-textarea')).toBeNull();
+    expect(api.composer()).toBe(current);
+    expect(api.composerVisible()).toBe(true);
+  });
+
+  it('never treats a generic editable textbox as the ChatGPT composer', () => {
+    box.remove();
+    const unrelated = document.createElement('div');
+    unrelated.setAttribute('contenteditable', 'true');
+    unrelated.setAttribute('role', 'textbox');
+    document.body.append(unrelated);
+    expect(api.composer()).toBeNull();
+    expect(api.composerVisible()).toBe(false);
+  });
+});
+
 function user(text: string) {
   const section = document.createElement('section');
   section.setAttribute('data-testid', 'conversation-turn-1');
@@ -672,6 +702,19 @@ describe('rendered temporary-chat state independent of language', () => {
 
 
 describe('locale-independent provider composer evidence', () => {
+  it.each([['zh-Hans', '发送'], ['ja', '送信'], ['ar', 'إرسال']])('recognizes the unique composer submit button without a test id in %s', (language, sendLabel) => {
+    document.documentElement.lang = language;
+    document.documentElement.dir = language === 'ar' ? 'rtl' : 'ltr';
+    button.removeAttribute('data-testid');
+    button.type = 'submit';
+    button.setAttribute('aria-label', sendLabel);
+    button.textContent = '';
+    expect(api.sendButton()).toBe(button);
+    const duplicate = button.cloneNode(true) as HTMLButtonElement;
+    button.parentElement!.append(duplicate);
+    expect(api.sendButton()).toBeNull();
+  });
+
   it.each([['ja', '送信', '回答を停止'], ['ar', 'إرسال', 'إيقاف الإجابة']])('uses provider Send and Stop identities in %s', (language, sendLabel, stopLabel) => {
     document.documentElement.lang = language;
     document.documentElement.dir = language === 'ar' ? 'rtl' : 'ltr';

@@ -11,8 +11,8 @@
  *     data-message-author-role, data-interrupted, data-testid)
  *   · `.markdown` for assistant prose when the current renderer supplies no assistant
  *     data-message-id; progress markdown under data-interrupted is excluded
- *   · the id #prompt-textarea on the composer, and the send/stop/dictation buttons beside
- *     it, which is where our own composer control is anchored
+ *   · ChatGPT's composer-specific data-* attributes (with legacy #prompt-textarea support),
+ *     and the send/stop/dictation buttons inside that exact composer form
  *   · one structural tool-message class substring, plus a display-contents row shape that
  *     is confirmed structurally (short header line, no prose) before it is believed
  *
@@ -35,7 +35,7 @@ var CLF_DOM = (() => {
   const STOP =
     'button[data-testid="stop-button"], button[data-testid="composer-stop-button"], ' +
     'button[aria-label="Stop streaming"], button[aria-label="Stop generating"], button[aria-label="Stop answering"]';
-  const SEND = 'button[data-testid="send-button"], form button[aria-label^="Send" i]';
+  const SEND = 'button[data-testid="send-button"], button[type="submit"], form button[aria-label^="Send" i]';
   /** The composer's own trailing controls, where the send and dictation buttons live. */
   const TRAILING =
     '[data-testid="composer-trailing-actions"], [data-testid="composer-footer-actions"], ' +
@@ -1392,7 +1392,18 @@ var CLF_DOM = (() => {
   }
 
   function composer() {
-    return safe(() => document.querySelector('#prompt-textarea'), null);
+    return safe(() => {
+      // Legacy ChatGPT exposed one stable #prompt-textarea id. The current composer no longer
+      // carries that id; its stable semantic surface is the rich-text editor inside
+      // data-composer-body. Keep the legacy path first, then use only the composer-specific
+      // data attributes plus editor semantics — never a generic contenteditable fallback,
+      // which could target a title/settings editor and submit into the wrong surface.
+      const legacy = document.querySelector('#prompt-textarea');
+      if (legacy) return legacy;
+      return document.querySelector(
+        '[data-composer-body] [data-composer-markdown][contenteditable="true"][role="textbox"]'
+      );
+    }, null);
   }
 
   /**
@@ -2093,8 +2104,15 @@ var CLF_DOM = (() => {
   }
   function modelPickerAccess(stillCurrent) {
     const shown = node => node && !node.closest('[hidden],[aria-hidden="true"],[inert]') && node.getClientRects().length > 0;
-    const picker = () => document.querySelector('[data-testid="composer-intelligence-picker-content"]');
     const trigger = modelPickerTrigger;
+    const picker = () => {
+      const legacy = document.querySelector('[data-testid="composer-intelligence-picker-content"]');
+      if (legacy) return legacy;
+      const button = trigger();
+      const id = button?.getAttribute('aria-controls');
+      const controlled = id ? document.getElementById(id) : null;
+      return controlled?.matches('[role="menu"],[role="dialog"]') ? controlled : null;
+    };
     let motion = null;
     const openPicker = () => {
       const panel = picker();
@@ -2127,7 +2145,7 @@ var CLF_DOM = (() => {
         // focus scope indefinitely. Suppress only this owned picker animation for
         // this operation; native state still closes/unmounts it and proves release.
         motion = document.createElement('style');
-        motion.textContent = '[role="menu"]:has(> [data-testid="composer-intelligence-picker-content"]),[role="dialog"]:has([data-testid="composer-intelligence-picker-content"]){animation:none!important}';
+        motion.textContent = '[role="menu"]:has(> [data-testid="composer-intelligence-picker-content"]),[role="dialog"]:has([data-testid="composer-intelligence-picker-content"]),[role="menu"]:has([data-model-picker-view]),[role="dialog"]:has([data-model-picker-view]){animation:none!important}';
         document.head.append(motion);
         // A cold home editor mounts before its native Chat/Work picker. Workers
         // enter here directly, without the New Chat reuse/catalog preparation.
@@ -2160,7 +2178,7 @@ var CLF_DOM = (() => {
         // The picker may already show the version list (including a checked row).
         // Select that row to return to its effort view; never assume the slider is open.
         if (!versionRows().length) {
-          const toggle = [...picker().querySelectorAll('[role="menuitem"][aria-expanded]')].filter(shown);
+          const toggle = [...picker().querySelectorAll('[role="menuitem"][aria-expanded],[role="menuitem"][data-model-picker-view-toggle]')].filter(shown);
           if (toggle.length !== 1) return null;
           toggle[0].click();
         }

@@ -44,7 +44,7 @@ const TIMED_OUT = 'the app took too long to answer';
 /** Bumped only when the request/response shape changes; the app compares it. */
 const BRIDGE_PROTOCOL = 15;
 /** Must match companion-build.txt; packaging/tests enforce this release identity. */
-const COMPANION_BUILD_ID = 'cos-3.1.5-companion-autorefresh-v1';
+const COMPANION_BUILD_ID = 'cos-3.1.15-companion-provider-picker-v1';
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a
@@ -2883,6 +2883,8 @@ const COMPACT_CHECKPOINT_FLAGS = [
   'sourceAttempt',
   'sourceDispatch',
   'sourceLost',
+  'sourceDraftProbe',
+  'sourceDraftCleared',
   'destinationAttempt',
   'destinationDispatch',
   'destinationLost'
@@ -3922,7 +3924,7 @@ chrome.tabs.onUpdated.addListener((id, changeInfo) => {
  * receive both its static manifest injection and this recovery injection.
  */
 const CHATGPT_TAB_URLS = ['https://chatgpt.com/*', 'https://chat.openai.com/*'];
-const PAGE_RECORDER_VERSION = 13;
+const PAGE_RECORDER_VERSION = 14;
 
 let deferredRecoveryWork = null;
 
@@ -4174,7 +4176,9 @@ function recoverDeferredRevivals() {
 async function restoreChatgptTab(id) {
   try {
     const live = await chrome.tabs.sendMessage(id, { type: 'clf-recorder-ping' });
-    if (live && live.ok === true && live.recorderVersion === PAGE_RECORDER_VERSION) {
+    if (live && live.ok === true &&
+        live.recorderVersion === PAGE_RECORDER_VERSION &&
+        live.recorderBuildId === COMPANION_BUILD_ID) {
       // Healthy content.js does not prove the independently running MAIN-world helper is
       // still present. Request-id ownership depends on fiber.js, and re-executing it is
       // idempotent because the helper keeps one listener per protocol version.

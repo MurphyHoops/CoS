@@ -1780,6 +1780,11 @@ async function refresh(): Promise<void> {
   if (next) apply(next);
 }
 
+// State pushes are the fast path, but the renderer must remain usable if Electron ever
+// drops a proxied callback while crossing the contextBridge boundary. A bounded local IPC
+// refresh is cheap, read-only, and also repairs one missed push after suspend/resume.
+window.setInterval(() => void refresh(), 15_000);
+
 buildGroups();
 initSidebarResize();
 initUsage();

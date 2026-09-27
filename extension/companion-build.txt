@@ -1,1 +1,1 @@
-cos-3.1.5-companion-autorefresh-v1
+cos-3.1.15-companion-provider-picker-v1
