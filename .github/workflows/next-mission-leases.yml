@@ -1,0 +1,43 @@
+name: CoS Next WP02 Mission Lease Safety
+
+on:
+  push:
+    branches:
+      - 'next/v4/wp02-**'
+  pull_request:
+    paths:
+      - 'src/main/next/auth/**'
+      - 'test/next/mission-leases*.test.ts'
+      - '.github/workflows/next-mission-leases.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: next-mission-leases-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mission-lease-safety:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Privacy check
+        run: npm run verify:privacy
+      - name: MissionLease trust and persistence negative controls
+        run: |
+          npx vitest run \
+            test/next/mission-leases.test.ts \
+            test/next/mission-leases-durable.test.ts \
+            test/host-identity-diagnostics.test.ts \
+            test/durable-recovery.test.ts \
+            test/mcp-inbound.test.ts
