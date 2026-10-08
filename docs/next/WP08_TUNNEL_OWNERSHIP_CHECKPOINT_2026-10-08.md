@@ -17,12 +17,13 @@ Date: 2026-10-08. Canonical task: [Issue #18](https://github.com/MurphyHoops/CoS
 - Owner verification checks recorded nonce/PID and directory inode before release; release first atomically renames the reserved directory to a nonce-specific retired location. The retired directory is checked again before removing it. Concurrent release callers share one promise and cannot remove the next owner's lock.
 - True child-process tests verify contention, concurrent race, crash retention, stale lock, label independence, different IDs, tamper detection, single-flight release and successor safety. All tests use disposable `os.tmpdir()` directories and a fake Tunnel ID.
 - CI workflow `.github/workflows/next-tunnel-ownership.yml` covers macOS, Windows and Linux runners, TypeScript check, privacy guard and these cross-process tests.
+- New Next-only `exclusive-lifecycle.mjs` admission wrapper coordinates reservation, startup, stop and independently verified child termination. Mock lifecycle tests prove two owners cannot start concurrently and that stop failures or inconclusive child termination **retain the reservation**. This wrapper is not yet called from the product's actual `connection.ts` and `tunnel/index.ts`.
 
 ## Explicit Gate limitations
 
 **WP08 LOCAL LOCK GATE only; full integration and production release remain BLOCKED.**
 
-1. The lock **is not yet called by the live `startOpenAiTunnel()` lifecycle**. Introducing a lock without reliable child stop/health/ownership/rollback barriers would yield false confidence. Integrate after verifying the old `startTunnel().stop()` return value proves the child process is gone; current v3 stop returns void and may leave a surviving tunnel-client evidenced only by lease PID files.
+1. The lock/lifecycle wrapper **is not yet called by the live `startOpenAiTunnel()` lifecycle**. Introducing a lock without reliable child stop/health/ownership/rollback barriers would yield false confidence. Integrate after verifying the old `startTunnel().stop()` return value proves the child process is gone; current v3 stop returns void and may leave a surviving tunnel-client evidenced only by lease PID files.
 2. The legacy CoS 3.1.16 binary does not acquire this new lock. **A Next-only lock cannot stop legacy↔Next races**. Until dual-version ownership is established, require explicit old-App shutdown check and a single-owner maintenance handoff; do not claim the full Tunnel-competition problem is solved.
 3. Atomic directory locks prevent cooperating local processes from simultaneous claims. They **do not defend against an arbitrary malicious same-user process deleting or moving lock directories**, which requires a stronger OS trust boundary.
 4. A crash between mkdir and metadata write conservatively leaves an orphan directory. An administrative recovery protocol with real PID/health/endpoint proof is required; never auto-delete ambiguous locks.
@@ -34,5 +35,5 @@ Date: 2026-10-08. Canonical task: [Issue #18](https://github.com/MurphyHoops/CoS
 
 1. Verify exact-head GitHub Actions across all supported OS, including new test jobs.
 2. READ-ONLY security audit the race in release, loss of orphan evidence, path/permission semantics and multi-process failure injection.
-3. Add a Next-only tunnel lifecycle adapter that obtains the reservation *before* spawning the child and retains it until child termination is independently proven; test simulated process crashes and bad handoffs. Never modify the installed app in WP08.
+3. Wire the implemented Next-only lifecycle adapter to a real **Next-owned** connection manager only after it can independently verify child termination (current legacy `.stop()` does not provide this proof). Add integration tests for true PID and health evidence, startup cancellation and recovery; do not modify the installed app.
 4. Only after independent credential provisioning/old App shutdown/real host approval, test the actual existing Core connector one-owner handoff. Record a controlled rollback and two real ChatGPT conversation fingerprints.

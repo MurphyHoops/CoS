@@ -38,4 +38,4 @@ jobs:
       - name: Privacy guard
         run: npm run verify:privacy
       - name: Cross-process tunnel locks and crash behavior
-        run: npx vitest run test/next/tunnel-exclusive-owner.test.ts
+        run: npx vitest run test/next/tunnel-exclusive-owner.test.ts test/next/tunnel-exclusive-lifecycle.test.ts
