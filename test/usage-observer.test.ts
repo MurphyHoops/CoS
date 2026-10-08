@@ -110,6 +110,22 @@ function harness() {
 }
 
 describe('MAIN-world usage projection', () => {
+  it('accepts an opaque UUID request id only with the exact same-event conversation proof', async () => {
+    const h = harness();
+    const conversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const requestId = 'f207d99c-6c29-4da8-8dc0-ea8b9ab4c3f8';
+    await h.feedSse([`data: ${JSON.stringify({ conversation_id: conversationId, message: { metadata: { request_id: requestId } } })}\n\n`]);
+    expect(h.posts).toEqual([
+      { type: 'cos-request-origin', conversationId, requestIds: [requestId], observedAt: expect.any(Number) }
+    ]);
+    const socket = h.socket();
+    const secondId = '0c13f812-1d49-48c2-a85f-bc14dca67821';
+    socket.receive([{ type: 'message', payload: { type: 'conversation-turn-stream', payload: {
+      type: 'stream-item', conversation_id: conversationId,
+      encoded_item: `data: ${JSON.stringify({ conversation_id: conversationId, metadata: { request_id: secondId } })}\n\n`
+    } } }]);
+    expect(h.posts[1]).toMatchObject({ conversationId, requestIds: [secondId] });
+  });
   it('observes the Pro socket handoff with exact inner/outer conversation proof and shares HTTP deduplication', async () => {
     const h = harness(), socket = h.socket();
     expect(socket).toBeInstanceOf(h.nativeSocket);

@@ -692,6 +692,8 @@ export interface BackgroundExecState {
 export class UnifiedExecProcessManager {
   private readonly processes = new Map<number, ProcessEntry>();
   private readonly reservedProcessIds = new Set<number>();
+  /** Launches between admission and insertion into `processes` also consume live capacity. */
+  private readonly launchingProcessIds = new Set<number>();
   private readonly maxWriteStdinYieldTimeMs: number;
 
   constructor(maxWriteStdinYieldTimeMs: number) {
@@ -710,6 +712,7 @@ export class UnifiedExecProcessManager {
 
   releaseProcessId(processId: number): void {
     this.reservedProcessIds.delete(processId);
+    this.launchingProcessIds.delete(processId);
     this.processes.delete(processId);
   }
 
@@ -734,6 +737,7 @@ export class UnifiedExecProcessManager {
         env: request.env,
         tty: request.tty
       });
+      this.launchingProcessIds.delete(request.processId);
     } catch (error) {
       this.releaseProcessId(request.processId);
       throw error instanceof UnifiedExecError
@@ -1035,6 +1039,7 @@ export class UnifiedExecProcessManager {
     const entries = [...this.processes.values()];
     this.processes.clear();
     this.reservedProcessIds.clear();
+    this.launchingProcessIds.clear();
     // App shutdown is the caller that matters, so this has to behave like `terminateProcess`
     // does for one id: skip the sessions that are already gone rather than spending a taskkill
     // on each. Awaiting them one after another also made a quit cost the *sum* of every
@@ -1055,18 +1060,24 @@ export class UnifiedExecProcessManager {
     return { kind: 'alive', exitCode, processId: entry.processId };
   }
 
-  /** Capacity is admission, never garbage collection: every retained row still owes output. */
+  /**
+   * Limit live OS children and in-progress launches, not completed output obligations.
+   * An exited process can still owe a result and must stay addressable by write_stdin,
+   * but it no longer owns a PTY, pipe, child PID, or one of the 64 execution slots.
+   */
   private ensureProcessCapacity(requestProcessId: number): void {
-    // Reservations participate in the hard cap, so concurrent exec_command calls cannot
-    // each observe one free slot and collectively insert a 65th live process.
-    if (this.reservedProcessIds.size > MAX_UNIFIED_EXEC_PROCESSES) {
-      throw UnifiedExecError.createProcess(
-        `too many retained terminal sessions (limit ${MAX_UNIFIED_EXEC_PROCESSES}); drain a returned session with write_stdin before starting another`
-      );
-    }
     if (!this.reservedProcessIds.has(requestProcessId)) {
       throw UnifiedExecError.createProcess('terminal session reservation was lost before launch');
     }
+    const running = [...this.processes.values()].filter((entry) => !entry.process.hasExited()).length;
+    // `execCommand` synchronously occupies a launching slot before awaiting spawn, so
+    // concurrent requests cannot pass admission against the same last free slot.
+    if (running + this.launchingProcessIds.size >= MAX_UNIFIED_EXEC_PROCESSES) {
+      throw UnifiedExecError.createProcess(
+        `too many active terminal sessions (limit ${MAX_UNIFIED_EXEC_PROCESSES}); terminate or drain a running session before starting another`
+      );
+    }
+    this.launchingProcessIds.add(requestProcessId);
   }
 }
 

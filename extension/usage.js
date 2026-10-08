@@ -15,7 +15,9 @@
   let latest = null;
   let requestOrder = 0, latestOrder = 0;
   const CONVERSATION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  const REQUEST = /^wfr_[a-zA-Z0-9_-]{1,96}$/;
+  // The HTTP x-request-id may now use the provider's UUID form. Both shapes
+  // are opaque exact-match keys; neither by itself grants a conversation owner.
+  const REQUEST = /^(?:wfr_[a-zA-Z0-9_-]{1,96}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
   const CONVERSATION_FIELD = /(?:^|[,{\s])\"conversation_id\"\s*:\s*\"([0-9a-f-]{36})\"/gi;
   // Passive evidence only: no polling, and no full response survives a scan. Retain a
   // small replay window for document_start -> content-script readiness and deduplicate
@@ -163,7 +165,8 @@
   function inspectSocketMessage(event) {
     // Pro hands its HTTP stream to the native conversation-turn-stream socket.
     // Observe only complete server envelopes; never subscribe, send or join deltas.
-    if (typeof event.data !== 'string' || event.data.length > 2 * 1024 * 1024 || !event.data.includes('wfr_')) return;
+    if (typeof event.data !== 'string' || event.data.length > 2 * 1024 * 1024 ||
+        (!event.data.includes('wfr_') && !event.data.includes('request_id'))) return;
     let rows;
     try { rows = JSON.parse(event.data); } catch { return; }
     if (!Array.isArray(rows) || rows.length > 32) return;

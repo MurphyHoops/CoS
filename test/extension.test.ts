@@ -1934,7 +1934,7 @@ describe('extension command delivery', () => {
     worker.tabsSendMessage.mockResolvedValueOnce({
       ok: true,
       recorderVersion: 14,
-      recorderBuildId: 'cos-3.1.15-companion-provider-picker-v1'
+      recorderBuildId: 'cos-3.1.16-pty-capacity-uuid-origin-v1'
     });
 
     await worker.installed('update');
@@ -2093,7 +2093,7 @@ describe('extension revival delivery', () => {
       ? {
           ok: true,
           recorderVersion: 14,
-          recorderBuildId: 'cos-3.1.15-companion-provider-picker-v1'
+          recorderBuildId: 'cos-3.1.16-pty-capacity-uuid-origin-v1'
         }
       : { ok: true, claimed: true };
 
