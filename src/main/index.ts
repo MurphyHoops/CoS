@@ -81,6 +81,7 @@ let shutdownComplete = false;
 const usageWarmup = new AbortController();
 
 // One instance only: two copies would fight over the tunnel and the config file.
+const isNextClassic = process.env.COS_NEXT_CLASSIC_WORKFLOW === '1';
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
   // `app.quit()` does not make the rest of this module stop executing. Mark this process as a
@@ -106,10 +107,12 @@ function createWindow(): void {
     } : {}),
     // Painted before the renderer loads, so a dark window never flashes white.
     backgroundColor: getConfig().ui.theme === 'dark' ? '#0e0e11' : '#ffffff',
-    title: 'Chat On Steroids',
+    title: isNextClassic ? 'Chat On Steroids Next' : 'Chat On Steroids',
     webPreferences: {
       zoomFactor: UI_BASE_ZOOM,
-      preload: path.join(__dirname, '../preload/index.js'),
+      preload: isNextClassic
+        ? path.join(app.getAppPath(), 'out-next/preload/index.js')
+        : path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -187,7 +190,9 @@ function createWindow(): void {
   if (process.env.ELECTRON_RENDERER_URL) {
     void window.loadURL(process.env.ELECTRON_RENDERER_URL);
   } else {
-    void window.loadFile(path.join(__dirname, '../renderer/index.html'));
+    void window.loadFile(isNextClassic
+      ? path.join(app.getAppPath(), 'out-next/renderer/index.html')
+      : path.join(__dirname, '../renderer/index.html'));
   }
 }
 
@@ -457,14 +462,19 @@ void app.whenReady().then(async () => {
   if (browserExtensionRequired(getConfig())) {
     void startBridge();
   }
-  if (getConfig().ui.autoConnect) void connect();
+  // Preserve the user's saved connection preference without silently
+  // acquiring the *old* registered Tunnel ID on a new preview's first launch.
+  // A user-initiated Connect from the familiar old Setup screen is supported.
+  if (getConfig().ui.autoConnect && !isNextClassic) void connect();
   startLongRunRuntime();
 
   // Never awaited: an unreachable GitHub, a slow download or a broken release must not delay a
   // window that is already on screen. Everything it learns arrives through the ordinary state
   // push, every failure ends inside it, and its own timer keeps it running for a tray app that
   // is never restarted.
-  startUpdateChecks();
+  // Next must never download/stage a legacy v3 installer over its independent
+  // app identity. Manual Next builds have a separate promotion process.
+  if (!isNextClassic) startUpdateChecks();
   // Warm the existing derived cache once, after startup, without delaying the UI.
   // A visit to Usage joins this same calculation; unchanged recordings cost no reads.
   void usageOverview(usageWarmup.signal).catch((error: Error) => {
@@ -523,7 +533,8 @@ app.on('will-quit', (event) => {
       // staged update is handed to the platform's installer here, so the next start of the app
       // is the new version. Nothing is staged unless it downloaded whole and matched the
       // release's published SHA-256, and applying it cannot fail loudly - see update.ts.
-      { name: 'update handoff', budgetMs: 5_000, run: () => [applyStagedUpdate()] }
+      { name: 'update handoff', budgetMs: 5_000,
+        run: () => isNextClassic ? [] : [applyStagedUpdate()] }
     ],
     {
       info: logInfo,

@@ -4,7 +4,7 @@ appId: com.chatonsteroids.next
 productName: Chat On Steroids Next
 copyright: MIT licensed
 extraMetadata:
-  main: out-next/main/electron-main.js
+  main: out-next/main/classic-main.js
   version: 4.0.0-alpha.0
 
 directories:
@@ -16,12 +16,27 @@ files:
   - package.json
   - '!extension/**'
   - '!out/**'
+  - '!node_modules/node-pty/build/**/*'
+  - '!node_modules/node-pty/third_party/**/*'
+  - '!node_modules/node-pty/prebuilds/**/*'
+  - '!node_modules/tree-sitter/prebuilds/**/*'
+  - '!node_modules/tree-sitter-bash/prebuilds/**/*'
+
+asarUnpack:
+  - '**/node_modules/node-pty/**'
+  - '**/node_modules/sharp/**'
+  - '**/node_modules/@img/**'
+  - '**/node_modules/tree-sitter/**'
+  - '**/node_modules/tree-sitter-bash/**'
 
 extraResources:
   - from: LICENSE
     to: LICENSE
   - from: THIRD-PARTY-NOTICES.txt
     to: THIRD-PARTY-NOTICES.txt
+  - from: extension
+    to: extension
+    filter: ['**/*', '!**/*.map']
 
 npmRebuild: false
 compression: maximum
@@ -42,6 +57,27 @@ nsis:
 
 mac:
   target: [dmg, zip]
+  # The complete v3 chat/Goal/Agent runtime requires native ARM64 bindings.
+  # Shipping a renderer without these caused a no-window Next startup.
+  files:
+    # Copy native ARM64 modules from declared npm dependencies into the
+    # same locations the original runtime resolves at startup.
+    - from: node_modules/node-pty/prebuilds/darwin-${arch}
+      to: node_modules/node-pty/prebuilds/darwin-${arch}
+      filter: ['**/*']
+    - from: node_modules/tree-sitter/prebuilds/darwin-${arch}
+      to: node_modules/tree-sitter/prebuilds/darwin-${arch}
+      filter: ['**/*']
+    - from: node_modules/tree-sitter-bash/prebuilds/darwin-${arch}
+      to: node_modules/tree-sitter-bash/prebuilds/darwin-${arch}
+      filter: ['**/*']
+  extraResources:
+    - from: resources/packaging/tunnel/darwin/${arch}
+      to: tunnel
+      filter: ['**/*']
+    - from: resources/packaging/rg/darwin/${arch}
+      to: rg
+      filter: ['**/*']
   category: public.app-category.developer-tools
   icon: build/icon.png
   identity: null
