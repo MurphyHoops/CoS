@@ -1,4 +1,5 @@
 import { toolDeclaration } from './tool-declarations.js';
+import { currentHostIdentityDiagnostics } from './host-identity.js';
 import { registerPlanTool } from './plan-tool.js';
 import { registerLongRunWaitTool } from './long-run-tool.js';
 import { registerProjectRuntimeTool } from './project-runtime-tool.js';
@@ -263,6 +264,26 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
       ? `Paths inside the live approved roots: ${virtualRoots.join(', ')}. A root is an approved folder, usually a parent of the project rather than the project itself, so name every folder between the root and the file — the same path exec_command takes as workdir. Reading a root lists it one level deep. ` +
         'Absolute native paths copied from command output are also accepted when they resolve inside one of these roots; globs work in either spelling.'
       : 'Paths require an approved virtual root in the form /<root>/...; no root is currently approved. Globs are supported after a root is approved.';
+
+  // Host-provided MCP metadata is useful for diagnosing unattributed calls, but is
+  // NOT mission ownership evidence. This read-only tool cannot bind sessions or
+  // grant access, and returns only per-process, salted, short fingerprints.
+  // Diagnostics are opt-in only. Host metadata must not appear in normal tool discovery,
+  // and neither MCP arguments nor the model can enable this local process setting.
+  if (process.env.COS_NEXT_IDENTITY_DIAGNOSTICS === '1') {
+    reg.register('identity_diagnostics', toolDeclaration('identity_diagnostics', () => ({
+      title: 'Check host session correlation metadata',
+      description:
+        'Read-only diagnostic of whether ChatGPT supplied anonymous MCP session and subject metadata on THIS request. ' +
+        'Returns short process-scoped fingerprints for comparing calls across chats. It does not retrieve ChatGPT chat IDs, ' +
+        'authorize a mission, start agents, read private user data or repair an unattributed session.',
+      inputSchema: z.object({}).strict(),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+    })), async () => {
+      const result = currentHostIdentityDiagnostics();
+      return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: { ...result } };
+    });
+  }
 
   // ------------------------------------------------------------------- read
 

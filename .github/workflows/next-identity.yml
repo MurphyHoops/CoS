@@ -1,0 +1,59 @@
+name: CoS Next WP01 Identity
+
+on:
+  push:
+    branches:
+      - 'next/v4/**'
+  pull_request:
+    paths:
+      - 'src/main/mcp/**'
+      - 'test/next/**'
+      - 'test/host-identity-diagnostics.test.ts'
+      - '.github/workflows/next-identity.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: next-identity-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  next-identity:
+    name: Next MCP identity and Core regression
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Install legacy regression binary
+        run: command -v rg >/dev/null 2>&1 || brew install ripgrep
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Check public history and privacy
+        run: npm run verify:privacy
+      - name: Host identity security and Core compatibility
+        run: |
+          npx vitest run \
+            test/host-identity-diagnostics.test.ts \
+            test/next/host-session-metadata.test.ts \
+            test/next/identity-probe.test.ts \
+            test/mcp.test.ts \
+            test/mcp-tool-declarations.test.ts \
+            test/kernel-desktop-identity.test.ts \
+            test/attribution-repair.test.ts \
+            test/kernel-identity-recovery.test.ts \
+            test/mcp-inbound.test.ts \
+            test/agents.test.ts \
+            test/agents-recovery.test.ts \
+            test/long-run.test.ts \
+            test/long-run-runtime.test.ts \
+            test/project-runtime.test.ts \
+            test/correlation.test.ts \
+            test/call-context.test.ts \
+            test/recorder-final-identity.test.ts
