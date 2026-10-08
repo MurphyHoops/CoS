@@ -17,6 +17,7 @@ Status: **LOCAL-GREEN / LIVE-G1b-HOLD / G2b-NOT-STARTED**
 
 - Local macOS Node v26 TypeScript check: `npm run typecheck` **PASS** (2026-10-08).
 - Focused cross-module 15-file suite: **490 passed, 9 skipped, 0 failed**. This validates existing Core/MCP/agent/long-run compatibility under synthetic requests.
+- Added a legacy 2025-era Streamable HTTP Core request regression alongside the 2026-07-28 request test: metadata arrives on both without promotion to Mission authorization. Latest 4-file MCP-focused run: **193 passed, 9 skipped, 0 failed**; TypeScript check passed. This remains a synthetic-host verification, not real ChatGPT G1b.
 - Earlier first-run failures came from unconditional diagnostic tool discovery and a missing `destructiveHint`. Both were fixed before the passing rerun.
 - **G1b is not passed:** official metadata transmission in two *real* ChatGPT web conversations has not been validated on the existing connector.
 - **G2b is not passed:** an MCP `_meta` string is caller-provided correlation data, not verified account identity or authorization. No new Mission lease is issued.

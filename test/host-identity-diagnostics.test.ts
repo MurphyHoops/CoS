@@ -156,6 +156,29 @@ describe('WP01 actual Core MCP tool dispatch', () => {
     } finally { await ep.close(); }
   });
 
+  it('preserves host correlation metadata on the legacy 2025 ChatGPT MCP wire format', async () => {
+    const ep = newCoreHandler();
+    try {
+      // Current ChatGPT connectors may still use 2025-era streamable HTTP:
+      // no 2026 MCP envelope and no mirrored MCP method/name headers.
+      const response = await ep.fetch(new Request('http://localhost/mcp', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: {
+          name: 'identity_diagnostics', arguments: {},
+          _meta: { 'openai/session': 'LEGACY_CHAT_A', 'openai/subject': 'LEGACY_USER' }
+        } })
+      }));
+      const raw = await response.text();
+      const parsed = JSON.parse(raw.startsWith('{') ? raw : [...raw.matchAll(/^data: (.+)$/gm)].at(-1)?.[1] ?? '{}');
+      expect(response.status).toBe(200);
+      const result = parsed.result?.structuredContent as Evidence;
+      expect(result).toMatchObject({ session_present: true, subject_present: true,
+        authority: 'correlation_only', mission_authorized: false });
+      expect(JSON.stringify(result)).not.toContain('LEGACY_CHAT_A');
+    } finally { await ep.close(); }
+  });
+
   it('produces stable fingerprints for the same session and distinct fingerprints for different chats', async () => {
     const ep = newCoreHandler();
     try {
