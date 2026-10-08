@@ -1,0 +1,24 @@
+appId: com.chatonsteroids.next.webfirst.preview
+productName: CoS Next Web-First Preview
+extraMetadata:
+  main: out-webfirst/main/web-first-main.js
+  version: 4.0.0-alpha.0
+directories:
+  output: release-next/webfirst-p1
+  buildResources: build
+files:
+  - out-webfirst/**
+  - package.json
+  - '!node_modules/**'
+  - '!extension/**'
+  - '!out/**'
+  - '!out-next/**'
+npmRebuild: false
+asar: true
+compression: normal
+mac:
+  target: [dir]
+  identity: null
+  notarize: false
+  minimumSystemVersion: '13.0'
+  category: public.app-category.developer-tools
