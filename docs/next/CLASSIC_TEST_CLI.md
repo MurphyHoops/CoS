@@ -48,3 +48,33 @@ Replace `<exact-session>` with the returned value of `home` from `start`. The CL
 - `npm run verify:ci`: exit 0; **5,036 ordinary tests passed + 2 standalone MCP shutdown tests passed**, 130 skipped, 0 failures, after extending native-window VM lifecycle tests to distinguish hidden synthetic CLI mode from opt-in visible GUI QA.
 - Independently tested `start`, `status`, `ui-status`, `theme`, `send`, `restart`, `outbox`, `stop` as separate shell commands; the message remained exactly `queued` with the same UUID after restart and the session's old-profile sentinel remained unchanged.
 - Current user Next `classic-validated` process was not restarted or replaced. Read-only live check found the saved tunnel IDs exist but the currently connected ChatGPT Core/Desktop tools still report offline (no Tunnel client seen for 300 seconds); that is not a model-delivery PASS.
+
+## Real Next live diagnostics & receipt audit (2026-10-09)
+
+This extension is **read-only** against the real running app. It never opens the synthetic
+control socket, reads credentials, changes settings, or sends a user message:
+
+```sh
+node scripts/next-classic-cli.mjs live-doctor
+node scripts/next-classic-cli.mjs live-marker
+node scripts/next-classic-cli.mjs live-receipt <exact-test-UUID>
+```
+
+`live-doctor` uses real app process inventory, real Next config presence (tunnel identifiers
+are counted **not displayed**), authenticated localhost `/health` probe (401 expected),
+existing model catalogue, Chrome ChatGPT tab count and app-start-relative tunnel log evidence.
+It never equates a cached model list or a running process with account authorization.
+`live-marker` generates a harmless unique new-chat prompt to be submitted using the actual
+Next UI **only after** successful live connection. `live-receipt` reads only its exact
+UUID-labeled row from the Next durable outbox and the associated session's event journal,
+then reports separate browser receipt / user record / assistant response / ACK / turn-finish
+booleans. It does not output conversation messages, IDs of unrelated sessions or secrets.
+A provider reply cannot be claimed unless a fresh assistant event actually exists.
+
+**Actual current state:** live Next running (PID checked in local session); three saved
+connector IDs, Chrome open with ChatGPT tabs, protected bridge 401. No live tunnel-client,
+and Core/Desktop connector read calls were unavailable. Attempted OS UI Connect automation
+was explicitly denied by macOS Accessibility (-25211); do not bypass. The sole interactive
+blocker is opening Next's already-visible window and clicking its **Connect** control once,
+or enabling system-approved Accessibility automation for the controlling application.
+No real account test was sent in this round. The real-delivery acceptance stays HOLD.

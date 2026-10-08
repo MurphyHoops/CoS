@@ -17,7 +17,7 @@ import { createConnection } from 'node:net';
 import { mkdtemp, mkdir, readFile, writeFile, chmod, rm, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const prefix = 'cos-next-ctl-';
@@ -206,10 +206,14 @@ async function verify(app){
     if(!finished){try{await shutdown(info);}catch{/* retain unsafe session for manual inspection */}}
   }
 }
+const {inspectLiveNext,inspectLiveFixture}=await import('./next-classic-live-doctor.mjs');
 const [operation,arg,value]=process.argv.slice(2);
 try{
   let result;
-  if(operation==='start')result=await begin(arg);
+  if(operation==='live-marker'){const id=randomUUID();result={id,message:'CoS Next live verification: '+id+'\nPlease reply exactly: ACK '+id};}
+  else if(operation==='live-doctor')result=await inspectLiveNext();
+  else if(operation==='live-receipt')result=await inspectLiveFixture(arg);
+  else if(operation==='start')result=await begin(arg);
   else if(operation==='verify')result=await verify(arg);
   else{
     const info=await load(arg);
