@@ -75,7 +75,7 @@ export class DurableMissionLeaseStorage implements LeaseStorage {
 /** Authentication/approval are separate, non-model-controlled app boundaries. */
 export interface MissionLeaseAuthority {
   authenticate(inbound: unknown): Promise<VerifiedPrincipal | null>;
-  confirmApproval(inboundApproval: unknown, operation: 'grant' | 'revoke'): Promise<boolean>;
+  confirmApproval(inboundApproval: unknown, operation: 'grant' | 'revoke', missionId: string): Promise<boolean>;
 }
 
 const CAPABILITIES = new Set<MissionCapability>(['read', 'write', 'command', 'agents', 'wait', 'stop_self']);
@@ -185,6 +185,9 @@ export class MissionLeaseRegistry {
     private readonly now: () => number = Date.now
   ) {}
 
+  /** Public health only; never leaks caller identity, leases or raw metadata. */
+  get posture(): 'new' | 'ready' | 'restart_locked' | 'blocked' { return this.state; }
+
   /** Restored authorizations never silently resume across process restart. */
   async restore(): Promise<void> {
     if (this.state !== 'new') throw new Error('Lease registry already initialized');
@@ -216,7 +219,7 @@ export class MissionLeaseRegistry {
           !validName(request.projectId) || !validCapabilities(request.capabilities) ||
           !Number.isSafeInteger(request.ttlMs) || request.ttlMs < 1_000 ||
           request.ttlMs > MAX_TTL_MS) throw new Error('INVALID_GRANT');
-      if (!(await this.authority.confirmApproval(localApproval, 'grant'))) throw new Error('APPROVAL_REQUIRED');
+      if (!(await this.authority.confirmApproval(localApproval, 'grant', request.missionId))) throw new Error('APPROVAL_REQUIRED');
       const payloadHash = createHash('sha256').update(JSON.stringify({
         principalId: request.principalId, namespace: request.namespace,
         hostBindingKey: request.hostBindingKey, missionId: request.missionId,
@@ -277,7 +280,7 @@ export class MissionLeaseRegistry {
     if (!validName(missionId) || !validName(approvalId)) return Promise.reject(new Error('INVALID_MISSION'));
     return this.serialized(async () => {
       if (this.state !== 'ready') throw new Error('STORE_UNAVAILABLE');
-      if (!(await this.authority.confirmApproval(localApproval, 'revoke'))) throw new Error('APPROVAL_REQUIRED');
+      if (!(await this.authority.confirmApproval(localApproval, 'revoke', missionId))) throw new Error('APPROVAL_REQUIRED');
       const existing = Object.hasOwn(this.snapshot.revokeRequests, approvalId)
         ? this.snapshot.revokeRequests[approvalId] : undefined;
       if (existing) {

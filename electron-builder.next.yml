@@ -1,0 +1,57 @@
+# Local-only CoS Next preview packaging. Does not inherit the legacy
+# extension, bridge or old app metadata. Not a signed production release.
+appId: com.chatonsteroids.next
+productName: Chat On Steroids Next
+copyright: MIT licensed
+extraMetadata:
+  main: out-next/main/electron-main.js
+  version: 4.0.0-alpha.0
+
+directories:
+  output: release-next
+  buildResources: build
+
+files:
+  - out-next/**
+  - package.json
+  - '!extension/**'
+  - '!out/**'
+
+extraResources:
+  - from: LICENSE
+    to: LICENSE
+  - from: THIRD-PARTY-NOTICES.txt
+    to: THIRD-PARTY-NOTICES.txt
+
+npmRebuild: false
+compression: maximum
+afterPack: scripts/afterpack-macos-adhoc-seal.mjs
+
+win:
+  target: nsis
+  icon: build/icon.ico
+  requestedExecutionLevel: asInvoker
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  shortcutName: Chat On Steroids Next
+  uninstallDisplayName: Chat On Steroids Next
+  deleteAppDataOnUninstall: false
+  artifactName: CoS-Next-Windows-${arch}.${ext}
+
+mac:
+  target: [dmg, zip]
+  category: public.app-category.developer-tools
+  icon: build/icon.png
+  identity: null
+  notarize: false
+  minimumSystemVersion: '13.0'
+  artifactName: CoS-Next-macOS-${arch}.${ext}
+
+linux:
+  target: [AppImage, deb]
+  category: Development
+  executableName: chat-on-steroids-next
+  artifactName: CoS-Next-Linux-${arch}.${ext}
+  maintainer: Chat On Steroids Next <86187309+MurphyHoops@users.noreply.github.com>
