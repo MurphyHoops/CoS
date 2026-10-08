@@ -7,7 +7,7 @@
  * Denied decisions never execute effects; stop/epoch fences must also be checked
  * by the future executor before each dispatch.
  */
-import { createHmac, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { durableStoreReady, readDurableResult, writeDurableNow } from '../../durable.js';
 
 export type MissionCapability = 'read' | 'write' | 'command' | 'agents' | 'wait' | 'stop_self';
@@ -35,6 +35,9 @@ export type LeaseSnapshot = {
   version: 1;
   missionEpochs: Record<string, number>;
   leases: MissionLease[];
+  /** Durable idempotency receipts for verified, single-use operator approvals. */
+  grantRequests: Record<string, { payloadHash: string; leaseId: string }>;
+  revokeRequests: Record<string, { missionId: string; epoch: number }>;
 };
 export type RestoreResult = { kind: 'missing' } | { kind: 'valid'; value: unknown } |
   { kind: 'corrupt' | 'io_error' };
@@ -81,7 +84,8 @@ const SHA_256 = /^[0-9a-f]{64}$/;
 const MAX_TTL_MS = 24 * 60 * 60 * 1000;
 
 function validName(value: unknown): value is string {
-  return typeof value === 'string' && SAFE_NAME.test(value);
+  return typeof value === 'string' && SAFE_NAME.test(value) && value !== 'prototype' &&
+    !Object.prototype.hasOwnProperty.call(Object.prototype, value);
 }
 function validBinding(value: unknown): value is string {
   return typeof value === 'string' && SHA_256.test(value);
@@ -109,7 +113,18 @@ function validSnapshot(raw: unknown): raw is LeaseSnapshot {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
   const s = raw as Partial<LeaseSnapshot>;
   if (s.version !== 1 || !s.missionEpochs || typeof s.missionEpochs !== 'object' ||
-      Array.isArray(s.missionEpochs) || !Array.isArray(s.leases)) return false;
+      Array.isArray(s.missionEpochs) || !Array.isArray(s.leases) ||
+      !s.grantRequests || typeof s.grantRequests !== 'object' || Array.isArray(s.grantRequests)) return false;
+  if (!s.revokeRequests || typeof s.revokeRequests !== 'object' || Array.isArray(s.revokeRequests)) return false;
+  if (Object.keys(s.grantRequests).length > 10_000 || Object.keys(s.revokeRequests).length > 10_000) return false;
+  for (const [id, receipt] of Object.entries(s.revokeRequests)) {
+    if (!validName(id) || !receipt || typeof receipt !== 'object' ||
+        !validName(receipt.missionId) || !Number.isSafeInteger(receipt.epoch) || receipt.epoch <= 0) return false;
+  }
+  for (const [id, receipt] of Object.entries(s.grantRequests)) {
+    if (!validName(id) || !receipt || typeof receipt !== 'object' ||
+        !SHA_256.test(receipt.payloadHash) || !validName(receipt.leaseId)) return false;
+  }
   for (const [id, epoch] of Object.entries(s.missionEpochs)) {
     if (!validName(id) || !Number.isSafeInteger(epoch) || epoch <= 0) return false;
   }
@@ -146,6 +161,8 @@ export function hostBindingKey(
 }
 
 export type GrantRequest = {
+  /** Locally approved one-shot operation ID. Never a model argument. */
+  approvalId: string;
   principalId: string;
   namespace: string;
   hostBindingKey: string;
@@ -156,7 +173,7 @@ export type GrantRequest = {
 };
 
 export class MissionLeaseRegistry {
-  private snapshot: LeaseSnapshot = { version: 1, missionEpochs: {}, leases: [] };
+  private snapshot: LeaseSnapshot = { version: 1, missionEpochs: {}, leases: [], grantRequests: {}, revokeRequests: {} };
   private state: 'new' | 'ready' | 'restart_locked' | 'blocked' = 'new';
   private pending: Promise<unknown> = Promise.resolve();
   // Never revive a persisted lease implicitly after restart/failed store commit.
@@ -194,12 +211,31 @@ export class MissionLeaseRegistry {
   grant(request: GrantRequest, localApproval: unknown): Promise<MissionLease> {
     return this.serialized(async () => {
       if (this.state === 'new' || this.state === 'blocked') throw new Error('STORE_UNAVAILABLE');
-      if (!validName(request.principalId) || !validName(request.namespace) ||
+      if (!validName(request.approvalId) || !validName(request.principalId) || !validName(request.namespace) ||
           !validBinding(request.hostBindingKey) || !validName(request.missionId) ||
           !validName(request.projectId) || !validCapabilities(request.capabilities) ||
           !Number.isSafeInteger(request.ttlMs) || request.ttlMs < 1_000 ||
           request.ttlMs > MAX_TTL_MS) throw new Error('INVALID_GRANT');
       if (!(await this.authority.confirmApproval(localApproval, 'grant'))) throw new Error('APPROVAL_REQUIRED');
+      const payloadHash = createHash('sha256').update(JSON.stringify({
+        principalId: request.principalId, namespace: request.namespace,
+        hostBindingKey: request.hostBindingKey, missionId: request.missionId,
+        projectId: request.projectId, capabilities: [...request.capabilities].sort(),
+        ttlMs: request.ttlMs
+      })).digest('hex');
+      const existing = Object.hasOwn(this.snapshot.grantRequests, request.approvalId)
+        ? this.snapshot.grantRequests[request.approvalId] : undefined;
+      if (existing) {
+        if (existing.payloadHash !== payloadHash) throw new Error('APPROVAL_REPLAY_CONFLICT');
+        const prior = this.snapshot.leases.find(x => x.leaseId === existing.leaseId);
+        if (!prior || this.state !== 'ready' || !this.activeThisProcess.has(prior.leaseId) ||
+            prior.revokedAt !== null || this.now() >= prior.expiresAt ||
+            this.snapshot.missionEpochs[prior.missionId] !== prior.epoch) {
+          throw new Error('APPROVAL_ALREADY_CONSUMED');
+        }
+        return prior; // Exact duplicate never increments epoch or writes again.
+      }
+      if (Object.keys(this.snapshot.grantRequests).length >= 10_000) throw new Error('APPROVAL_LOG_FULL');
       const currentEpoch = this.snapshot.missionEpochs[request.missionId] ?? 0;
       const epoch = currentEpoch + 1;
       if (!Number.isSafeInteger(epoch)) throw new Error('EPOCH_EXHAUSTED');
@@ -218,7 +254,10 @@ export class MissionLeaseRegistry {
       const candidate: LeaseSnapshot = {
         version: 1,
         missionEpochs: { ...this.snapshot.missionEpochs, [request.missionId]: epoch },
-        leases: [...this.snapshot.leases.filter(x => x.missionId !== request.missionId), issued]
+        leases: [...this.snapshot.leases.filter(x => x.missionId !== request.missionId), issued],
+        grantRequests: { ...this.snapshot.grantRequests,
+          [request.approvalId]: { payloadHash, leaseId: issued.leaseId } },
+        revokeRequests: { ...this.snapshot.revokeRequests }
       };
       // This is a commit barrier; never acknowledge an uncommitted grant.
       try { await this.storage.commit(candidate); }
@@ -234,11 +273,18 @@ export class MissionLeaseRegistry {
   }
 
   /** Immediately fence in-memory authorization while the revocation commits. */
-  revoke(missionId: string, localApproval: unknown): Promise<boolean> {
-    if (!validName(missionId)) return Promise.reject(new Error('INVALID_MISSION'));
+  revoke(missionId: string, localApproval: unknown, approvalId: string): Promise<boolean> {
+    if (!validName(missionId) || !validName(approvalId)) return Promise.reject(new Error('INVALID_MISSION'));
     return this.serialized(async () => {
       if (this.state !== 'ready') throw new Error('STORE_UNAVAILABLE');
       if (!(await this.authority.confirmApproval(localApproval, 'revoke'))) throw new Error('APPROVAL_REQUIRED');
+      const existing = Object.hasOwn(this.snapshot.revokeRequests, approvalId)
+        ? this.snapshot.revokeRequests[approvalId] : undefined;
+      if (existing) {
+        if (existing.missionId !== missionId) throw new Error('APPROVAL_REPLAY_CONFLICT');
+        return true; // Exact receipt retry: do not increment the mission epoch again.
+      }
+      if (Object.keys(this.snapshot.revokeRequests).length >= 10_000) throw new Error('APPROVAL_LOG_FULL');
       this.state = 'blocked';
       const epoch = (this.snapshot.missionEpochs[missionId] ?? 0) + 1;
       if (!Number.isSafeInteger(epoch)) throw new Error('EPOCH_EXHAUSTED');
@@ -246,7 +292,9 @@ export class MissionLeaseRegistry {
         version: 1,
         missionEpochs: { ...this.snapshot.missionEpochs, [missionId]: epoch },
         leases: this.snapshot.leases.map(x => x.missionId === missionId
-          ? { ...x, revokedAt: this.now() } : x)
+          ? { ...x, revokedAt: this.now() } : x),
+        grantRequests: { ...this.snapshot.grantRequests },
+        revokeRequests: { ...this.snapshot.revokeRequests, [approvalId]: { missionId, epoch } }
       };
       try { await this.storage.commit(candidate); }
       catch { throw new Error('STORE_UNAVAILABLE'); }

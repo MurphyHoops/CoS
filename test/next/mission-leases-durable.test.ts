@@ -21,6 +21,7 @@ const authority: MissionLeaseAuthority = {
   confirmApproval: async (approval, action) => approval === 'operator-confirmed-' + action
 };
 const grant = (actor: 'A' | 'B' = 'A') => ({
+  approvalId: actor === 'A' ? 'approval-A' : 'approval-B',
   principalId: actor === 'A' ? 'userA' : 'userB',
   namespace: 'chatgpt',
   hostBindingKey: actor === 'A' ? bindingA : bindingB,
@@ -122,7 +123,7 @@ describe('WP02 live durable adapter in isolated temp data', () => {
     const r = new MissionLeaseRegistry(storage, authority);
     await r.restore();
     await r.grant(grant(), 'operator-confirmed-grant');
-    await r.revoke('mission-A', 'operator-confirmed-revoke');
+    await r.revoke('mission-A', 'operator-confirmed-revoke', 'revoke-A');
     expect((await r.authorize(request())).allowed).toBe(false);
     const json = JSON.parse(await fs.readFile(path.join(root, 'state', 'next-mission-leases.json'), 'utf8'));
     expect(json.missionEpochs['mission-A']).toBe(2);

@@ -45,6 +45,7 @@ const auth: MissionLeaseAuthority = {
 };
 function grantFor(hostBindingKey = bindingA, caps: MissionCapability[] = ['read', 'command']) {
   return {
+    approvalId: hostBindingKey === bindingB ? 'approval-B' : 'approval-A',
     principalId: 'userA', namespace: 'chatgpt', hostBindingKey,
     missionId: 'mission-A', projectId: 'project-A', capabilities: caps, ttlMs: 60_000
   };
@@ -102,6 +103,43 @@ describe('WP02 MissionLease fail-closed authorization', () => {
       .toMatchObject({ allowed: false, reason: 'UNTRUSTED_CALLER' });
   });
 
+  it('refuses prototype-chain names for missions and approval receipts', async () => {
+    for (const name of ['__proto__', 'constructor', 'toString', 'prototype', 'hasOwnProperty']) {
+      await expect(ledger.grant({ ...grantFor(), approvalId: name }, 'approved-grant'))
+        .rejects.toThrow('INVALID_GRANT');
+      await expect(ledger.grant({ ...grantFor(), missionId: name }, 'approved-grant'))
+        .rejects.toThrow('INVALID_GRANT');
+    }
+    expect(store.writes).toBe(0);
+  });
+
+  it('returns the original receipt for an identical approved grant retry without a second write', async () => {
+    const first = await ledger.grant(grantFor(), 'approved-grant');
+    const again = await ledger.grant(grantFor(), 'approved-grant');
+    expect(again.leaseId).toBe(first.leaseId);
+    expect(again.epoch).toBe(1);
+    expect(store.writes).toBe(1);
+    expect(store.value?.grantRequests['approval-A']?.leaseId).toBe(first.leaseId);
+  });
+
+  it('rejects an approval ID replay with a different grant payload', async () => {
+    await ledger.grant(grantFor(), 'approved-grant');
+    await expect(ledger.grant({ ...grantFor(bindingB), approvalId: 'approval-A' }, 'approved-grant'))
+      .rejects.toThrow('APPROVAL_REPLAY_CONFLICT');
+    expect(store.writes).toBe(1);
+    expect((await ledger.authorize(context())).allowed).toBe(true);
+  });
+
+  it('never reopens superseded or restarted authority by replaying an old approval ID', async () => {
+    await ledger.grant(grantFor(), 'approved-grant');
+    await ledger.grant(grantFor(bindingB), 'approved-grant');
+    await expect(ledger.grant(grantFor(), 'approved-grant')).rejects.toThrow('APPROVAL_ALREADY_CONSUMED');
+    expect(store.writes).toBe(2);
+    const restarted = new MissionLeaseRegistry(store, auth, () => currentTime);
+    await restarted.restore();
+    await expect(restarted.grant(grantFor(bindingB), 'approved-grant')).rejects.toThrow('APPROVAL_ALREADY_CONSUMED');
+  });
+
   it('rejects other host sessions, principals, namespaces and projects', async () => {
     await ledger.grant(grantFor(), 'approved-grant');
     expect(await ledger.authorize(context('B'))).toMatchObject({ allowed: false, reason: 'NOT_BOUND' });
@@ -137,11 +175,22 @@ describe('WP02 MissionLease fail-closed authorization', () => {
 
   it('requires independent revoke approval; revoked or wrong-epoch calls cannot write', async () => {
     await ledger.grant(grantFor(), 'approved-grant');
-    await expect(ledger.revoke('mission-A', 'wrong')).rejects.toThrow('APPROVAL_REQUIRED');
+    await expect(ledger.revoke('mission-A', 'wrong', 'revoke-A')).rejects.toThrow('APPROVAL_REQUIRED');
     expect((await ledger.authorize(context())).allowed).toBe(true);
-    expect(await ledger.revoke('mission-A', 'approved-revoke')).toBe(true);
+    expect(await ledger.revoke('mission-A', 'approved-revoke', 'revoke-A')).toBe(true);
     expect(await ledger.authorize(context())).toMatchObject({ allowed: false });
     expect(store.value?.missionEpochs['mission-A']).toBe(2);
+  });
+
+  it('deduplicates a confirmed revoke and rejects the same approval ID for another mission', async () => {
+    await ledger.grant(grantFor(), 'approved-grant');
+    await ledger.revoke('mission-A', 'approved-revoke', 'revoke-A');
+    expect(store.value?.missionEpochs['mission-A']).toBe(2);
+    expect(store.writes).toBe(2);
+    expect(await ledger.revoke('mission-A', 'approved-revoke', 'revoke-A')).toBe(true);
+    expect(store.writes).toBe(2);
+    await expect(ledger.revoke('mission-B', 'approved-revoke', 'revoke-A'))
+      .rejects.toThrow('APPROVAL_REPLAY_CONFLICT');
   });
 
   it('never acknowledges an uncommitted grant; fails closed after ambiguous storage writes', async () => {
@@ -164,7 +213,7 @@ describe('WP02 MissionLease fail-closed authorization', () => {
     await ledger.grant(grantFor(), 'approved-grant');
     const deferred: { resolve: () => void } = { resolve: () => { throw new Error('barrier not entered'); } };
     store.barrier = () => new Promise<void>(resolve => { deferred.resolve = resolve; });
-    const revoking = ledger.revoke('mission-A', 'approved-revoke');
+    const revoking = ledger.revoke('mission-A', 'approved-revoke', 'revoke-A');
     await new Promise(resolve => setImmediate(resolve));
     expect(await ledger.authorize(context())).toMatchObject({ allowed: false, reason: 'RECOVERY_LOCKED' });
     deferred.resolve();
