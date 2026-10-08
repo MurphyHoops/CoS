@@ -14800,7 +14800,7 @@ describe('one live isolated-world recorder per document', () => {
     await expect(live.runtimeMessage({ type: 'clf-recorder-ping' })).resolves.toEqual({
       ok: true,
       recorderVersion: 14,
-      recorderBuildId: 'cos-3.1.16-pty-capacity-uuid-origin-v2'
+      recorderBuildId: 'cos-3.1.16-pty-capacity-uuid-origin-v3'
     });
   });
 

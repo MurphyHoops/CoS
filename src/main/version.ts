@@ -14,7 +14,7 @@
 
 export const APP_VERSION = '3.1.16';
 /** Opaque companion release identity. Must match extension/background.js and companion-build.txt. */
-export const COMPANION_BUILD_ID = 'cos-3.1.16-pty-capacity-uuid-origin-v2';
+export const COMPANION_BUILD_ID = 'cos-3.1.16-pty-capacity-uuid-origin-v3';
 
 /**
  * Standalone extension recovery must stay on the app's own release. Using GitHub's moving

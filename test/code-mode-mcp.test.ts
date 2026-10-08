@@ -332,6 +332,10 @@ it('delivers completed terminal output on the outer result even when code filter
   expect(text(response)).toContain('Exit code: 7');
   expect(text(response)).not.toContain('PRIVATE_ALPHA');
   expect(text(response).match(/Background session/g)).toHaveLength(1);
+  // A later owner call acknowledges an already-published page. The publication
+  // and immediate next request can share one Date.now() millisecond under load;
+  // wait past that fence rather than weakening the no-premature-ack production rule.
+  await new Promise(resolve => setTimeout(resolve, 8));
   const receipt = await call(who.requestId, 'text("receipt");');
   expect(text(receipt)).not.toContain('OUTER_AUTO_RESULT');
   expect(unifiedExecManager.exitedUnread(new Set([id]))).toEqual([]);

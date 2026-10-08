@@ -24,6 +24,10 @@
 
 var CLF_DOM = (() => {
   const TURN = 'section[data-testid^="conversation-turn"]';
+  // New ChatGPT renderer (October 2026): a turn has a stable data-turn-key and
+  // native search units rather than the earlier section[data-testid] elements.
+  const MODERN_TURN = '[data-turn-key]';
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   // ChatGPT has used both shapes in the live renderer: the older tool-message span
   // and, as of 2026-08-15, a display-contents row wrapping the visible tool label.
   // Keep both explicit structural anchors; hashed CSS-module names remain off limits.
@@ -479,6 +483,31 @@ var CLF_DOM = (() => {
         previous = { node, nodes: [node], id, role };
         out.push(previous);
       }
+      if (out.length > 0) return out;
+      // Treat the modern search-unit labels as display/Send-receipt hints only.
+      // In particular, there is no evidence here for a server tool request, a
+      // complete assistant final, or permission to claim an MCP conversation.
+      const transcript = document.querySelector('[data-chatgpt-conversation-selection-target="true"]');
+      if (!transcript) return out;
+      const visited = new Set();
+      for (const host of transcript.querySelectorAll(MODERN_TURN)) {
+        const userId = host.getAttribute('data-turn-key');
+        if (!UUID.test(userId || '')) continue;
+        for (const unit of host.querySelectorAll('[data-chatgpt-search-unit-key][data-chatgpt-search-message-ids]')) {
+          const key = unit.getAttribute('data-chatgpt-search-unit-key') || '';
+          const role = /^fallback-turn-\d+:\d+:(user|assistant)$/.exec(key)?.[1];
+          if (!role) continue;
+          const ids = (unit.getAttribute('data-chatgpt-search-message-ids') || '').split(/\s+/).filter(Boolean);
+          const id = ids[0];
+          if (!UUID.test(id || '') || ids.some(item => item !== id) || visited.has(id)) continue;
+          // The visible user prompt owns the outer stable turn key. Never
+          // assign the key from a different/adjacent turn to this message.
+          if (role === 'user' && (id !== userId || unit.querySelectorAll('[data-user-message-bubble]').length !== 1)) continue;
+          if (role === 'assistant' && !unit.querySelector('[data-conversation-role]')) continue;
+          visited.add(id);
+          out.push({ node: unit, nodes: [unit], id, role, modern: true });
+        }
+      }
       return out;
     }, []);
   }
@@ -541,6 +570,22 @@ var CLF_DOM = (() => {
     return safe(() => {
       const out = [];
       const nodes = turnNodes(turn);
+      if (turn?.modern) {
+        // Only a page-native user message with a cross-checked server UUID can
+        // confirm a submitted prompt. Search result text from an assistant unit
+        // combines commentary, tools and final output, so never promote it to a
+        // canonical assistant final or task completion.
+        if (turn.role !== 'user' || !turn.id || seen.has(turn.id)) return out;
+        const bubble = turn.node?.querySelector('[data-user-message-bubble]');
+        const prose = bubble?.querySelector('.text-size-chat.whitespace-pre-wrap');
+        if (!prose || prose.closest('[data-chatgpt-search-unit-key]') !== turn.node) return out;
+        const value = pageText(prose);
+        if (!value) return out;
+        seen.add(turn.id);
+        out.push({ id: turn.id, role: 'user', text: value, turnId: turn.id,
+          node: turn.node, interrupted: false });
+        return out;
+      }
       let explicit = 0;
       for (const section of nodes) {
         for (const row of sectionRows(section)) {

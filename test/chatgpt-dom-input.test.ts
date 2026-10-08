@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const source = readFileSync(new URL('../extension/chatgpt-dom.js', import.meta.url), 'utf8');
 interface DomApi {
+  turns(): Array<{ id: string; role: string }>;
+  messages(): Array<{ id: string; role: string; text: string }>;
   composer(): HTMLElement | null;
   composerVisible(): boolean;
   insertPrompt(text: string, mode?: boolean | 'append', failure?: (reason: string) => void): boolean;
@@ -38,6 +40,45 @@ beforeEach(() => {
   button = document.querySelector('[data-testid="send-button"]')!;
 });
 afterEach(() => { dom.window.close(); vi.useRealTimers(); });
+
+
+describe('October 2026 native turn/message markup', () => {
+  const userId = '500e82a3-2a55-4688-a8ef-65efaf994ca7';
+  const assistantId = '4133d819-7acd-43d4-a07a-312d51ecfc18';
+  function modern(turnKey = userId, messageId = userId) {
+    const host = document.createElement('div');
+    host.setAttribute('data-turn-key', turnKey);
+    host.innerHTML = `<div data-chatgpt-search-unit-key="fallback-turn-0:0:user" data-chatgpt-search-message-ids="${messageId}"><div data-user-message-bubble="true"><div class="text-size-chat whitespace-pre-wrap">Exact sent user message</div></div></div><div data-chatgpt-search-unit-key="fallback-turn-0:2:assistant" data-chatgpt-search-message-ids="${assistantId} ${assistantId}"><h4 data-conversation-role="assistant">ChatGPT says:</h4><div>Tools and commentary must NOT be recorded as the final answer</div></div>`;
+    const transcript = document.createElement('div');
+    transcript.setAttribute('data-chatgpt-conversation-selection-target', 'true');
+    transcript.append(host); document.body.append(transcript);
+  }
+  it('witnesses a user Send from matching native turn key and message UUID without fabricating an assistant final', () => {
+    modern();
+    expect(api.turns().map(row => row.role)).toEqual(['user', 'assistant']);
+    expect(api.messages().map(row => [row.id, row.role, row.text])).toEqual([
+      [userId, 'user', 'Exact sent user message']
+    ]);
+  });
+  it('rejects a mixed-turn user UUID rather than claiming a neighbouring message', () => {
+    modern(userId, 'a0000000-bbbb-4ccc-8ddd-eeeeeeeeeeee');
+    expect(api.messages()).toEqual([]);
+  });
+  it('does not adopt an unrelated turn-shaped surface outside the active conversation transcript', () => {
+    modern();
+    document.querySelector('[data-chatgpt-conversation-selection-target]')?.removeAttribute('data-chatgpt-conversation-selection-target');
+    expect(api.turns()).toEqual([]);
+    expect(api.messages()).toEqual([]);
+  });
+  it('keeps the older provider section renderer authoritative when both representations exist', () => {
+    modern();
+    user('Legacy authenticated text');
+    expect(api.messages()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'message-one', text: 'Legacy authenticated text' })
+    ]));
+    expect(api.messages().some(row => row.id === userId)).toBe(false);
+  });
+});
 
 describe('composer identity', () => {
   it('recognizes the current ChatGPT rich editor after prompt-textarea id removal', () => {

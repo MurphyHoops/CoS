@@ -41,7 +41,7 @@
   // the build id proves it is the recorder shipped with the currently running companion.
   // Both are required because a behavioral change can keep the same protocol surface while
   // still requiring already-open ChatGPT pages to replace their old isolated-world script.
-  const RECORDER_BUILD_ID = 'cos-3.1.16-pty-capacity-uuid-origin-v2';
+  const RECORDER_BUILD_ID = 'cos-3.1.16-pty-capacity-uuid-origin-v3';
   const recorderHandle = {
     version: RECORDER_VERSION,
     buildId: RECORDER_BUILD_ID,
