@@ -20,6 +20,7 @@ import { randomUUID } from 'node:crypto';
 import { retryGoalBrowserHelper } from './goal.js';
 import { requestBrowserPreferences } from './browser-preferences.js';
 import { sendDesktopInput, cancelDesktopInput, retryQueuedInputBrowser } from './session/start-input.js';
+import { classicTestTransportDisabled } from './next/runtime/classic-test-control.js';
 import { wakeBrowserUrl } from './browser-startup.js';
 import { registerPluginIpc } from './plugins-ipc.js';
 /**
@@ -366,18 +367,19 @@ function resolvedBinary(config: Config): string | null {
 
 async function buildState(): Promise<AppState> {
   const config = getConfig();
+  const synthetic = classicTestTransportDisabled();
   return {
     config,
     status: getStatus(),
     platform: hostPlatformInfo(),
     loginStartupAvailable: supportsLoginStartup(process.platform, app.isPackaged),
-    secureStorage: await secureStorageStatus(),
-    hasApiKey: await hasSecret(setupApiKeySlot(config.tunnel.profileId)),
-    hasGoalKey: await hasSecret('openRouterApiKey'),
-    hasCustomProviderKey: await hasSecret('customProviderApiKey'),
+    secureStorage: synthetic ? { available: false, detail: 'Synthetic offline QA: OS credentials deliberately disabled' } : await secureStorageStatus(),
+    hasApiKey: synthetic ? false : await hasSecret(setupApiKeySlot(config.tunnel.profileId)),
+    hasGoalKey: synthetic ? false : await hasSecret('openRouterApiKey'),
+    hasCustomProviderKey: synthetic ? false : await hasSecret('customProviderApiKey'),
     resolvedBinary: resolvedBinary(config),
     bundledTunnelVersion: bundledVersion(),
-    bridge: await bridgeStatus(),
+    bridge: synthetic ? {running:false,port:8765,paired:false,disconnected:false,detected:false,present:false,wakeConnected:false,lastSeenAt:null,extensionVersion:null,extensionBuildId:null,extensionSourceCurrent:null} : await bridgeStatus(),
     update: updateStatus(),
     desktopAccess: getMacOSDesktopAccess()
   };

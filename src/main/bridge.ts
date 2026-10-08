@@ -1,3 +1,4 @@
+import { classicTestTransportDisabled } from './next/runtime/classic-test-control.js';
 import { conversationProgress } from './session/progress.js';
 import { messageReaction } from '../shared/message-reaction.js';
 import { browserControl } from './browser-control.js';
@@ -5474,6 +5475,7 @@ function enqueueBridgeLifecycle<T>(operation: () => Promise<T>): Promise<T> {
 }
 
 export function startBridge(): Promise<number | null> {
+  if (classicTestTransportDisabled()) return Promise.resolve(null);
   if (bridgeShutdownRequested) return Promise.resolve(null);
   if (bridgeDesiredRunning) {
     if (bridgeStartRequest) return bridgeStartRequest;

@@ -1,4 +1,5 @@
 import { REASONING_EFFORTS } from '../shared/session.js';
+import { classicTestTransportDisabled } from './next/runtime/classic-test-control.js';
 /** Successful account choices survive restart; request/opening authority never does. */
 import { randomUUID } from 'node:crypto';
 import { wakeBrowserWork } from './browser-wake.js';
@@ -62,6 +63,7 @@ export function requestChatModels(allowOpen = true): ChatModelCatalog {
 }
 /** An explicit UI request starts only the local browser bridge, never MCP/tunnel exposure. */
 export async function startChatModelDiscovery(allowOpen = true): Promise<ChatModelCatalog> {
+  if (classicTestTransportDisabled()) return getChatModels();
   // Showing an existing app window is neither a refresh nor permission to open Chrome.
   if (!allowOpen && catalog.state !== 'unknown') return getChatModels();
   requestChatModels(allowOpen);

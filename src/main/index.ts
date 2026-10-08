@@ -70,6 +70,7 @@ import {
 } from './window-lifecycle.js';
 import { trayGuidArgsForPlatform, trayImageSpec } from './tray-image.js';
 import { browserWindowIconPath } from './window-icon.js';
+import { classicControlPermitted, classicTestTransportDisabled, startClassicTestControl } from './next/runtime/classic-test-control.js';
 import { editContextMenuTemplate } from './edit-context-menu.js';
 
 
@@ -82,6 +83,10 @@ const usageWarmup = new AbortController();
 
 // One instance only: two copies would fight over the tunnel and the config file.
 const isNextClassic = process.env.COS_NEXT_CLASSIC_WORKFLOW === '1';
+const syntheticClassicTest = classicTestTransportDisabled() && process.env.COS_NEXT_E2E_TEMP_PROFILE === '1' && classicControlPermitted({
+  isNext: isNextClassic, packaged: app.isPackaged, home: process.env.HOME ?? '',
+  userData: app.getPath('userData'), socket: process.env.COS_NEXT_TEST_CONTROL_SOCKET ?? ''
+});
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
   // `app.quit()` does not make the rest of this module stop executing. Mark this process as a
@@ -128,7 +133,7 @@ function createWindow(): void {
   // catalogue. Merely showing the app never grants authority to open a browser document;
   // explicit Refresh and real delivery operations own that stronger action separately.
   window.on('show', () => {
-    if (!quitting && getChatModels().state === 'unknown') void startChatModelDiscovery(false)
+    if (!syntheticClassicTest && !quitting && getChatModels().state === 'unknown') void startChatModelDiscovery(false)
       .catch(error => logWarn(`model discovery on window open: ${error.message}`));
   });
   window.once('ready-to-show', () => {
@@ -139,7 +144,7 @@ function createWindow(): void {
       // here so later tray/Dock/native activation can show an existing user-sized window without
       // overwriting its geometry.
       if (!window?.isFullScreen()) window?.maximize();
-      showWindow();
+      if (!syntheticClassicTest || process.env.COS_NEXT_E2E_VISIBLE_GUI === '1') showWindow();
     }
   });
 
@@ -450,6 +455,18 @@ void app.whenReady().then(async () => {
   }
 
   logInfo('app started');
+  if (syntheticClassicTest) {
+    try {
+      await startClassicTestControl({
+        isNext: true, packaged: app.isPackaged, home: process.env.HOME!,
+        userData, socket: process.env.COS_NEXT_TEST_CONTROL_SOCKET!, app, window: () => window
+      });
+    } catch (error) {
+      logError('isolated test control could not start: ' + (error instanceof Error ? error.message : 'unknown'));
+      app.quit();
+      return;
+    }
+  }
 
   // Historical Unattributed repair may legitimately scan and rewrite a large legacy bucket.
   // It is maintenance, not a prerequisite for showing the app or accepting new exact-id
@@ -458,8 +475,8 @@ void app.whenReady().then(async () => {
 
   // Recording, workers and direct browser tools share one extension transport.
   // ipc.ts uses the same eligibility rule when settings change.
-  startInputStartupRuntime();
-  if (browserExtensionRequired(getConfig())) {
+  if (!syntheticClassicTest) startInputStartupRuntime();
+  if (!syntheticClassicTest && browserExtensionRequired(getConfig())) {
     void startBridge();
   }
   // Preserve the user's saved connection preference without silently

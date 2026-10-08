@@ -78,7 +78,7 @@ describe('native window activation', () => {
       once: (_event: string, listener: () => void) => { ready = listener; },
       isFullScreen: () => startupState.fullscreen,
       maximize: () => startupOperations.push('maximize')
-    }, quitting: false, showWindow });
+    }, quitting: false, showWindow, syntheticClassicTest: false, process: { env: {} } });
     vm.runInContext(startup, launch);
     ready();
     expect(startupOperations.splice(0)).toEqual(['maximize', 'showWindow']);
@@ -88,6 +88,15 @@ describe('native window activation', () => {
     launch.quitting = true;
     ready();
     expect(showWindow).toHaveBeenCalledTimes(2);
+    // Synthetic CLI tests must remain invisible, except the explicit isolated
+    // GUI parity harness whose real BrowserWindow must be painted for CDP.
+    launch.quitting = false;
+    launch.syntheticClassicTest = true;
+    ready();
+    expect(showWindow).toHaveBeenCalledTimes(2);
+    (launch.process as {env:Record<string,string>}).env.COS_NEXT_E2E_VISIBLE_GUI='1';
+    ready();
+    expect(showWindow).toHaveBeenCalledTimes(3);
   });
   it('passively discovers on first visible use without browser-opening authority, never on repeat show or quit', async () => {
     const source = readFileSync(new URL('../src/main/index.ts', import.meta.url), 'utf8');
@@ -97,7 +106,7 @@ describe('native window activation', () => {
     const start = vi.fn(async () => { state = 'pending'; return {}; });
     const context = vm.createContext({ window: { on: (event: string, callback: () => void) => {
       expect(event).toBe('show'); show = callback;
-    } }, quitting: false, getChatModels: () => ({ state }), startChatModelDiscovery: start, logWarn: vi.fn() });
+    } }, quitting: false, syntheticClassicTest: false, getChatModels: () => ({ state }), startChatModelDiscovery: start, logWarn: vi.fn() });
     vm.runInContext(listener, context);
     show(); await Promise.resolve(); expect(start).not.toHaveBeenCalled();
     state = 'unknown';
@@ -110,6 +119,10 @@ describe('native window activation', () => {
     expect(start).toHaveBeenCalledTimes(1);
     state = 'unknown';
     context.quitting = true;
+    show();
+    expect(start).toHaveBeenCalledTimes(1);
+    context.quitting = false;
+    context.syntheticClassicTest = true;
     show();
     expect(start).toHaveBeenCalledTimes(1);
   });

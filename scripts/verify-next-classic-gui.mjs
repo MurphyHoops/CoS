@@ -19,7 +19,7 @@ if (!app?.startsWith('/') || !app.endsWith('Chat On Steroids Next.app')) {
   throw new Error('SPECIFY_BUILT_NEXT_APP_ABSOLUTE_PATH');
 }
 const binary = path.join(app, 'Contents/MacOS/Chat On Steroids Next');
-const home = await mkdtemp(path.join(os.tmpdir(), 'cos-next-e2e-home-'));
+const home = await mkdtemp(path.join(os.tmpdir(), 'cos-next-ctl-'));
 const oldRoot = path.join(home, 'Library/Application Support/chat-on-steroids');
 const nextRoot = path.join(home, 'Library/Application Support/chat-on-steroids-next');
 await mkdir(oldRoot, { recursive: true, mode: 0o700 });
@@ -74,6 +74,7 @@ async function connect(wsUrl) {
     const next = pending.get(result.id);
     if (!next) return;
     pending.delete(result.id);
+    clearTimeout(next.timer);
     if (result.error) next.reject(new Error('CHROMIUM_DEVTOOLS_ERROR:' + result.error.code));
     else next.resolve(result.result);
   });
@@ -81,9 +82,10 @@ async function connect(wsUrl) {
 async function rpc(method, params={}) {
   const id = ++sequence;
   return await new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject });
+    const timer=setTimeout(() => {pending.delete(id);reject(new Error('CHROMIUM_DEVTOOLS_RPC_TIMED_OUT'));},10000);
+    pending.set(id, { resolve, reject, timer });
     connection.send(JSON.stringify({ id, method, params }), error => {
-      if (error) { pending.delete(id); reject(error); }
+      if (error) { clearTimeout(timer);pending.delete(id); reject(error); }
     });
   });
 }
@@ -95,7 +97,7 @@ async function evaluate(expression) {
 async function boot() {
   const port = await randomPort();
   child = spawn(binary, ['--remote-debugging-address=127.0.0.1', '--remote-debugging-port='+port], {
-    env: { ...process.env, HOME: home, COS_NEXT_E2E_TEMP_PROFILE: '1' },
+    env: { ...process.env, HOME: home, COS_NEXT_E2E_TEMP_PROFILE: '1', COS_NEXT_TEST_CONTROL_SOCKET: path.join(home, 'control.sock'), COS_NEXT_E2E_VISIBLE_GUI: '1' },
     stdio: ['ignore', 'pipe', 'pipe'], detached: false
   });
   child.stdout?.resume(); child.stderr?.resume();
@@ -130,6 +132,7 @@ async function stop() {
   // The test profile explicitly forbids a Tunnel. Only terminate OUR child.
   if (target.exitCode === null && target.signalCode === null) target.kill('SIGKILL');
   await delay(150);
+  for(const p of pending.values()){clearTimeout(p.timer);p.reject(new Error('CHROMIUM_DEVTOOLS_SESSION_CLOSED'));}
   pending=new Map();
 }
 try {
@@ -200,6 +203,10 @@ try {
   await stop();
   const afterHash=createHash('sha256').update(await readFile(path.join(oldRoot,'config.json'))).digest('hex');
   if (afterHash!==originalHash) throw new Error('ORIGINAL_PROFILE_MODIFIED');
+  const appLog=await readFile(path.join(nextRoot,'app.log'),'utf8').catch(()=> '');
+  if (/bridge listening|core tunnel connected|model discovery browser wake completed/.test(appLog))
+    throw new Error('NEXT_GUI_TEST_UNEXPECTED_REAL_TRANSPORT');
+  console.log('NEXT_CLASSIC_GUI_ISOLATED_TRANSPORT=PASS');
   console.log('NEXT_CLASSIC_GUI_OLD_PROFILE_UNMODIFIED=PASS');
   console.log('NEXT_CLASSIC_GUI_TEMP_PROFILE=PASS');
 } finally {

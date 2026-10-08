@@ -6,6 +6,7 @@ import {
   waitForProviderTransport
 } from './connectivity.js';
 import { startBridge } from '../bridge.js';
+import { classicTestTransportDisabled } from '../next/runtime/classic-test-control.js';
 import { wakeBrowserUrl, resetBrowserStartupForTests } from '../browser-startup.js';
 import { getConfig } from '../config.js';
 import { enqueueInput, cancelInput, listInputs, noteInputStartupError, type InputArgs, type InputEntry } from './input.js';
@@ -98,6 +99,12 @@ export async function sendDesktopInput(input: InputArgs): Promise<InputEntry> {
     if (controller.signal.aborted) { await cancelInput(input.id); controller.signal.throwIfAborted(); }
     if (entry.state !== 'queued' || entry.transportIntent === 'tool' || entry.attachmentDelivery === 'tool') {
       starting.delete(input.id); return entry;
+    }
+    // Synthetic packaged QA proves UI→IPC→durable queue, not real delivery.
+    // Never open a browser or tunnel from its deliberately offline test profile.
+    if (classicTestTransportDisabled()) {
+      starting.delete(input.id);
+      return entry;
     }
     // Return after durable admission, not after connection startup or native delivery.
     void startAcceptedInput(entry, controller).catch(() => undefined);

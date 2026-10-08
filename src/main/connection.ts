@@ -1,3 +1,4 @@
+import { classicTestTransportDisabled } from './next/runtime/classic-test-control.js';
 /**
  * Owns the lifecycle: local MCP server up, then tunnel(s) up, then connected.
  * Everything the UI shows about connection state comes from here.
@@ -229,6 +230,7 @@ function siblingPublicUrl(publicUrl: string | null, localUrl: string | null): st
 }
 
 async function connectImpl(): Promise<void> {
+  if (classicTestTransportDisabled()) return; // Isolated QA cannot start MCP or Tunnel.
   if (shutdownRequested) return;
   // Offline counts as running: the tunnel is alive and retrying on its own.
   if (
