@@ -1,0 +1,41 @@
+name: CoS Next WP08 Tunnel Ownership
+on:
+  push:
+    branches:
+      - 'next/v4/wp08-**'
+  pull_request:
+    paths:
+      - 'src/main/next/tunnel/**'
+      - 'test/next/tunnel-exclusive-owner.test.ts'
+      - 'test/next/fixtures/tunnel-owner-worker.mjs'
+      - '.github/workflows/next-tunnel-ownership.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: next-tunnel-owner-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tunnel-ownership:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Privacy guard
+        run: npm run verify:privacy
+      - name: Cross-process tunnel locks and crash behavior
+        run: npx vitest run test/next/tunnel-exclusive-owner.test.ts
