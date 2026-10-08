@@ -285,8 +285,8 @@ describe('route observation under partial health failures', () => {
     );
   });
 
-  it('reports a ready startup while the first readable long poll is still open', () => {
-    expect(routeObservation(0, null, NO_OUTAGE, T)).toBe('connected');
+  it('does not claim handshake from a ready local client while its first OpenAI poll is pending', () => {
+    expect(routeObservation(0, null, NO_OUTAGE, T)).toBe('unknown'); // a live client alone is not OpenAI handshake proof
   });
 
   it('requires the full complaint window before calling a ready client offline', () => {

@@ -205,7 +205,7 @@ describe('OpenAI tunnel process ownership', () => {
       }
       if (url.pathname === '/readyz') return new Response('ok');
       if (url.pathname === '/metrics') {
-        return new Response('commands_poll_last_successful_timestamp_seconds 0\ncommands_poll_errors_total 0\n');
+        return new Response(`commands_poll_last_successful_timestamp_seconds ${Date.now()/1000}\ncommands_poll_errors_total 0\n`);
       }
       if (url.pathname === '/api/status') return Response.json({ uptime_seconds: 1, channels: [] });
       return new Response('missing', { status: 404 });

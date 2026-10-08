@@ -2,24 +2,82 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import {createHash} from 'node:crypto';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 const run=promisify(execFile);
 const root=path.join(os.homedir(),'Library/Application Support/chat-on-steroids-next');
 const maxLogBytes=512_000;
+/** Per-connector authenticated tunnel poll evidence, not a process-start marker. */
+const POLL_FRESH_MS=95_000; // src/main/tunnel/health.ts
+async function candidateTempRoots(){
+  const roots=new Set([os.tmpdir()]);
+  if(process.platform==='darwin'){
+    for(const a of await fs.readdir('/var/folders').catch(()=>[])){
+      if(!/^[a-z0-9]{1,8}$/.test(a))continue;
+      for(const b of await fs.readdir(path.join('/var/folders',a)).catch(()=>[])){
+        if(!/^[a-z0-9_]{8,80}$/.test(b))continue;
+        roots.add(path.join('/var/folders',a,b,'T'));
+      }
+    }
+  }
+  return [...roots];
+}
+export async function tunnelHandshakeHealth(config,livePids,nowMs,roots=null){
+  const results={};
+  roots??=await candidateTempRoots();
+  for(const [label,name] of [['core','tunnelId'],['plugins','pluginsTunnelId'],['desktop','desktopTunnelId']]){
+    const id=config.tunnel?.[name];
+    if(typeof id!=='string' || !/^tunnel_[0-9a-f]{32}$/.test(id))continue;
+    const hashed=createHash('sha256').update(`${label}\0${id}`).digest('hex').slice(0,24);
+    let result={running:false,lastPollAgeSeconds:null,pollErrorCount:null,freshHandshake:false};
+    for(const temp of roots){
+      const dir=path.join(temp,'chat-on-steroids-tunnels',hashed);
+      try{
+        const owner=Number((await fs.readFile(path.join(dir,'client.pid'),'utf8')).trim());
+        if(!livePids.has(owner))continue;
+        result.running=true;
+        const base=(await fs.readFile(path.join(dir,'health.url'),'utf8')).trim();
+        const url=new URL(base);
+        if(url.protocol!=='http:' || url.hostname!=='127.0.0.1' || !url.port)continue;
+        const response=await fetch(base+'/metrics',{signal:AbortSignal.timeout(2500)});
+        if(!response.ok)continue;
+        const metric=await response.text();
+        const get=(key)=>{
+          const m=metric.match(new RegExp('(?:^|\\n)'+key+'(?:\\{[^}]*\\})?\\s+([0-9eE.+-]+)(?:\\n|$)'));
+          return m?Number(m[1]):null;
+        };
+        const seconds=get('commands_poll_last_successful_timestamp_seconds');
+        const errors=get('commands_poll_errors_total');
+        const age=seconds&&seconds>0?Math.max(0,Math.round((nowMs-seconds*1000)/1000)):null;
+        result={running:true,lastPollAgeSeconds:age,pollErrorCount:errors,
+          freshHandshake:age!==null && seconds*1000<=nowMs+5000 && age*1000<=POLL_FRESH_MS};
+        break;
+      }catch{ /* Closed client, stale lease or no current metrics: NOT handshake proof. */ }
+    }
+    results[label]=result;
+  }
+  return results;
+}
 export async function inspectLiveNext(){
   const data={mode:'read-only-live',appRunning:false,appPid:null,
     configuredTunnelCount:0,tunnelProcessCount:0,connectedSinceLatestStart:false,
+    handshakeFreshCount:0,handshakeExpectedCount:0,handshakes:{},
     bridgeHttpAuthenticationEnforced:null,bridgeListener:false,
     latestAppStartedAt:null,latestTunnelConnectedAt:null, modelCatalogueCached:false,
     chromeChatGPTTabs:null,readyForLiveModelProbe:false,requiresAction:[]};
-  const p=await run('/bin/ps',['-axo','pid=,command='],{maxBuffer:4_000_000});
+  const p=await run('/bin/ps',['-axo','pid=,ppid=,command='],{maxBuffer:4_000_000});
   const lines=p.stdout.split('\n');
   const next=lines.find(s=>s.includes('/Chat On Steroids Next.app/Contents/MacOS/Chat On Steroids Next') && !s.includes('Helper'));
   if(next){data.appRunning=true;data.appPid=Number(next.trim().match(/^\d+/)?.[0])||null;}
-  data.tunnelProcessCount=lines.filter(s=>s.includes('/tunnel-client') && !s.includes('grep ') && !s.includes('next-classic-live-doctor')).length;
+  const tunnelLines=lines.filter(s=>s.includes('/tunnel-client') && !s.includes('grep ') && !s.includes('next-classic-live-doctor'));
+  data.tunnelProcessCount=tunnelLines.length;
+  const ownedPids=new Set(tunnelLines.flatMap(line=>{const m=line.trim().match(/^(\d+)\s+(\d+)\s+/);return m && Number(m[2])===data.appPid?[Number(m[1])]:[];}));
   const config=JSON.parse(await fs.readFile(path.join(root,'config.json'),'utf8'));
   data.configuredTunnelCount=['tunnelId','pluginsTunnelId','desktopTunnelId'].filter(k=>!!config.tunnel?.[k]).length;
+  data.handshakes=await tunnelHandshakeHealth(config,ownedPids,Date.now());
+  data.handshakeExpectedCount=Object.keys(data.handshakes).length;
+  data.handshakeFreshCount=Object.values(data.handshakes).filter(x=>x.freshHandshake).length;
   const modelPath=path.join(root,'state/chat-models.json');
   try{
     const models=JSON.parse(await fs.readFile(modelPath,'utf8'));
@@ -53,10 +111,12 @@ export async function inspectLiveNext(){
   if(!data.appRunning)data.requiresAction.push('Start the existing Next application');
   if(data.configuredTunnelCount<1)data.requiresAction.push('Configure a Next connector in Setup');
   if(data.tunnelProcessCount===0)data.requiresAction.push('Click Connect once in the existing Next window (macOS Accessibility automation is not authorized)');
+  if(data.tunnelProcessCount>0 && data.handshakeFreshCount<data.handshakeExpectedCount)
+    data.requiresAction.push('Tunnel process is local but OpenAI handshake is stale: check api.openai.com network/Shadowrocket route');
   if(!data.modelCatalogueCached)data.requiresAction.push('Discover real ChatGPT account model options');
   // A historical connected log and a running tunnel are preliminary evidence only.
   // Final readiness still needs exact authenticated browser/recipient observation.
-  data.readyForLiveModelProbe=data.appRunning && data.tunnelProcessCount>0 && data.connectedSinceLatestStart && data.bridgeHttpAuthenticationEnforced===true && data.modelCatalogueCached;
+  data.readyForLiveModelProbe=data.appRunning && data.tunnelProcessCount>0 && data.handshakeExpectedCount>0 && data.handshakeFreshCount===data.handshakeExpectedCount && data.bridgeHttpAuthenticationEnforced===true && data.modelCatalogueCached;
   return data;
 }
 

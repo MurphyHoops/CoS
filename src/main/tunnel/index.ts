@@ -363,7 +363,7 @@ export function outageRecovered(run: UnreachableRun, lastHandshake: number | nul
 
 export type RouteObservation = 'connected' | 'offline' | 'unknown';
 
-/** Missing metrics prove neither recovery nor failure; a readable zero is a ready first poll. */
+/** No first successful OpenAI poll means connecting, even when local /readyz is green. */
 export function routeObservation(
   read: number | null,
   lastHandshake: number | null,
@@ -372,7 +372,7 @@ export function routeObservation(
 ): RouteObservation {
   if (read === null) return 'unknown';
   if (outageConfirmed(run, nowMs)) return 'offline';
-  if (lastHandshake === null) return 'connected';
+  if (lastHandshake === null) return 'unknown';
   return nowMs - lastHandshake > POLL_FRESH_MS ? 'offline' : 'connected';
 }
 
@@ -500,12 +500,16 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
     });
   };
 
-  const showUnknown = (run: ClientRun): void => {
+  const showUnknown = (run: ClientRun, metricsUnavailable = false): void => {
     if (stopped || current !== run) return;
     run.shown = 'unknown';
     opts.report({
       state: 'connecting-tunnel',
-      detail: 'Tunnel client is locally ready, but its OpenAI poll metrics are temporarily unavailable.',
+      detail: metricsUnavailable
+        ? 'Tunnel client is locally ready, but its OpenAI poll metrics are temporarily unavailable.'
+        : run.lastHandshake === null
+          ? 'Tunnel client started; waiting for its first verified OpenAI control-plane handshake.'
+          : 'Tunnel client is locally ready; waiting to verify its latest OpenAI handshake.',
       handshakeAt: run.lastHandshake,
       health: run.health
     });
@@ -653,7 +657,7 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
           } else if (observation === 'connected') {
             showConnected(run);
           } else {
-            showUnknown(run);
+            showUnknown(run, read === null);
           }
           watch(run);
         })();
@@ -802,7 +806,7 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
           } else if (observation === 'connected') {
             showConnected(run);
           } else {
-            showUnknown(run);
+            showUnknown(run, read === null);
           }
           watch(run);
           return;
