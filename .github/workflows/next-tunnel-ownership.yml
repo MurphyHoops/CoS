@@ -6,6 +6,9 @@ on:
   pull_request:
     paths:
       - 'src/main/next/tunnel/**'
+      - 'src/main/tunnel/index.ts'
+      - 'test/tunnel-lifecycle.test.ts'
+      - 'test/next/next-openai-transport.test.ts'
       - 'test/next/tunnel-exclusive-owner.test.ts'
       - 'test/next/fixtures/tunnel-owner-worker.mjs'
       - '.github/workflows/next-tunnel-ownership.yml'
@@ -38,4 +41,4 @@ jobs:
       - name: Privacy guard
         run: npm run verify:privacy
       - name: Cross-process tunnel locks and crash behavior
-        run: npx vitest run test/next/tunnel-exclusive-owner.test.ts test/next/tunnel-exclusive-lifecycle.test.ts
+        run: npx vitest run test/next/tunnel-exclusive-owner.test.ts test/next/tunnel-exclusive-lifecycle.test.ts test/next/next-openai-transport.test.ts test/tunnel-lifecycle.test.ts

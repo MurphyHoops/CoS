@@ -38,6 +38,8 @@ export interface TunnelStartOptions {
   settings: TunnelSettings;
   /** OpenAI control-plane API key, only for the openai adapter. */
   apiKey: string | null;
+  /** Next-only: refuse preexisting legacy publication files instead of retiring processes. */
+  nextRejectOrphans?: boolean;
   /** Headers added only to tunnel-client's own MCP discovery/startup probes. */
   discoveryHeaders?: Record<string, string>;
   /**
@@ -50,6 +52,12 @@ export interface TunnelStartOptions {
 
 export interface TunnelHandle {
   stop: () => Promise<void>;
+  /**
+   * Next-only strict shutdown receipt. True only when every tracked tunnel-client tree
+   * has exited; false/undefined means an exclusive lock MUST NOT be released.
+   * Legacy stop() remains source-compatible and deliberately does not grant this proof.
+   */
+  stopWithProof?: () => Promise<boolean>;
   /** Loopback base URL of the client's own health/metrics server, when it has one. */
   healthBase?: () => string | null;
 }
@@ -397,7 +405,21 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
   await fs.mkdir(lease.dir, { recursive: true });
   // A SIGKILL cannot run this module's normal stop path. Reclaim only a client whose own status
   // proves it belongs to this exact tunnel and whose previous local CoS server is already gone.
-  await retireCrashOrphan(lease, opts.settings.tunnelId, opts.localUrl, tag);
+  if (opts.nextRejectOrphans) {
+    // Existing legacy metadata may describe a still-running tunnel-client. Do
+    // not kill it, even when its endpoint looks offline or its PID file is stale.
+    // Only an explicit operator-supervised recovery may retire ambiguous files.
+    for (const file of [lease.pidFile, lease.healthFile]) {
+      try {
+        await fs.readFile(file, 'utf8');
+        throw new TunnelError('Legacy tunnel ownership evidence exists. Reconcile the old client before starting Next.');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+  } else {
+    await retireCrashOrphan(lease, opts.settings.tunnelId, opts.localUrl, tag);
+  }
   const healthFile = lease.healthFile;
   const pidFile = lease.pidFile;
 
@@ -434,7 +456,9 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
   let stopped = false;
   let current: ClientRun | null = null;
   let timer: NodeJS.Timeout | null = null;
-  let retirement: Promise<void> = Promise.resolve();
+  let retirement: Promise<boolean> = Promise.resolve(true);
+  let unverifiedRetirement = false;
+  let shutdownReceipt: Promise<boolean> | null = null;
   /** Consecutive failed attempts, which is what the backoff grows on. */
   let attempts = 0;
 
@@ -554,7 +578,8 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
     });
     retirement = (async () => {
       const retired = !terminate || (await stopTree(run.proc));
-      if (stopped) return;
+      if (!retired) unverifiedRetirement = true;
+      if (stopped) return retired;
       if (!retired) {
         // Starting B without proof that A stopped would create two owned tunnel trees. Fail
         // closed and let an explicit reconnect create a fresh supervisor instead.
@@ -562,13 +587,14 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
           state: 'tunnel-unavailable',
           detail: 'The previous tunnel client could not be stopped safely. Disconnect and reconnect to try again.'
         });
-        return;
+        return false;
       }
       timer = setTimeout(() => {
         timer = null;
         void launch();
       }, wait);
       timer.unref?.();
+      return retired;
     })();
   };
 
@@ -692,7 +718,10 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
         stopped = true;
         current = null;
         clearTimer();
-        retirement = stopTree(proc).then(() => undefined);
+        retirement = stopTree(proc).then((retired) => {
+          if (!retired) unverifiedRetirement = true;
+          return retired;
+        });
         opts.report({
           state: 'auth-failed',
           detail: 'The tunnel rejected the API key or tunnel ID. Check both in Connection settings.'
@@ -789,22 +818,29 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
 
   void launch();
 
-  return {
-    healthBase: () => current?.healthBase ?? null,
-    stop: async () => {
+  const stopWithProof = (): Promise<boolean> => {
+    if (shutdownReceipt) return shutdownReceipt;
+    shutdownReceipt = (async () => {
       stopped = true;
       clearTimer();
       const active = current;
       current = null;
-      await retirement;
+      const priorRetired = await retirement;
       const retired = await stopTree(active?.proc ?? null);
-      // Keep the stable lease on disk if shutdown could not prove the client tree stopped. A
-      // later app process can then identify/reconcile that exact survivor instead of losing the
-      // only evidence and starting a duplicate tunnel client.
-      if (retired) {
+      // A prior failed retirement cannot become safe merely because the *latest*
+      // child exited. Keep both legacy publication files and Next's exclusive lock.
+      const verified = priorRetired && retired && !unverifiedRetirement;
+      if (verified) {
         await fs.rm(lease.dir, { recursive: true, force: true }).catch(() => {});
       }
-    }
+      return verified;
+    })();
+    return shutdownReceipt;
+  };
+  return {
+    healthBase: () => current?.healthBase ?? null,
+    stopWithProof,
+    stop: async () => { await stopWithProof(); }
   };
 }
 
