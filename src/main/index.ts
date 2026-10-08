@@ -71,6 +71,7 @@ import {
 import { trayGuidArgsForPlatform, trayImageSpec } from './tray-image.js';
 import { browserWindowIconPath } from './window-icon.js';
 import { classicControlPermitted, classicTestTransportDisabled, startClassicTestControl } from './next/runtime/classic-test-control.js';
+import { liveControlPermitted, startClassicLiveControl } from './next/runtime/classic-live-control.js';
 import { editContextMenuTemplate } from './edit-context-menu.js';
 
 
@@ -466,6 +467,20 @@ void app.whenReady().then(async () => {
       app.quit();
       return;
     }
+  }
+
+  // CLI-launched REAL Next verification: explicitly authorized, one-use private socket.
+  // No socket exists during ordinary user launches or the synthetic QA mode.
+  if (process.env.COS_NEXT_LIVE_QA === '1') {
+    const gate={isNext:isNextClassic,packaged:app.isPackaged,home:process.env.HOME??'',
+      userData,dir:process.env.COS_NEXT_LIVE_QA_DIR??'',
+      socket:process.env.COS_NEXT_LIVE_QA_SOCKET??'',token:process.env.COS_NEXT_LIVE_QA_TOKEN??''};
+    if(!liveControlPermitted(gate)){
+      logError('Live CLI verification blocked: invalid activation or userData boundary');
+      app.quit();return;
+    }
+    try{await startClassicLiveControl({...gate,app});}
+    catch(error){logError('Live CLI verification cannot start: '+(error instanceof Error?error.message:'unknown'));app.quit();return;}
   }
 
   // Historical Unattributed repair may legitimately scan and rewrite a large legacy bucket.
