@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
+  <title>Chat On Steroids Next</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <svg width="0" height="0" class="svg-icons" aria-hidden="true">
+    <defs>
+      <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.8"/><rect x="14" y="3" width="7" height="7" rx="1.8"/><rect x="3" y="14" width="7" height="7" rx="1.8"/><rect x="14" y="14" width="7" height="7" rx="1.8"/></symbol>
+      <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 6.5A2 2 0 0 1 5 4.5h5l2.4 2.5H19a2 2 0 0 1 2 2v9A2 2 0 0 1 19 20H5a2 2 0 0 1-2-2z"/></symbol>
+      <symbol id="i-list" viewBox="0 0 24 24"><rect x="4" y="3.5" width="16" height="17" rx="2.5"/><path d="M8 9h8M8 13h8M8 17h5"/></symbol>
+      <symbol id="i-agents" viewBox="0 0 24 24"><circle cx="9" cy="7" r="3"/><path d="M3.5 20v-2a5.5 5.5 0 0 1 11 0v2zM17 4.5a3 3 0 0 1 0 5.8M16.5 14a5.5 5.5 0 0 1 4 5.2"/></symbol>
+      <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 6.5v6l4 2"/></symbol>
+      <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-2 2M14 10a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l2-2"/></symbol>
+      <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2.5 20 6v6.2c0 5.5-4 8.5-8 9.8-4-1.3-8-4.3-8-9.8V6z"/><path d="m9 12 2 2 4-4"/></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.7-4.3L3 9M3 4v5h5M4 13a8 8 0 0 0 14.7 4.3L21 15M21 20v-5h-5"/></symbol>
+      <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
+      <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="m7 9 3 3-3 3M13 16h4"/></symbol>
+      <symbol id="i-pulse" viewBox="0 0 24 24"><path d="M2 12h5l3-7 4 14 3-7h5"/></symbol>
+      <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4.5" y="10" width="15" height="11" rx="2.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></symbol>
+      <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 10.5V17M12 7.5h.01"/></symbol>
+    </defs>
+  </svg>
+  <div class="shell">
+    <aside class="sidebar" aria-label="导航">
+      <div class="brand">
+        <div class="brandmark"><span class="brandmark-ring">C</span><span class="brandmark-dot"></span></div>
+        <div class="brandcopy"><strong>CoS <span>Next</span></strong><small>MISSION CONTROL</small></div>
+      </div>
+      <div class="sidebar-label">工作空间 <span class="sidebar-alpha">ALPHA</span></div>
+      <nav id="navigation">
+        <button class="nav-item active" type="button" data-view="overview"><svg><use href="#i-grid"/></svg><span>工作台总览</span></button>
+        <button class="nav-item" type="button" data-view="projects"><svg><use href="#i-folder"/></svg><span>项目管理</span></button>
+        <button class="nav-item" type="button" data-view="missions"><svg><use href="#i-list"/></svg><span>Mission 任务</span></button>
+        <button class="nav-item" type="button" data-view="agents"><svg><use href="#i-agents"/></svg><span>多 Agent</span></button>
+        <button class="nav-item" type="button" data-view="waits"><svg><use href="#i-clock"/></svg><span>等待与恢复</span></button>
+        <div class="nav-group-divider"></div>
+        <button class="nav-item" type="button" data-view="connections"><svg><use href="#i-link"/></svg><span>连接管理</span></button>
+        <button class="nav-item" type="button" data-view="security"><svg><use href="#i-shield"/></svg><span>安全与权限</span></button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="environment">
+          <div class="env-title"><span class="tiny-led" id="sidebar-led"></span> Local Runtime</div>
+          <div class="env-line" id="sidebar-runtime">正在检测</div>
+        </div>
+        <div class="version"><span>v4.0.0-alpha</span><span>LOCAL FIRST</span></div>
+      </div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <div class="breadcrumbs"><span>CoS Next</span><svg><use href="#i-chevron"/></svg><strong id="crumb-current">工作台总览</strong></div>
+        <div class="top-actions">
+          <span id="top-tunnel" class="top-pill"><span class="tiny-led"></span>Tunnel 已断开</span>
+          <button type="button" id="refresh" class="icon-btn" title="刷新状态" aria-label="刷新状态"><svg><use href="#i-refresh"/></svg></button>
+        </div>
+      </header>
+      <main id="main" tabindex="-1">
+        <section class="page-heading">
+          <div>
+            <div class="eyebrow" id="page-eyebrow">LOCAL WORKSPACE · OVERVIEW</div>
+            <h1 id="page-title">工作台总览</h1>
+            <p id="page-description">在一个本地工作台中查看项目、任务与连接状态。ChatGPT 仍是主要 AI 交互入口。</p>
+          </div>
+          <div class="heading-actions" id="heading-actions">
+            <button class="btn btn-quiet" type="button" data-action="reload"><svg><use href="#i-refresh"/></svg>刷新数据</button>
+            <button class="btn btn-primary" type="button" data-action="choose-project"><svg><use href="#i-plus"/></svg>添加项目</button>
+          </div>
+        </section>
+        <div id="notice" class="toast" hidden role="status" aria-live="polite"></div>
+        <div id="content" aria-live="polite"></div>
+      </main>
+      <footer class="footer">
+        <span><span class="tiny-led" id="footer-led"></span><span id="footer-state">准备中</span></span>
+        <span>独立存储 <span class="footer-divider">·</span> 零自动 API 计费 <span class="footer-divider">·</span> 原版 CoS 不受影响</span>
+      </footer>
+    </div>
+  </div>
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

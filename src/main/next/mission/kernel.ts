@@ -280,6 +280,28 @@ export class MissionKernel {
     });
   }
 
+  /** Native-approved dashboard projection. No raw task prompt, command, or token. */
+  adminOverview(localApproval: unknown): Promise<{
+    projects: Project[]; missions: Mission[];
+    workers: Pick<Worker, 'agentId' | 'missionId' | 'state' | 'epoch'>[];
+    obligations: Pick<Obligation, 'obligationId' | 'missionId' | 'state' | 'kind' | 'outcome' | 'continuation'>[];
+  }> {
+    return this.serialized(async () => {
+      this.guardReady();
+      if (!(await this.admin.approve(localApproval, 'browse', 'local-registry')))
+        conflict('LOCAL_APPROVAL_REQUIRED');
+      return structuredClone({
+        projects: Object.values(this.current.projects),
+        missions: Object.values(this.current.missions),
+        workers: Object.values(this.current.workers).map(
+          ({ agentId, missionId, state, epoch }) => ({ agentId, missionId, state, epoch })),
+        obligations: Object.values(this.current.obligations).map(
+          ({ obligationId, missionId, state, kind, outcome, continuation }) =>
+            ({ obligationId, missionId, state, kind, outcome, continuation }))
+      });
+    });
+  }
+
   /** Local administrative bootstrap; never accessible as a raw ChatGPT tool. */
   provisionProject(projectId: string, canonicalRoot: string, approval: unknown): Promise<Project> {
     return this.serialized(async () => {

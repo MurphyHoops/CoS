@@ -9,7 +9,7 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { mkdirSync } from 'node:fs';
 import { promises as fs } from 'node:fs';
-import { app, dialog, Menu } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, Menu, type IpcMainInvokeEvent } from 'electron';
 import { NextLocalRuntime } from './local-runtime.js';
 import { serveNextMcpLoopback } from './mcp-loopback.js';
 import { connectImportedCoreTunnel, type ImportedCoreTunnel } from './imported-core-tunnel.js';
@@ -18,6 +18,7 @@ import { NextNativeApprovalBroker } from '../auth/native-approval.js';
 import { initSecretsPath, secureStorageStatus, hasSecret } from '../../secrets.js';
 import type { MissionLeaseAuthority } from '../auth/mission-leases.js';
 import type { LocalAdministrator, LocalVerifier } from '../mission/kernel.js';
+import type { NextUiCatalog, NextUiResult, NextUiStatus } from '../../../shared/next-ui.js';
 
 const dataDir = defaultNextUserData();
 mkdirSync(dataDir, { recursive: true, mode: 0o700 });
@@ -27,6 +28,7 @@ const isPrimary = app.requestSingleInstanceLock();
 if (!isPrimary) app.quit();
 
 let runtime: NextLocalRuntime | null = null;
+let mainWindow: BrowserWindow | null = null;
 let mcp: Awaited<ReturnType<typeof serveNextMcpLoopback>> | null = null;
 let importedCoreTunnel: ImportedCoreTunnel | null = null;
 let connectingImportedCore = false;
@@ -91,23 +93,23 @@ async function showStatus(): Promise<void> {
   });
 }
 
-async function chooseProject(): Promise<void> {
+async function chooseProject(): Promise<boolean> {
   if (!runtime || runtime.health.state !== 'READY') {
     await showStatus();
-    return;
+    return false;
   }
   const selected = await dialog.showOpenDialog({
     title: 'Choose a project directory for CoS Next only',
     properties: ['openDirectory']
   });
   const folder = selected.filePaths[0];
-  if (selected.canceled || !folder) return;
+  if (selected.canceled || !folder) return false;
   const canonical = await fs.realpath(folder);
   const projectId = 'project-' + randomUUID();
   descriptions.set(projectId, 'Project directory: ' + canonical);
   try {
     const ticket = await approvals.request('project', projectId);
-    if (!ticket) return;
+    if (!ticket) return false;
     const project = await runtime.mission.provisionProject(projectId, canonical, ticket);
     await dialog.showMessageBox({
       type: 'info',
@@ -116,11 +118,13 @@ async function chooseProject(): Promise<void> {
         '\n\nNo ChatGPT, agent, command or Tunnel access was granted.',
       buttons: ['Close']
     });
+    return true;
   } catch {
     await dialog.showMessageBox({
       type: 'error', message: 'Project registration was denied or could not be saved.',
       buttons: ['Close']
     });
+    return false;
   } finally {
     descriptions.delete(projectId);
   }
@@ -198,15 +202,11 @@ async function createLocalMission(): Promise<void> {
   } finally { descriptions.delete(missionId); }
 }
 
-async function connectImportedCoreFromMenu(): Promise<void> {
-  if (connectingImportedCore || importedCoreTunnel) {
-    await showStatus(); return;
-  }
-  if (!runtime || !mcp || runtime.health.state !== 'READY') {
-    await showStatus(); return;
-  }
+async function connectImportedCoreFromMenu(notify = true): Promise<boolean> {
+  if (connectingImportedCore || importedCoreTunnel) return false;
+  if (!runtime || !mcp || runtime.health.state !== 'READY') return false;
   const ticket = await approvals.request('tunnel', 'core');
-  if (!ticket || !(await approvals.consume(ticket, 'tunnel', 'core'))) return;
+  if (!ticket || !(await approvals.consume(ticket, 'tunnel', 'core'))) return false;
   connectingImportedCore = true;
   try {
     const tunnel = await connectImportedCoreTunnel(runtime, mcp.endpointUrl,
@@ -217,42 +217,183 @@ async function connectImportedCoreFromMenu(): Promise<void> {
       const stopped = await tunnel.stopWithProof();
       if (!stopped) throw new Error('IMPORT_TUNNEL_SHUTDOWN_UNVERIFIED');
       importedCoreTunnel = null;
-      await dialog.showMessageBox({
+      if (notify) await dialog.showMessageBox({
         type: 'warning', title: 'CoS Next — Tunnel not connected',
         message: 'The original Core Tunnel could not be verified as connected.',
         detail: 'The original CoS configuration has not been changed. Check the network and account status.',
         buttons: ['Close']
       });
-      return;
+      return false;
     }
-    await dialog.showMessageBox({
+    if (notify) await dialog.showMessageBox({
       type: 'info', title: 'CoS Next — Core Tunnel connected',
       message: 'Next now owns the imported Core Tunnel.',
       detail: 'Only read-only health and identity diagnostics are exposed. ' +
         'Mission, Agent, command and autonomous ChatGPT continuation remain disabled.',
       buttons: ['Close']
     });
+    return true;
   } catch {
-    await dialog.showMessageBox({
+    if (notify) await dialog.showMessageBox({
       type: 'error', title: 'CoS Next — connection blocked',
       message: 'Core Tunnel connection was denied or could not establish exclusive ownership.',
       detail: 'Close the old CoS and verify no legacy tunnel process is running before retrying.',
       buttons: ['Close']
     });
+    return false;
   } finally { connectingImportedCore = false; }
 }
-async function disconnectImportedCoreFromMenu(): Promise<void> {
-  if (!importedCoreTunnel) return;
+async function disconnectImportedCoreFromMenu(notify = true): Promise<boolean> {
+  if (!importedCoreTunnel) return false;
   const stopped = await importedCoreTunnel.stopWithProof();
   if (!stopped) {
-    await dialog.showMessageBox({ type: 'error',
+    if (notify) await dialog.showMessageBox({ type: 'error',
       message: 'Unable to verify Tunnel shutdown. The Next connection remains blocked.',
       buttons: ['Close'] });
-    return;
+    return false;
   }
   importedCoreTunnel = null;
-  await showStatus();
+  if (notify) await showStatus();
+  return true;
 }
+
+const VALID_NAME = /^[a-zA-Z0-9_.:-]{1,128}$/;
+const CONTRACTS = [
+  ['build', 'tests', 'review'], ['ci', 'ledger', 'review'], ['artifact', 'review']
+];
+function windowOnly(event: IpcMainInvokeEvent): void {
+  if (!mainWindow || mainWindow.isDestroyed() ||
+      event.sender !== mainWindow.webContents ||
+      event.senderFrame !== mainWindow.webContents.mainFrame)
+    throw new Error('NEXT_WINDOW_NOT_TRUSTED');
+}
+async function uiStatus(): Promise<NextUiStatus> {
+  const health = runtime?.health;
+  const secure = await secureStorageStatus();
+  return {
+    runtime: health?.state ?? 'OFF',
+    leases: health?.leases ?? 'new',
+    journal: health?.mission ?? 'NEW',
+    tunnel: connectingImportedCore ? 'CONNECTING' : importedCoreTunnel?.state ?? 'DISCONNECTED',
+    keychain: secure.available ? 'AVAILABLE' : 'UNAVAILABLE',
+    model: 'DISABLED',
+    remoteAuthority: 'DISABLED',
+    plugin: 'NOT_REQUIRED'
+  };
+}
+async function uiCatalog(): Promise<NextUiCatalog | null> {
+  if (!runtime || !['READY', 'REAPPROVAL_REQUIRED'].includes(runtime.health.state)) return null;
+  const ticket = await approvals.request('browse', 'local-registry');
+  if (!ticket) return null;
+  try {
+    const catalog = await runtime.mission.adminOverview(ticket);
+    return {
+      projects: catalog.projects.map(({ projectId, canonicalRoot }) => ({ projectId, canonicalRoot })),
+      missions: catalog.missions.map(({ missionId, projectId, epoch, revision, state, completionChecks }) =>
+        ({ missionId, projectId, epoch, revision, state, completionChecks })),
+      workers: catalog.workers, obligations: catalog.obligations
+    };
+  } catch { return null; }
+}
+async function uiCreateMission(projectId: unknown, completionChecks: unknown): Promise<NextUiResult> {
+  if (!runtime || runtime.health.state !== 'READY' || typeof projectId !== 'string' ||
+      !VALID_NAME.test(projectId) || !Array.isArray(completionChecks) ||
+      !completionChecks.every(x => typeof x === 'string') ||
+      !CONTRACTS.some(template => template.length === completionChecks.length &&
+        template.every((check, index) => check === completionChecks[index])))
+    return { ok: false, reason: '任务参数不符合已批准的完成条件模板。' };
+  const missionId = 'mission-' + randomUUID();
+  descriptions.set(missionId, 'Project: ' + projectId +
+    '\nRequired checks: ' + completionChecks.join(', '));
+  try {
+    const ticket = await approvals.request('create', missionId);
+    if (!ticket) return { ok: false, reason: '本机审批已取消。' };
+    await runtime.mission.provisionMission(projectId, missionId, completionChecks, ticket);
+    return { ok: true };
+  } catch {
+    return { ok: false, reason: 'Mission 创建失败或项目未被授权。' };
+  } finally { descriptions.delete(missionId); }
+}
+function registerWindowIpc(): void {
+  ipcMain.handle('next-ui:status', async event => {
+    windowOnly(event); return await uiStatus();
+  });
+  ipcMain.handle('next-ui:catalog', async event => {
+    windowOnly(event); return await uiCatalog();
+  });
+  ipcMain.handle('next-ui:choose-project', async event => {
+    windowOnly(event);
+    return { ok: await chooseProject() } satisfies NextUiResult;
+  });
+  ipcMain.handle('next-ui:create-mission', async (event, id: unknown, checks: unknown) => {
+    windowOnly(event); return await uiCreateMission(id, checks);
+  });
+  ipcMain.handle('next-ui:connect-core', async event => {
+    windowOnly(event);
+    return { ok: await connectImportedCoreFromMenu(false) } satisfies NextUiResult;
+  });
+  ipcMain.handle('next-ui:disconnect-core', async event => {
+    windowOnly(event);
+    return { ok: await disconnectImportedCoreFromMenu(false) } satisfies NextUiResult;
+  });
+}
+function showWindow(): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+}
+function createWindow(): void {
+  if (mainWindow && !mainWindow.isDestroyed()) return showWindow();
+  mainWindow = new BrowserWindow({
+    title: 'Chat On Steroids Next',
+    width: 1270, height: 855,
+    minWidth: 830, minHeight: 580,
+    center: true, show: false,
+    backgroundColor: '#0d141e',
+    fullscreenable: true,
+    autoHideMenuBar: process.platform !== 'darwin',
+    webPreferences: {
+      preload: path.join(__dirname, '../preload/next.js'),
+      contextIsolation: true, sandbox: true, nodeIntegration: false,
+      webSecurity: true, webviewTag: false
+    }
+  });
+  const owner = mainWindow;
+  owner.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  owner.webContents.on('will-navigate', event => event.preventDefault());
+  owner.webContents.on('will-redirect', event => event.preventDefault());
+  owner.webContents.on('will-attach-webview', event => event.preventDefault());
+  owner.webContents.on('did-fail-load', () => {
+    void dialog.showMessageBox(owner, { type: 'error',
+      title: 'CoS Next — renderer failed',
+      message: 'The local Next dashboard could not be loaded.',
+      detail: 'Check the bundled renderer assets. No remote Mission authority has been granted.',
+      buttons: ['Close'] });
+  });
+  owner.once('ready-to-show', () => { if (!shuttingDown && !fullyClosed) showWindow(); });
+  owner.on('close', event => {
+    if (!shuttingDown && !fullyClosed) { event.preventDefault(); owner.hide(); }
+  });
+  owner.on('closed', () => { if (mainWindow === owner) mainWindow = null; });
+  void owner.loadFile(path.join(__dirname, '../renderer/index.html')).catch(() => {
+    if (!owner.isDestroyed()) {
+      void dialog.showMessageBox(owner, {
+        type: 'error', message: 'Next dashboard files could not be loaded.',
+        buttons: ['Close']
+      });
+    }
+  });
+}
+app.on('activate', () => {
+  if (fullyClosed || shuttingDown) return;
+  if (!mainWindow) createWindow();
+  else showWindow();
+});
+app.on('second-instance', () => {
+  if (!shuttingDown && !fullyClosed) showWindow();
+});
 
 function installMenu(): void {
   const items: Electron.MenuItemConstructorOptions[] = [
@@ -306,6 +447,7 @@ app.on('before-quit', (event) => {
 void app.whenReady().then(async () => {
   if (!isPrimary) return;
   installMenu();
+  registerWindowIpc();
   runtime = new NextLocalRuntime({ userData: dataDir, authority, admin, verifier });
   try {
     await runtime.start();
@@ -391,5 +533,5 @@ void app.whenReady().then(async () => {
     app.exit(ok && runtime.health.state === 'STOPPED' ? 0 : 1);
     return;
   }
-  await showStatus();
+  createWindow();
 });
