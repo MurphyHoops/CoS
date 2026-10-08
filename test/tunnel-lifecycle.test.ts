@@ -130,7 +130,52 @@ beforeEach(() => {
   vi.useRealTimers();
 });
 
+describe('WP08 strict client tree stop proof for the Next exclusive owner', () => {
+  it('exposes a stable shutdown receipt after a verified child tree exit', async () => {
+    vi.useFakeTimers();
+    const handle = await startTunnel({
+      localUrl: 'http://127.0.0.1:1234/secret', settings,
+      apiKey: 'test', report: () => undefined
+    });
+    await vi.advanceTimersByTimeAsync(20);
+    expect(fixture.children).toHaveLength(1);
+    expect(typeof handle.stopWithProof).toBe('function');
+    expect(await handle.stopWithProof?.()).toBe(true);
+    expect(await handle.stopWithProof?.()).toBe(true);
+    expect(fixture.terminate).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(fixture.children).toHaveLength(1);
+  });
+
+  it('refuses to certify a child whose process-tree stop had no exit receipt', async () => {
+    vi.useFakeTimers();
+    const handle = await startTunnel({
+      localUrl: 'http://127.0.0.1:1234/secret', settings,
+      apiKey: 'test', report: () => undefined
+    });
+    await vi.advanceTimersByTimeAsync(20);
+    const child = fixture.children[0];
+    fixture.terminate.mockRejectedValueOnce(new Error('simulated stop failure'));
+    const receipt = handle.stopWithProof?.();
+    await vi.advanceTimersByTimeAsync(3_200);
+    expect(await receipt).toBe(false);
+    expect(child.exitCode).toBeNull();
+    expect(await handle.stopWithProof?.()).toBe(false);
+  });
+});
+
 describe('OpenAI tunnel process ownership', () => {
+  it('Next mode refuses any old publication evidence rather than retiring an old child', async () => {
+    const lease = openAiTunnelLeasePaths(settings.tunnelId, 'core');
+    fixture.files.set(lease.pidFile, '42424');
+    await expect(startTunnel({
+      localUrl: 'http://127.0.0.1:1234/new-secret', settings, apiKey: 'test',
+      label: 'core', nextRejectOrphans: true, report: () => undefined
+    })).rejects.toThrow(/legacy tunnel ownership evidence/i);
+    expect(fixture.terminate).not.toHaveBeenCalled();
+    expect(fixture.spawn).not.toHaveBeenCalled();
+  });
+
   it('retires an exact orphaned client left by a crashed app before launching one replacement', async () => {
     vi.useFakeTimers();
     const label = 'core';
