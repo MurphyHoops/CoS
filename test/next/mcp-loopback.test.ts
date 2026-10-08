@@ -47,6 +47,21 @@ describe('CoS Next real loopback MCP HTTP without browser companion', () => {
       .toEqual(['identity_diagnostics', 'runtime_health']);
     expect(tools.every((t: { annotations: { readOnlyHint: boolean } }) => t.annotations.readOnlyHint)).toBe(true);
   });
+  it('serves token-qualified RFC 9728 resource metadata for the official Tunnel Client', async () => {
+    const endpoint = new URL(service.endpointUrl);
+    const metadata = endpoint.origin + '/.well-known/oauth-protected-resource' + endpoint.pathname;
+    const fetched = await fetch(metadata);
+    expect(fetched.status).toBe(200);
+    expect(await fetched.json()).toEqual({
+      resource: service.endpointUrl,
+      resource_name: 'CoS Next local read-only diagnostics',
+      authorization_servers: [], scopes_supported: []
+    });
+    const plain = await fetch(endpoint.origin + '/.well-known/oauth-protected-resource');
+    expect(plain.status).toBe(404);
+    expect((await fetch(metadata, { method: 'POST' })).status).toBe(405);
+  });
+
   it('reports bounded runtime health and no unverified Mission authority', async () => {
     const result = await call('runtime_health');
     expect(result.status).toBe(200);

@@ -12,9 +12,10 @@ import { promises as fs } from 'node:fs';
 import { app, dialog, Menu } from 'electron';
 import { NextLocalRuntime } from './local-runtime.js';
 import { serveNextMcpLoopback } from './mcp-loopback.js';
+import { connectImportedCoreTunnel, type ImportedCoreTunnel } from './imported-core-tunnel.js';
 import { defaultNextUserData } from './writer.js';
 import { NextNativeApprovalBroker } from '../auth/native-approval.js';
-import { initSecretsPath, secureStorageStatus } from '../../secrets.js';
+import { initSecretsPath, secureStorageStatus, hasSecret } from '../../secrets.js';
 import type { MissionLeaseAuthority } from '../auth/mission-leases.js';
 import type { LocalAdministrator, LocalVerifier } from '../mission/kernel.js';
 
@@ -27,6 +28,8 @@ if (!isPrimary) app.quit();
 
 let runtime: NextLocalRuntime | null = null;
 let mcp: Awaited<ReturnType<typeof serveNextMcpLoopback>> | null = null;
+let importedCoreTunnel: ImportedCoreTunnel | null = null;
+let connectingImportedCore = false;
 let shuttingDown = false;
 let fullyClosed = false;
 const descriptions = new Map<string, string>();
@@ -76,7 +79,9 @@ async function showStatus(): Promise<void> {
       'Mission journal: ' + (h?.mission ?? 'NEW'),
       'Lease state: ' + (h?.leases ?? 'new'),
       'Encrypted OS storage: ' + (storage.available ? 'available' : 'unavailable'),
-      'ChatGPT MCP: loopback read-only only (G1b pending)',
+      'ChatGPT MCP: ' + (importedCoreTunnel?.state === 'CONNECTED'
+        ? 'IMPORTED CORE TUNNEL CONNECTED (READ-ONLY)'
+        : 'local-only; imported Tunnel disconnected'),
       'Remote Mission authority: DISABLED (G2b pending)',
       'Model inference: DISABLED — no extra API billing',
       'Chrome companion: NOT REQUIRED for this local runtime',
@@ -193,12 +198,71 @@ async function createLocalMission(): Promise<void> {
   } finally { descriptions.delete(missionId); }
 }
 
+async function connectImportedCoreFromMenu(): Promise<void> {
+  if (connectingImportedCore || importedCoreTunnel) {
+    await showStatus(); return;
+  }
+  if (!runtime || !mcp || runtime.health.state !== 'READY') {
+    await showStatus(); return;
+  }
+  const ticket = await approvals.request('tunnel', 'core');
+  if (!ticket || !(await approvals.consume(ticket, 'tunnel', 'core'))) return;
+  connectingImportedCore = true;
+  try {
+    const tunnel = await connectImportedCoreTunnel(runtime, mcp.endpointUrl,
+      path.join(dataDir, 'config.json'));
+    importedCoreTunnel = tunnel;
+    const ready = await tunnel.connected;
+    if (!ready) {
+      const stopped = await tunnel.stopWithProof();
+      if (!stopped) throw new Error('IMPORT_TUNNEL_SHUTDOWN_UNVERIFIED');
+      importedCoreTunnel = null;
+      await dialog.showMessageBox({
+        type: 'warning', title: 'CoS Next — Tunnel not connected',
+        message: 'The original Core Tunnel could not be verified as connected.',
+        detail: 'The original CoS configuration has not been changed. Check the network and account status.',
+        buttons: ['Close']
+      });
+      return;
+    }
+    await dialog.showMessageBox({
+      type: 'info', title: 'CoS Next — Core Tunnel connected',
+      message: 'Next now owns the imported Core Tunnel.',
+      detail: 'Only read-only health and identity diagnostics are exposed. ' +
+        'Mission, Agent, command and autonomous ChatGPT continuation remain disabled.',
+      buttons: ['Close']
+    });
+  } catch {
+    await dialog.showMessageBox({
+      type: 'error', title: 'CoS Next — connection blocked',
+      message: 'Core Tunnel connection was denied or could not establish exclusive ownership.',
+      detail: 'Close the old CoS and verify no legacy tunnel process is running before retrying.',
+      buttons: ['Close']
+    });
+  } finally { connectingImportedCore = false; }
+}
+async function disconnectImportedCoreFromMenu(): Promise<void> {
+  if (!importedCoreTunnel) return;
+  const stopped = await importedCoreTunnel.stopWithProof();
+  if (!stopped) {
+    await dialog.showMessageBox({ type: 'error',
+      message: 'Unable to verify Tunnel shutdown. The Next connection remains blocked.',
+      buttons: ['Close'] });
+    return;
+  }
+  importedCoreTunnel = null;
+  await showStatus();
+}
+
 function installMenu(): void {
   const items: Electron.MenuItemConstructorOptions[] = [
     { label: 'Show local runtime status', click: () => { void showStatus(); } },
     { label: 'Register project directory…', click: () => { void chooseProject(); } },
     { label: 'Show local projects and Missions…', click: () => { void showProjects(); } },
     { label: 'Create local Mission…', click: () => { void createLocalMission(); } },
+    { type: 'separator' },
+    { label: 'Connect imported Core Tunnel…', click: () => { void connectImportedCoreFromMenu(); } },
+    { label: 'Disconnect imported Core Tunnel', click: () => { void disconnectImportedCoreFromMenu(); } },
     { type: 'separator' },
     { label: 'Quit CoS Next', click: () => app.quit() }
   ];
@@ -214,13 +278,24 @@ app.on('before-quit', (event) => {
   shuttingDown = true;
   void (async () => {
     try {
+      if (importedCoreTunnel) {
+        const disconnected = await importedCoreTunnel.stopWithProof();
+        if (!disconnected) throw new Error('TUNNEL_SHUTDOWN_UNVERIFIED');
+        importedCoreTunnel = null;
+      }
       await mcp?.close(); // Drain local MCP before releasing any durable writer.
       mcp = null;
       await runtime?.stop();
     } catch {
-      // Exiting an ambiguous writer lifecycle must not advertise a healthy shutdown.
-      fullyClosed = true;
-      app.exit(1);
+      // Do not exit and abandon a possibly detached tunnel-client. Retain the
+      // Next writer lock and request operator intervention.
+      shuttingDown = false;
+      await dialog.showMessageBox({
+        type: 'error', title: 'CoS Next — shutdown held',
+        message: 'The Tunnel or local writer could not be proven stopped.',
+        detail: 'App remains running to preserve ownership. Resolve the process before quitting.',
+        buttons: ['Close']
+      });
       return;
     }
     fullyClosed = true;
@@ -247,6 +322,46 @@ void app.whenReady().then(async () => {
       detail: 'Old CoS was not modified. Inspect the Next-only lock and storage before retrying.',
       buttons: ['Close']
     });
+  }
+  // Explicit operator-only imported Tunnel integration probe, always scoped to
+  // the read-only Next MCP endpoint. Never starts automatically in normal use.
+  if (process.env.COS_NEXT_TUNNEL_VERIFY === '1') {
+    let success = false;
+    try {
+      if (!mcp || !runtime || runtime.health.state !== 'READY')
+        throw new Error('NEXT_RUNTIME_NOT_READY');
+      const tunnel = await connectImportedCoreTunnel(runtime, mcp.endpointUrl,
+        path.join(dataDir, 'config.json'));
+      importedCoreTunnel = tunnel;
+      success = await tunnel.connected;
+      console.log('NEXT_IMPORTED_TUNNEL_CONNECTED=' + (success ? 'YES' : 'NO'));
+      console.log('NEXT_IMPORTED_TUNNEL_FINAL_STATE=' + tunnel.state.toLowerCase());
+      const stopped = await tunnel.stopWithProof();
+      console.log('NEXT_IMPORTED_TUNNEL_STOP_VERIFIED=' + (stopped ? 'YES' : 'NO'));
+      if (!stopped) success = false;
+      else importedCoreTunnel = null;
+    } catch {
+      console.log('NEXT_IMPORTED_TUNNEL_TEST=BLOCKED');
+    }
+    try { await mcp?.close(); await runtime?.stop(); }
+    catch { success = false; console.log('NEXT_IMPORTED_TUNNEL_CLEANUP=UNVERIFIED'); }
+    fullyClosed = true;
+    console.log('NEXT_IMPORTED_TUNNEL_TEST=' + (success ? 'PASS' : 'HOLD'));
+    app.exit(success && runtime?.health.state === 'STOPPED' ? 0 : 1);
+    return;
+  }
+  // Operator requested encrypted legacy credential import verification.
+  // No secret value is exported, printed, transmitted, or persisted in plaintext.
+  if (process.env.COS_NEXT_IMPORT_VERIFY === '1') {
+    const storage = await secureStorageStatus();
+    const available = storage.available;
+    const usable = available && await hasSecret('openaiApiKey');
+    console.log('NEXT_IMPORTED_OS_STORAGE=' + (available ? 'AVAILABLE' : 'UNAVAILABLE'));
+    console.log('NEXT_IMPORTED_CONTROL_PLANE_CREDENTIAL=' + (usable ? 'READABLE' : 'UNAVAILABLE'));
+    try { await mcp?.close(); await runtime?.stop(); } catch { /* fail closed */ }
+    fullyClosed = true;
+    app.exit(usable && runtime?.health.state === 'STOPPED' ? 0 : 1);
+    return;
   }
   // Explicit local-only packaged smoke. No remote call or interactive dialog.
   if (process.env.COS_NEXT_LOCAL_SMOKE === '1') {

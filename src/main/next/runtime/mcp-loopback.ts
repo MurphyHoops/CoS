@@ -19,6 +19,7 @@ export async function serveNextMcpLoopback(registration: NextMcpRegistration, po
   const local = createNextMcpHandler(registration);
   const token = randomBytes(24).toString('base64url');
   const endpointPath = '/next/' + token + '/mcp';
+  const metadataPath = '/.well-known/oauth-protected-resource' + endpointPath;
   const server = http.createServer(async (req, res) => {
     const host = req.headers.host ?? '';
     if (!/^127\.0\.0\.1(?::\d{1,5})?$/.test(host)) { error(res, 403, 'invalid_host'); return; }
@@ -26,7 +27,25 @@ export async function serveNextMcpLoopback(registration: NextMcpRegistration, po
     if (origin && !/^http:\/\/127\.0\.0\.1(?::\d{1,5})?$/.test(origin)) {
       error(res, 403, 'invalid_origin'); return;
     }
-    if (req.url?.split('?')[0] !== endpointPath) { error(res, 404, 'not_found'); return; }
+    const requestPath = req.url?.split('?')[0];
+    if (requestPath === metadataPath) {
+      if (req.method !== 'GET') { error(res, 405, 'method_not_allowed'); return; }
+      // RFC 9728 metadata is required by the official tunnel-client's OAuth
+      // discovery. A route-specific token remains necessary even for metadata.
+      // This endpoint is NOT OAuth protected: no authorization server is named.
+      const current = server.address();
+      if (!current || typeof current === 'string') { error(res, 503, 'not_ready'); return; }
+      const body = JSON.stringify({
+        resource: 'http://127.0.0.1:' + current.port + endpointPath,
+        resource_name: 'CoS Next local read-only diagnostics',
+        authorization_servers: [], scopes_supported: []
+      });
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store',
+        'content-length': Buffer.byteLength(body) });
+      res.end(body);
+      return;
+    }
+    if (requestPath !== endpointPath) { error(res, 404, 'not_found'); return; }
     if (!['GET', 'POST', 'DELETE'].includes(req.method ?? '')) {
       error(res, 405, 'method_not_allowed'); return;
     }
