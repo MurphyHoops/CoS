@@ -55,3 +55,18 @@
 Open the Next Preview and select **返回聊天** for conversations, **工作区** for projects and roots, **连接设置** to review/edit Core credentials/Tunnel (manual Connect only), or **智能体与自动化** to inspect the original Goal/Loop/multi-Agent controls. Changes are local to the `chat-on-steroids-next` userData directory, not to original CoS. Do not run both applications against the same old Tunnel ID. If macOS requests Keychain access for Next Safe Storage, approve through the system dialog only; never send a password through chat.
 
 The feature-parity release is still **HOLD** pending real browser/model delivery, user-observed settings save/restart, full Mission/agent recovery and across-platform native packaging. Source build/test verification does not substitute for these gates.
+
+## Interruption reconciliation and local hardening (2026-10-09)
+
+- Restored local Git state at **7608e57** on `next/v4/classic-workflow-first` with a clean working tree before making further changes. Previous full verification finished with **5,029 tests passed + 2 MCP shutdown tests**, 130 skipped, zero failures.
+- Confirmed the latest `classic-validated` Next process remains live with three **Next-owned** Core/Desktop/Plugins Tunnel clients and the original `/Applications/Chat On Steroids.app` is not running. Never started a second tunnel owner or overwrote the running bundle.
+- Inspected the real Next application log: the old UI renderer initialized, its window loaded, and its three tunnels connected. Previous captured GUI screenshot showed the actual original navigation (Return to chat, Workspace, Usage, Plugins, Connection settings, Agents & automation, Activity), not the simplified v4 status dashboard.
+- Added an explicit `test/next/classic-settings-roundtrip.test.ts` verifying reversible UI and Goal preferences survive JSON save/reload in an isolated synthetic Next profile and never modify a separate old-CoS profile. Together with the existing `settings:save` typed IPC tests, this covers the config storage path but **not yet a user-driven UI click/restart**.
+- Added a standalone packaged-app verifier `scripts/verify-next-classic-package.mjs`: checks the correct Next bundle ID, package entrypoint, real chat renderer/preload, eight native ARM64 resources, and macOS code-signing integrity. Successfully ran it against `release-next/classic-validated/mac-arm64/Chat On Steroids Next.app`. This does not trigger network connection or modify any credential.
+- Status remains **LOCAL ALPHA / RELEASE HOLD**. The Next Alpha still needs real user-driven settings roundtrip, verified host identity/ChatGPT Web continuation, optional SIWC subscription-backed inference and cross-platform distribution gates. The classic Workflow retains the optional Chrome companion for old browser-dependent behavior; removing that dependency with feature parity has not been established.
+
+### Latest local regression evidence
+
+- **2026-10-09:** `npm run verify:ci` completed exit 0: **5,032 regular tests passed + 2 independent MCP shutdown tests passed**, 130 skipped, zero failed. The dedicated Next Classic settings test ran together with the existing config/IPC suites.
+- `node scripts/verify-next-classic-package.mjs <absolute .app path>` passed against the already built `release-next/classic-validated/mac-arm64/Chat On Steroids Next.app`. It verified independent bundle identity, correct main/preload/renderer payloads, 8 native resources with Mach-O ARM64 architecture, and bundle code signature.
+- No changes were made to the running Next instance or to user credentials while running these tests; no cloud push.
