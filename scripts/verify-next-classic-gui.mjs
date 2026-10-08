@@ -24,6 +24,13 @@ const oldRoot = path.join(home, 'Library/Application Support/chat-on-steroids');
 const nextRoot = path.join(home, 'Library/Application Support/chat-on-steroids-next');
 await mkdir(oldRoot, { recursive: true, mode: 0o700 });
 await mkdir(nextRoot, { recursive: true, mode: 0o700 });
+// A synthetic account model catalogue lets us exercise the REAL classic composer
+// and typed IPC offline. It is a fixture in this temporary HOME, never a claim
+// that the model is available to a logged-in user or that a browser delivered it.
+await mkdir(path.join(nextRoot, 'state'), { recursive: true, mode: 0o700 });
+await writeFile(path.join(nextRoot, 'state/chat-models.json'), JSON.stringify({
+  observedAt: Date.now(), models: [{ id: 'synthetic-offline-model', label: 'GPT-6', efforts: ['high'] }]
+}), { mode: 0o600 });
 const oldPayload = '{"sentinel":"old CoS untouched by Next UI test"}\n';
 await writeFile(path.join(oldRoot, 'config.json'), oldPayload, { mode: 0o600 });
 const originalHash = createHash('sha256').update(oldPayload).digest('hex');
@@ -163,6 +170,33 @@ try {
   const reloaded=await evaluate("document.documentElement.dataset.theme");
   if (reloaded!==savedTheme) throw new Error('REAL_UI_THEME_SETTING_DID_NOT_SURVIVE_RESTART');
   console.log('NEXT_CLASSIC_GUI_RESTART_ROUNDTRIP=PASS');
+  // Exercise the original UI form, not a direct call to an internal enqueue helper.
+  // No Tunnel credentials, live ChatGPT tab, or browser Companion exist in HOME.
+  await evaluate("document.querySelector('#tabs button[data-tab=home]').click()");
+  await evaluate("document.getElementById('newChat').click()");
+  const selectedModel = await evaluate("[document.getElementById('composerModel').value,document.getElementById('composerReasoning').value]");
+  if (selectedModel?.[0] !== 'synthetic-offline-model' || selectedModel?.[1] !== 'high')
+    throw new Error('SYNTHETIC_OFFLINE_MODEL_NOT_AVAILABLE_IN_REAL_COMPOSER');
+  const marker = 'Next isolated offline composer admission fixture';
+  await evaluate(`(()=>{const el=document.getElementById('chatInput');el.value=${JSON.stringify(marker)};el.dispatchEvent(new Event('input',{bubbles:true}));document.getElementById('composer').requestSubmit();return true})()`);
+  let accepted = null;
+  for (let i = 0; i < 70; i++) {
+    const rows = await evaluate("(async()=>{const r=await window.api.listInputs();return r.ok?r.data.map(x=>({id:x.id,text:x.text,state:x.state,model:x.model,deliveredAt:x.deliveredAt||null})):null})()");
+    accepted = rows?.find(row => row.text === marker) ?? null;
+    if (accepted) break;
+    await delay(100);
+  }
+  if (!accepted || accepted.state !== 'queued' || accepted.deliveredAt)
+    throw new Error('REAL_GUI_OFFLINE_INPUT_NOT_DURABLY_ADMITTED');
+  console.log('NEXT_CLASSIC_GUI_OFFLINE_INPUT_ADMITTED=PASS');
+  await stop();
+  await boot();
+  const restored = await evaluate("(async()=>{const r=await window.api.listInputs();return r.ok?r.data.map(x=>({id:x.id,text:x.text,state:x.state,deliveredAt:x.deliveredAt||null})):null})()");
+  const recovered = restored?.find(row => row.id === accepted.id);
+  if (!recovered || recovered.text !== marker || recovered.state !== 'queued' || recovered.deliveredAt)
+    throw new Error('OFFLINE_GUI_INPUT_LOST_OR_FALSLY_CLAIMED_DELIVERED_AFTER_RESTART');
+  console.log('NEXT_CLASSIC_GUI_OFFLINE_INPUT_RESTART=PASS');
+  console.log('NEXT_CLASSIC_GUI_OFFLINE_NOT_DELIVERED=PASS');
   await stop();
   const afterHash=createHash('sha256').update(await readFile(path.join(oldRoot,'config.json'))).digest('hex');
   if (afterHash!==originalHash) throw new Error('ORIGINAL_PROFILE_MODIFIED');
