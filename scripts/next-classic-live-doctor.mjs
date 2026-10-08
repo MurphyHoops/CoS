@@ -65,7 +65,9 @@ export async function inspectLiveNext(){
     handshakeFreshCount:0,handshakeExpectedCount:0,handshakes:{},
     bridgeHttpAuthenticationEnforced:null,bridgeListener:false,
     latestAppStartedAt:null,latestTunnelConnectedAt:null, modelCatalogueCached:false,
-    chromeChatGPTTabs:null,readyForLiveModelProbe:false,requiresAction:[]};
+    chromeChatGPTTabs:null,controlPlaneReady:false,coreToolRegistryVerified:false,
+    recipientIdentityVerified:false,providerReplyVerified:false,
+    readyForLiveModelProbe:false,requiresAction:[]};
   const p=await run('/bin/ps',['-axo','pid=,ppid=,command='],{maxBuffer:4_000_000});
   const lines=p.stdout.split('\n');
   const next=lines.find(s=>s.includes('/Chat On Steroids Next.app/Contents/MacOS/Chat On Steroids Next') && !s.includes('Helper'));
@@ -116,7 +118,13 @@ export async function inspectLiveNext(){
   if(!data.modelCatalogueCached)data.requiresAction.push('Discover real ChatGPT account model options');
   // A historical connected log and a running tunnel are preliminary evidence only.
   // Final readiness still needs exact authenticated browser/recipient observation.
-  data.readyForLiveModelProbe=data.appRunning && data.tunnelProcessCount>0 && data.handshakeExpectedCount>0 && data.handshakeFreshCount===data.handshakeExpectedCount && data.bridgeHttpAuthenticationEnforced===true && data.modelCatalogueCached;
+  data.controlPlaneReady=data.appRunning && data.tunnelProcessCount>0 &&
+    data.handshakeExpectedCount>0 && data.handshakeFreshCount===data.handshakeExpectedCount &&
+    data.bridgeHttpAuthenticationEnforced===true && data.modelCatalogueCached;
+  // A read-only local doctor cannot bind a ChatGPT host principal or prove tool
+  // registration. Do not promote its control-plane state into model-send authority.
+  data.readyForLiveModelProbe=false;
+  if(data.controlPlaneReady) data.requiresAction.push('Verify actual ChatGPT Core tool registry and recipient identity before sending a live fixture');
   return data;
 }
 

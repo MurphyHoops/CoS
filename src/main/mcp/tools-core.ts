@@ -265,6 +265,34 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
         'Absolute native paths copied from command output are also accepted when they resolve inside one of these roots; globs work in either spelling.'
       : 'Paths require an approved virtual root in the form /<root>/...; no root is currently approved. Globs are supported after a root is approved.';
 
+  // Next Classic preserves the full v3 Core workflow, but an earlier experimental
+  // Next connector advertised these two read-only diagnostic names. ChatGPT may keep
+  // that schema cached after the server is upgraded. Serve truthful compatibility
+  // answers *only* in Next Classic, never in the original v3 app.
+  // No identity/mutation authority is granted by either tool.
+  if (process.env.COS_NEXT_CLASSIC_WORKFLOW === '1') {
+    reg.register('runtime_health', toolDeclaration('runtime_health', () => ({
+      title: 'CoS Next Classic runtime health',
+      description: 'Read the actual Classic connection state and freshness of its last OpenAI control-plane handshake. This is not ChatGPT user identity or Mission authorization.',
+      inputSchema: z.object({}).strict(),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+    })), async () => {
+      // Deferred import keeps the Core registration independent of connection startup:
+      // connection -> MCP server -> Core otherwise forms a module initialization cycle.
+      const { getStatus } = await import('../connection.js');
+      const status = getStatus();
+      const at = status.handshakeAt;
+      const fresh = typeof at === 'number' && at > 0 && at <= Date.now() && Date.now() - at <= 95_000;
+      const result = {
+        runtime: 'NEXT_CLASSIC', connection_state: status.state,
+        openai_control_plane_handshake_fresh: fresh,
+        identity_verified: false, mission_authorized: false,
+        provider_reply_verified: false
+      };
+      return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result };
+    });
+  }
+
   // Host-provided MCP metadata is useful for diagnosing unattributed calls, but is
   // NOT mission ownership evidence. This read-only tool cannot bind sessions or
   // grant access, and returns only per-process, salted, short fingerprints.
@@ -282,6 +310,19 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
     })), async () => {
       const result = currentHostIdentityDiagnostics();
       return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: { ...result } };
+    });
+  }
+
+  else if (process.env.COS_NEXT_CLASSIC_WORKFLOW === '1') {
+    reg.register('identity_diagnostics', toolDeclaration('identity_diagnostics', () => ({
+      title: 'CoS Next host identity diagnostics (opt-in)',
+      description: 'This optional read-only diagnostic requires explicit local COS_NEXT_IDENTITY_DIAGNOSTICS=1 startup authorization. It cannot authorize a mission or recover a ChatGPT session.',
+      inputSchema: z.object({}).strict(),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+    })), async () => {
+      const result = { status: 'IDENTITY_DIAGNOSTICS_DISABLED',
+        identity_verified: false, mission_authorized: false };
+      return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result };
     });
   }
 

@@ -58,9 +58,10 @@ describe('portable browser-backed feature parity', () => {
     // intentionally false on macOS 12.0-12.2, and this policy test must not depend on the
     // Darwin release of the machine running Vitest.
     const config = defaultConfig('darwin', '21.4.0');
-    // The optional identity probe is part of the declared potential surface,
-    // but remains absent from tools/list unless locally enabled.
+    // The Next-only cached diagnostic names are part of the declared potential
+    // Core surface; original v3 still registers neither unless locally enabled.
     expect(surfaceDefinition('core').tools).toEqual([
+      'runtime_health',
       'identity_diagnostics',
       'read',
       'view_image',
