@@ -39,3 +39,19 @@
 - Existing original installation: `/Applications/Chat On Steroids.app` (unchanged).
 - Both a running old app and Next must never own the same original Tunnel ID simultaneously.
 - Work locally; do not push a PR, register fresh MCP connectors, export secret keys, or publish the alpha before the user explicitly authorizes cloud promotion.
+
+## Interruption recovery and second local native build (2026-10-08 23:44 CST)
+
+- Reconciled the actual worktree and prior CI receipts before proceeding; previous complete local `verify:ci` recorded **5,029 standard tests + 2 MCP shutdown tests passed, 130 skipped**, with no failures. No repository changes were replayed blindly.
+- Old preview was gracefully stopped, then the newest Next Classic preview was activated successfully from a separate build folder. The application created a **1728 × 1084** native window, logged `app started` and `window loaded`, and maintained its own local data directory. Original CoS app and Tunnel client were not launched.
+- The complete Original CoS `src/renderer` and `src/preload/index.ts` remain the frontend and IPC. The previous experimental local dashboard is retained in Git but not used to replace chats or settings.
+- Correct macOS ARM64 prebuilds (PTY, Tree-sitter, Tree-sitter-bash) are included in the Next bundle. An additional native Desktop addon gap was identified and closed. The new **local-only** staging script `node scripts/stage-next-classic-desktop.mjs` copies two version-matched arm64 binaries, **not credentials**, from the existing installed original CoS into **gitignored** `resources/packaging/desktop/darwin/arm64`. The `electron-builder.next.yml` now bundles them under `Contents/Resources/desktop` in Next. Binary presence, architecture, dynamic libraries, ad-hoc signature envelope and packaged app launch were checked.
+- Latest tested local preview path: `release-next/classic-validated/mac-arm64/Chat On Steroids Next.app` (independent `com.chatonsteroids.next`). **Keep the original installed `/Applications/Chat On Steroids.app` unchanged.**
+- The original UI `settings:save` typed IPC and its durable JSON transactional implementation are retained. Prior automated IPC tests exercise setting changes and profile/key ownership in isolated temporary directories. **A hands-on save/restart test inside the user's live window remains unverified**: macOS denied terminal-driven Accessibility clicks (`-25211`), so we did not bypass permissions or silently modify any real preference.
+- ChatGPT subscription-backed inference through browser Web UI **still requires a supported transport**. Classic CoS browser delivery depends on its companion for exact conversation identity; restoring its working UI is not proof that extension-free webpage wake, multi-Agent continuation or the v4 verified-principal gates have been solved.
+
+### User-visible Classic workflow
+
+Open the Next Preview and select **返回聊天** for conversations, **工作区** for projects and roots, **连接设置** to review/edit Core credentials/Tunnel (manual Connect only), or **智能体与自动化** to inspect the original Goal/Loop/multi-Agent controls. Changes are local to the `chat-on-steroids-next` userData directory, not to original CoS. Do not run both applications against the same old Tunnel ID. If macOS requests Keychain access for Next Safe Storage, approve through the system dialog only; never send a password through chat.
+
+The feature-parity release is still **HOLD** pending real browser/model delivery, user-observed settings save/restart, full Mission/agent recovery and across-platform native packaging. Source build/test verification does not substitute for these gates.

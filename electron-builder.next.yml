@@ -72,6 +72,11 @@ mac:
       to: node_modules/tree-sitter-bash/prebuilds/darwin-${arch}
       filter: ['**/*']
   extraResources:
+    # Stage from installed, version-matched CoS with:
+    # node scripts/stage-next-classic-desktop.mjs
+    - from: resources/packaging/desktop/darwin/${arch}
+      to: desktop
+      filter: ['macos-desktop-addon.node', 'libcos-desktop.dylib']
     - from: resources/packaging/tunnel/darwin/${arch}
       to: tunnel
       filter: ['**/*']
