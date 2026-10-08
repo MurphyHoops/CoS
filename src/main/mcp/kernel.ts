@@ -24,6 +24,7 @@ import { WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-compu
 
 import { rawPromises as fs } from '../rawfs.js';
 import { beginToolTiming, inboundRequestId, inboundPublication } from './inbound.js';
+import { withHostIdentityEvidence } from './host-identity.js';
 import { McpServer, type ServerContext } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { Capabilities, Root } from '../../shared/types.js';
@@ -361,8 +362,8 @@ function setCallerConversation(context: CallContext, conversationId: string | nu
   context.caller.sessionId = exact?.conversationId === conversationId ? exact.sessionId : null;
 }
 
-/** The only SDK handler context field this layer consumes; request identity comes from ingress ALS. */
-type McpCallContext = Pick<ServerContext, 'sessionId'>;
+/** Request identity comes from ingress ALS; host metadata is separate correlation-only evidence. */
+type McpCallContext = Pick<ServerContext, 'sessionId' | 'mcpReq' | 'http'>;
 
 /**
  * ChatGPT's id for this request, from `x-request-id`, without the per-attempt suffix.
@@ -1299,8 +1300,10 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
         inputSchema: toolSchema(config.inputSchema),
         ...(config.outputSchema ? { outputSchema: toolSchema(config.outputSchema) } : {})
       }, ((args: never, mcpCtx?: McpCallContext) =>
-        dispatch(name, args, mcpCtx?.sessionId ?? null, requestIdOf(mcpCtx), surface, () =>
-          handler(args)
+        withHostIdentityEvidence(mcpCtx, () =>
+          dispatch(name, args, mcpCtx?.sessionId ?? null, requestIdOf(mcpCtx), surface, () =>
+            handler(args)
+          )
         )) as never);
     },
     guarded(cap, name, fn) {
