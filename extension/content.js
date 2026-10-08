@@ -41,7 +41,7 @@
   // the build id proves it is the recorder shipped with the currently running companion.
   // Both are required because a behavioral change can keep the same protocol surface while
   // still requiring already-open ChatGPT pages to replace their old isolated-world script.
-  const RECORDER_BUILD_ID = 'cos-3.1.15-companion-provider-picker-v1';
+  const RECORDER_BUILD_ID = 'cos-3.1.16-pty-capacity-uuid-origin-v2';
   const recorderHandle = {
     version: RECORDER_VERSION,
     buildId: RECORDER_BUILD_ID,
@@ -10754,7 +10754,11 @@
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(claimed)) return;
     const raw = Array.isArray(event.data.requestIds) ? event.data.requestIds : [];
     if (raw.length === 0 || raw.length > 16) return;
-    const requestIds = [...new Set(raw.filter((id) => typeof id === 'string' && /^wfr_[a-zA-Z0-9_-]{1,96}$/.test(id)))];
+    // Match the response observer's two exact request-id dialects. This is
+    // format validation, not authorization: /correlations still requires the
+    // current concrete conversation and an acknowledged server-side join.
+    const requestIds = [...new Set(raw.filter((id) => typeof id === 'string' &&
+      /^(?:wfr_[a-zA-Z0-9_-]{1,96}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.test(id)))];
     if (requestIds.length === 0) return;
     const observedAt = Number.isFinite(event.data.observedAt) ? event.data.observedAt : Date.now();
     confirmStreamRequestOrigin(claimed, requestIds, observedAt);

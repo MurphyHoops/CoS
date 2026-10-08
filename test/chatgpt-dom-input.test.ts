@@ -684,6 +684,14 @@ describe('rendered temporary-chat state independent of language', () => {
     toggle(label, true);
     expect(api.temporaryChatReady()).toBe(true);
   });
+  it('recognizes ChatGPT\'s translated close action as active temporary-chat evidence', () => {
+    const control = document.createElement('button');
+    control.setAttribute('aria-label', '关闭临时聊天');
+    document.body.append(control);
+    expect(api.temporaryChatReady()).toBe(true);
+    control.setAttribute('aria-label', '开启临时聊天');
+    expect(api.temporaryChatReady()).toBe(false);
+  });
   it('does not mistake a hidden checked glyph, English wording or URL intent for active mode', () => {
     dom.reconfigure({ url: 'https://chatgpt.com/?temporary-chat=true' });
     toggle('Turn off temporary chat', false);

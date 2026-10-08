@@ -2408,7 +2408,7 @@ var CLF_DOM = (() => {
       if (button.closest(`${OWN_SURFACES}, [data-message-author-role], [data-testid^="conversation-turn-"]`) || !button.getClientRects().length) return false;
       // The provider renders both icons at once. Only the visible checked glyph proves
       // the mode; translated labels and the requested URL are not activation receipts.
-      return [...button.querySelectorAll('svg use')].some(use => {
+      const checkedGlyph = [...button.querySelectorAll('svg use')].some(use => {
         const href = use.getAttribute('href') || use.getAttribute('xlink:href') || '';
         if (href.slice(href.lastIndexOf('#')) !== '#chat-temp-checked') return false;
         for (let node = use.parentElement; node; node = node.parentElement) {
@@ -2417,6 +2417,15 @@ var CLF_DOM = (() => {
         }
         return true;
       });
+      // ChatGPT's current toolbar exposes the active state as an action label
+      // ("关闭临时聊天") instead of the old checked sprite. Treat only explicit
+      // close/turn-off labels as proof; the open/enable action is not sufficient.
+      const label = `${button.getAttribute('aria-label') || ''} ${button.getAttribute('title') || ''}`.trim();
+      const activeLabel = /(?:关闭|结束|退出)\s*(?:此)?临时聊天|(?:turn off|close|end)\s+(?:the\s+)?temporary chat|一時チャットをオフにする|Temporären Chat ausschalten/i.test(label);
+      // On sprite-based controls both on/off actions can retain the same stale
+      // label during a transition. If sprites exist, their actual visible state
+      // wins; fall back to the action label only for the newer sprite-less UI.
+      return checkedGlyph || (button.querySelectorAll('svg use').length === 0 && activeLabel);
     }), false),
     confirmTemporaryChatIntroduction: () => {
       const dialog = [...document.querySelectorAll('[role="dialog"]')].find(node =>

@@ -9645,6 +9645,21 @@ describe('evidence from the page context', () => {
     ]);
   });
 
+  it('confirms a provider UUID request id from the live response under the exact current chat', async () => {
+    live = await harness();
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const requestId = 'f207d99c-6c29-4da8-8dc0-ea8b9ab4c3f8';
+    live.reply.set('correlate', () => ({ ok: true, data: { conversationId, confirmed: [requestId] } }));
+    live.window.dispatchEvent(new live.window.MessageEvent('message', {
+      source: live.window as unknown as Window, origin: 'https://chatgpt.com',
+      data: { type: 'cos-request-origin', conversationId, requestIds: [requestId] }
+    }));
+    await settle();
+    expect(live.sent.filter(message => message.type === 'correlate')).toEqual([
+      expect.objectContaining({ conversationId, calls: [expect.objectContaining({ requestId })] })
+    ]);
+  });
+
   it('retains one-shot stream proof through a failed ACK without overlapping or repeating a confirmed request', async () => {
     live = await harness();
     const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', requestId = 'wfr_retry_once';
@@ -14785,7 +14800,7 @@ describe('one live isolated-world recorder per document', () => {
     await expect(live.runtimeMessage({ type: 'clf-recorder-ping' })).resolves.toEqual({
       ok: true,
       recorderVersion: 14,
-      recorderBuildId: 'cos-3.1.15-companion-provider-picker-v1'
+      recorderBuildId: 'cos-3.1.16-pty-capacity-uuid-origin-v2'
     });
   });
 

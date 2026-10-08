@@ -43,6 +43,8 @@ describe('extension release metadata', () => {
     expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 15;');
     expect(backgroundSource).toContain(`const COMPANION_BUILD_ID = '${COMPANION_BUILD_ID}';`);
     expect((await fs.readFile(path.join(process.cwd(), 'extension', 'companion-build.txt'), 'utf8')).trim()).toBe(COMPANION_BUILD_ID);
+    const recorderSource = await fs.readFile(path.join(process.cwd(), 'extension', 'content.js'), 'utf8');
+    expect(recorderSource).toContain(`const RECORDER_BUILD_ID = '${COMPANION_BUILD_ID}';`);
 
     // Discovery has both a cached-port refresh path and a first-scan path. Both must learn the
     // app's expected build id or the popup diagnoses an unpacked-copy mismatch only on its second
@@ -1934,7 +1936,7 @@ describe('extension command delivery', () => {
     worker.tabsSendMessage.mockResolvedValueOnce({
       ok: true,
       recorderVersion: 14,
-      recorderBuildId: 'cos-3.1.15-companion-provider-picker-v1'
+      recorderBuildId: 'cos-3.1.16-pty-capacity-uuid-origin-v2'
     });
 
     await worker.installed('update');
@@ -2093,7 +2095,7 @@ describe('extension revival delivery', () => {
       ? {
           ok: true,
           recorderVersion: 14,
-          recorderBuildId: 'cos-3.1.15-companion-provider-picker-v1'
+          recorderBuildId: 'cos-3.1.16-pty-capacity-uuid-origin-v2'
         }
       : { ok: true, claimed: true };
 

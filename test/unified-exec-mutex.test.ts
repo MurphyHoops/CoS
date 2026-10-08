@@ -56,7 +56,7 @@ it('does not let a lock attempt barge ahead of an already queued waiter', async 
   }
 });
 
-it('refuses new capacity without evicting a completed unread result', async () => {
+it('keeps completed unread output without charging a live terminal slot', async () => {
   const manager = new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS);
   const unreadId = manager.allocateProcessId();
   const request = (processId: number, command: string, yieldTimeMs: number) => ({
@@ -84,10 +84,10 @@ it('refuses new capacity without evicting a completed unread result', async () =
     ]);
 
     while (fillerIds.length < MAX_UNIFIED_EXEC_PROCESSES - 1) fillerIds.push(manager.allocateProcessId());
-    const refusedId = manager.allocateProcessId();
-    await expect(manager.execCommand(request(refusedId, "console.log('must-not-run')", 100))).rejects.toThrow(
-      `too many retained terminal sessions (limit ${MAX_UNIFIED_EXEC_PROCESSES})`
-    );
+    const nextId = manager.allocateProcessId();
+    const next = await manager.execCommand(request(nextId, "console.log('new-command-ran')", 1000));
+    expect(next.rawOutput.toString('utf8')).toContain('new-command-ran');
+    expect(next.exitCode).toBe(0);
 
     expect(manager.backgroundState(new Set([unreadId])).exitedUnread).toEqual([
       { processId: unreadId, exitCode: 7 }
@@ -103,6 +103,39 @@ it('refuses new capacity without evicting a completed unread result', async () =
     expect(drained.exitCode).toBe(7);
   } finally {
     for (const processId of fillerIds) manager.releaseProcessId(processId);
+    await manager.terminateAllProcesses();
+  }
+});
+
+it('keeps the 64-child safety cap when launches are still in flight', async () => {
+  const manager = new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS);
+  const liveId = manager.allocateProcessId();
+  const request = (processId: number) => ({
+    command: [process.execPath, '-e', 'setInterval(() => {}, 1000)'],
+    shellType: process.platform === 'win32' ? ('powershell' as const) : ('bash' as const),
+    hookCommand: 'live capacity probe', processId, yieldTimeMs: 250,
+    maxOutputTokens: undefined, truncationPolicy, cwd: process.cwd(),
+    displayCwd: process.cwd(), env: applyUnifiedExecEnv(process.env), tty: false
+  });
+  const pendingIds: number[] = [];
+  try {
+    expect((await manager.execCommand(request(liveId))).processId).toBe(liveId);
+    // Model the bounded asynchronous spawn window without creating 63 real children.
+    const launching = (manager as any).launchingProcessIds as Set<number>;
+    while (pendingIds.length < MAX_UNIFIED_EXEC_PROCESSES - 1) {
+      const id = manager.allocateProcessId();
+      pendingIds.push(id);
+      launching.add(id);
+    }
+    const refusedId = manager.allocateProcessId();
+    await expect(manager.execCommand(request(refusedId))).rejects.toThrow(
+      `too many active terminal sessions (limit ${MAX_UNIFIED_EXEC_PROCESSES})`
+    );
+    manager.releaseProcessId(pendingIds.pop()!);
+    const admittedId = manager.allocateProcessId();
+    expect((await manager.execCommand({ ...request(admittedId), command: [process.execPath, '-e', 'console.log("admitted")'], yieldTimeMs: 1000 })).exitCode).toBe(0);
+  } finally {
+    for (const id of pendingIds) manager.releaseProcessId(id);
     await manager.terminateAllProcesses();
   }
 });

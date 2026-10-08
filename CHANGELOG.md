@@ -15,6 +15,19 @@ self-reloads once when it sees a newer expected build. Existing ChatGPT tabs are
 that reload; a normal page refresh is sufficient if a tab still shows stale UI. Manual
 chrome://extensions reload remains the fallback only for an intentionally different unpacked path.
 
+## [3.1.16] — 2026-10-08
+
+### Terminal capacity and browser request identity
+
+- Count live child processes and in-flight launches against the 64-session terminal ceiling, while retaining completed unread output without consuming execution capacity.
+- Recognize exact UUID-form and `wfr_` ChatGPT request identifiers from bounded, conversation-matched page evidence. Unproven requests still fail closed.
+- Use translated temporary-chat action labels only where the provider's visible checked-sprite evidence is unavailable.
+- Restore complete build scripts, dependency manifest and cross-platform packaging checks from the 3.1.15 development branch.
+
+The provider's HTTP 429 history limitation and missing page identity proof cannot be bypassed by this update.
+
+See [3.1.16 release notes](docs/release-notes/v3.1.16.md).
+
 ## [3.1.15] — 2026-09-27
 
 ### Restore new-chat execution and harden browser recovery
