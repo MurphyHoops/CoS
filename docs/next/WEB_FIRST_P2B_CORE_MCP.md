@@ -268,3 +268,25 @@ receives its real return after a separate user-confirmed macOS native approval.
   intentionally left undisturbed.** An upgrade of diagnostic UI is not worth
   disconnecting a previously working control-plane session while platform
   action refresh remains pending.
+
+### P2c catalogue-audit release check
+
+- `readWebFirstLocalToolList` performs a real, bounded, loopback-only MCP
+  `tools/list` request, requires the exact five read-only server tool names,
+  and never leaks the local random-route bearer URL.
+- `runtime_health` retains its existing diagnostic fields and now reports
+  `server_tools`, `server_toolset=web-first-readonly-p2b-v1`, and
+  `chatgpt_tool_registry=NOT_VERIFIED`. These describe the **local server only**.
+- Local menu `本地项目 → 核对 MCP 工具清单（仅本地）` shows actual local MCP
+  discovery and distinguishes it from the separately frozen ChatGPT app
+  tool snapshot. The sidebar also reflects this distinction.
+- Focused Web-First suite: 21 passed, 1 opt-in real-network test skipped.
+- Complete `npm run verify:ci`: 225 regular files / **5,067 tests passed**,
+  **131 skipped**, plus **2** separate MCP shutdown tests passed; **0 failed**.
+- macOS ARM64 standalone preview packaged and executed against an isolated
+  offline test profile: startup, project durability, native input, local MCP
+  fixture read, tool/menu checks and shutdown all passed.
+- **The running authenticated user's Web-First app and active Core Tunnel are
+  intentionally left undisturbed.** An upgrade of diagnostic UI is not worth
+  disconnecting a previously working control-plane session while platform
+  action refresh remains pending.
