@@ -59,3 +59,7 @@ Under ChatGPT model cooldown, approved local checks may still complete without a
 Inside an ACTIVE Goal, select **2 / 3 / 4** under **本地 Worker 并行数**, then click **启动只读 Worker 预检**. One macOS approval admits that group of fixed, independent directory/Git inspection jobs; each produces a separate durable local receipt. A checked Git result may report failure when the project is not a Git repository; it is not a failed model turn.
 
 Separately, **AI Worker 分工** lets you add/remove up to four planned roles (规划/开发/验证/审计). These are **registered only** and explicitly display `等待可信会话授权`; they do not send ChatGPT prompts. A stale plan moves an old role to review. Goal pause/cancel cancels waiting roles and stops active local checks. See `P34B_MULTIWORKER_NATIVE_FIRST.md` for precise safety and pending real AI-agent requirements.
+
+## P3.4-C one-click local acceptance
+
+Choose **本地项目 → 运行一键本机功能验收（只读）** to check current registered projects, Goal/plan/job/Worker ledger readability, grant storage, rate-limit state, website loading, the local Core MCP catalogue and broker handshake. Read the **通过 / 待完善 / 异常** breakdown, not only the PASS count. This view does not reveal stored secrets or inspect conversation text, issue a model turn, edit a project or change permission. The verification of ChatGPT-side tool publication and true multi-AI Worker execution remains HOLD until separately proved. Full evidence and failure boundaries are in `P34C_FULL_ACCEPTANCE_REVIEW_20261009.md`.

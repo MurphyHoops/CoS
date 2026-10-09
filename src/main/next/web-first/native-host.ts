@@ -34,6 +34,7 @@ import {conversationFromUrl,VISIBLE_REPLY_SCRIPT,WebReplySettleTracker,WebFirstR
 import {WebFirstWebOutbox} from './web-outbox.js';
 import {sendNativeWebFirstMessage} from './native-web-input.js';
 import {randomUUID} from 'node:crypto';
+import {summarizeNativeAcceptance,type AcceptanceRow} from './native-acceptance.js';
 import {createContinuityLease,assessContinuity,type ContinuityLease} from './continuity-gate.js';
 import {createWebFirstCoreLoopback} from './core-loopback.js';
 import {readWebFirstLocalToolList,EXPECTED_READ_ONLY_CORE_TOOLS} from './core-catalogue.js';
@@ -57,6 +58,7 @@ export interface NativeWebHost {
   snapshotVisibleAssistant:()=>Promise<VisibleWebReply|null>;
   testRecoveryOverlayOffline?:()=>Promise<boolean>;
   testGoalWorkbenchOffline?:()=>Promise<boolean>;
+  testNativeAcceptanceOffline?:()=>Promise<boolean>;
 }
 export function launchNextWebFirstHost(options: {
   /** Only a fixture launch may use data URLs; the production path is fixed. */
@@ -1171,6 +1173,55 @@ export function launchNextWebFirstHost(options: {
       buttons:['关闭']
     });
   };
+  /** Repeatable in-product acceptance with no secrets, filesystem contents,
+   * model turns, permission changes, or automatic project mutations. */
+  const runNativeAcceptance=async()=>{
+    const probe=await Promise.allSettled([
+      projects.list(),taskLedger.list(),planLedger.list(),localJobs.list(),
+      aiWorkers.list(),grants.inspect(),throttle.status()
+    ]);
+    const names=['已登记项目','Goal 状态记录','分步计划记录','本地操作收据',
+      'AI Worker 分工','本地权限配置','限流恢复账本'];
+    const rows:AcceptanceRow[]=probe.map((x,i)=>{
+      let detail='记录无效或访问失败；保留原文件，禁止自动操作';
+      if(x.status==='fulfilled'){
+        if(i<5&&Array.isArray(x.value))detail=`可安全读取；记录 ${x.value.length} 项`;
+        else if(i===5){
+          const grantsValue=x.value as Awaited<ReturnType<typeof grants.inspect>>;
+          detail=`可安全读取；永久授权 ${grantsValue.persistent.length} 项，本次运行 ${grantsValue.session.length} 项`;
+        }else if(i===6){
+          const rate=x.value as Awaited<ReturnType<typeof throttle.status>>;
+          detail=`可安全读取；模型 ${rate.model}，历史列表 ${rate.history}（不是服务端配额证明）`;
+        }
+      }
+      return {name:names[i]??'本地记录',state:x.status==='fulfilled'?'PASS' as const:'FAIL' as const,detail};
+    });
+    const nativeReady=status.state==='loaded'&&
+      (status.location==='chatgpt'||status.location==='offline-test');
+    rows.push({name:'ChatGPT 网页容器',state:nativeReady?'PASS':'HOLD',
+      detail:offline?'隔离测试网页已加载；并非真实模型验收':
+        nativeReady?'主页加载正常；账号登录与模型额度独立核验':'网页尚未进入可验证的加载完成状态'});
+    let coreList:ReadonlyArray<string>|null=null;
+    if(mcpService){try{coreList=await readWebFirstLocalToolList(mcpService.endpointUrl);}catch{/* reported FAIL below */}}
+    rows.push({name:'本地 MCP 工具清单',state:coreList?'PASS':mcpService?'FAIL':'HOLD',
+      detail:coreList?`本机 ${coreList.length} 个工具通过精确清单验证；不代表远端工具已发布`:
+        mcpService?'本机工具清单未通过验证':'本机 MCP 尚未由原生界面启用'});
+    const connected=mcpState==='REMOTE_CONNECTED'&&coreTunnel?.alive===true;
+    rows.push({name:'Core Tunnel 控制平面',state:connected?'PASS':'HOLD',
+      detail:connected?'本机确认真实控制平面握手':'尚无同时满足已握手和存活证明的 Core Broker'});
+    rows.push({name:'ChatGPT 工具发布/调用者身份',state:'HOLD',
+      detail:'无法仅靠本机数据证明平台已发布所有工具或当前调用者身份；不提升权限'});
+    rows.push({name:'真实多 AI Worker 执行',state:'HOLD',
+      detail:'角色登记已实现，独立模型会话、执行回执、限额与冲突隔离尚未完整验收'});
+    return summarizeNativeAcceptance(rows);
+  };
+  const showNativeAcceptance=async()=>{
+    const output=await runNativeAcceptance();
+    if(!owner.isDestroyed())await dialog.showMessageBox(owner,{
+      type:output.fail?'warning':'info',title:'CoS Next · 一键本机功能验收',
+      message:output.headline,detail:output.detail,buttons:['关闭']
+    });
+  };
   const manageRateLimit=async()=>{
     if(owner.isDestroyed())return;
     try{
@@ -1246,6 +1297,7 @@ export function launchNextWebFirstHost(options: {
       {label:'添加项目目录（仅本地登记）',click:()=>{void addProjectFromNativePicker();}},
       {label:'查看登记与 Core MCP 状态',click:()=>{void showLocalProjectStatus();}},
       {label:'核对 MCP 工具清单（仅本地）',click:()=>{void showCoreCatalogue();}},
+      {label:'运行一键本机功能验收（只读）',click:()=>{void showNativeAcceptance();}},
       {type:'separator'},
       {label:'管理/撤销只读授权',click:()=>{void manageReadGrants();}},
       {label:'撤销全部只读授权',click:()=>{void revokeAllReadGrants();}},
@@ -1512,6 +1564,13 @@ export function launchNextWebFirstHost(options: {
     if(!window.isDestroyed())window.close();
     return found;
   };
+  const testNativeAcceptanceOffline=async():Promise<boolean>=>{
+    if(!offline)throw Error('NATIVE_AUDIT_OFFLINE_ONLY');
+    const output=await runNativeAcceptance();
+    return output.fail===0&&output.pass>=8&&output.hold>=2&&
+      output.detail.includes('ChatGPT 工具发布/调用者身份')&&
+      output.detail.includes('真实多 AI Worker 执行');
+  };
   const testRecoveryOverlayOffline=async():Promise<boolean>=>{
     if(!offline||owner.isDestroyed())throw Error('RECOVERY_TEST_ONLY_OFFLINE');
     pageRecovery.renderFailure(-105);
@@ -1526,5 +1585,5 @@ export function launchNextWebFirstHost(options: {
   return {window:owner,status:()=>({...status}),reload:()=>view.webContents.reload(),diagnostics,
     nativeProjects:()=>projects.list(),enableNativeCore,disableNativeCore,
     getCorePosture:()=>mcpState,snapshotVisibleAssistant,
-    ...(offline?{testRecoveryOverlayOffline,testGoalWorkbenchOffline}:{})};
+    ...(offline?{testRecoveryOverlayOffline,testGoalWorkbenchOffline,testNativeAcceptanceOffline}:{})};
 }
