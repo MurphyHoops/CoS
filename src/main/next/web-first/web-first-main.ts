@@ -100,6 +100,9 @@ app.whenReady().then(async()=>{
         await new Promise(resolve=>setTimeout(resolve,2900));
       }
       if(!host.window.isVisible())throw Error('WEBFIRST_OFFLINE_MAIN_WINDOW_NOT_VISIBLE');
+      if(!await host.testRecoveryOverlayOffline?.())
+        throw Error('WEBFIRST_OFFLINE_RECOVERY_OVERLAY_FAILED');
+      process.stdout.write('WEB_FIRST_OFFLINE_RECOVERY_OVERLAY_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_MAIN_WINDOW_VISIBLE_PASS\n');
       if((await host.nativeProjects()).length!==1)
         throw Error('WEBFIRST_OFFLINE_PROJECT_UI_NOT_AVAILABLE');

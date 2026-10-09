@@ -285,3 +285,40 @@ chat navigation, expiry or App exit, and does not store any credentials or
 initiate a ChatGPT model turn. It does **not** grant write/exec permissions or
 activate unattended autopilot. The existing **one-shot** continuation retains
 its separate explicit native confirmation.
+
+## P3j — white ChatGPT pane triage and fail-visible recovery (2026-10-09)
+
+**User report:** Native project sidebar and Core Tunnel are operational, but
+ChatGPT's `WebContentsView` occupies the remaining window with a solid white
+area and no chat controls. This is **not** equivalent to Core MCP connectivity.
+Mac-wide unauthenticated `curl` to `https://chatgpt.com/` returned HTTP 403,
+but that result alone cannot establish the logged-in embedded Electron page's
+actual HTTP status or prove an account/authentication problem.
+
+**Repair:** A first-party `PageRecoveryGate` tracks sanitized *main-frame*
+HTTP status codes, network navigation errors, renderer disappearance, and a
+sustained truly empty DOM. It never reads page text, HTML, cookies, message
+identifiers, account information, or auth redirect URLs. Electron now overlays
+a separate sandboxed **no-JavaScript, no-network** error panel above the blank
+ChatGPT pane, with a readable reason and explicit native reload instructions.
+The overlay is torn down on legitimate navigation and on window close. A
+persistently empty fully loaded ChatGPT document may be reloaded once per app
+process **only if it has no composer, visible UI or interactive buttons**.
+A nonresponsive renderer is surfaced for manual recovery, never auto-retried.
+
+The native `ChatGPT 网页 → 安全重新加载网页（保留登录）` menu calls
+`reloadIgnoringCache`; no cookies or project data are cleared. `检查网页健康状态`
+now exposes only main-document HTTP status, recovery category, whether an
+empty-page reload has already occurred, aggregate status-code totals and
+non-content DOM input counts. Loading errors must not silently become a
+successful `did-finish-load` health claim.
+
+**Regression:** Pure tests cover login/loading/content guards, no repeated
+reload, 403-only metadata, network errors, renderer loss and 3x nonresponsive
+polling. Packaged ARM64 Electron offline smoke proves a **real native recovery
+WebContentsView overlay is mounted at nonzero dimensions**, alongside all
+previous main-window, MCP file, task, web send/receive, grant and receipt
+checks. Full regular and MCP shutdown tests pass. This verifies the native
+failure UI, but **not** real account-page restoration: perform a controlled
+restart with the existing login partition and collect only opt-in sanitized
+page/network diagnostics before declaring the user-facing blank screen fixed.

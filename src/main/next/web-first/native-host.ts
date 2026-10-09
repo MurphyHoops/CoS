@@ -12,6 +12,7 @@ import {
   classifyWebFirstNavigation
 } from './host-policy.js';
 import {newWebHealthTracker, type WebHealthSnapshot} from './web-health.js';
+import {PageRecoveryGate,type SafePageProbe} from './page-recovery.js';
 import {allowedOAuthStoragePermission,allowedOAuthPopup} from './login-permissions.js';
 import {WebFirstProjectRegistry, type WebFirstProject} from './project-registry.js';
 import {renderProjectSidebar} from './project-sidebar.js';
@@ -46,6 +47,7 @@ export interface NativeWebHost {
   disableNativeCore: () => Promise<void>;
   getCorePosture:()=>string;
   snapshotVisibleAssistant:()=>Promise<VisibleWebReply|null>;
+  testRecoveryOverlayOffline?:()=>Promise<boolean>;
 }
 export function launchNextWebFirstHost(options: {
   /** Only a fixture launch may use data URLs; the production path is fixed. */
@@ -59,6 +61,8 @@ export function launchNextWebFirstHost(options: {
 }): NativeWebHost {
   const offline = options.offlineSmoke === true;
   const health=newWebHealthTracker();
+  const pageRecovery=new PageRecoveryGate();
+  pageRecovery.navigate(Date.now());
   const webSession = session.fromPartition(WEB_FIRST_PARTITION);
   // No general device, file, clipboard or camera permission is inherited.
   // Chromium's Storage Access API may be essential for OAuth/Google SSO after
@@ -71,7 +75,11 @@ export function launchNextWebFirstHost(options: {
   webSession.setPermissionCheckHandler((_wc,permission,origin,details)=>
     allowedOAuthStoragePermission(permission,origin,details?.embeddingOrigin));
   webSession.on('will-download', event => event.preventDefault());
-  webSession.webRequest.onCompleted(details=>{if(details.webContentsId)health.completed(details.url,details.statusCode);});
+  webSession.webRequest.onCompleted(details=>{
+    if(details.webContentsId)health.completed(details.url,details.statusCode);
+    if(details.webContentsId===view.webContents.id && details.resourceType==='mainFrame')
+      pageRecovery.httpStatus(details.statusCode);
+  });
   webSession.webRequest.onErrorOccurred(details=>{if(details.webContentsId)health.failed(details.url,details.error);});
   const owner = new BrowserWindow({
     title: 'CoS Next · ChatGPT Web-First Preview',
@@ -88,6 +96,38 @@ export function launchNextWebFirstHost(options: {
     state:'starting',location: offline ? 'offline-test':'chatgpt',
     lastErrorCode:null,blockedNavigations:0
   };
+  // A failed ChatGPT page must not leave the user with an unexplained white
+  // WebContentsView. The overlay is separate, no JS, no site privileges.
+  let recoveryOverlay:WebContentsView|null=null;
+  const showRecoveryOverlay=()=>{
+    if(owner.isDestroyed())return;
+    const message=pageRecovery.fallbackMessage();
+    if(!message)return;
+    if(!recoveryOverlay){
+      recoveryOverlay=new WebContentsView({webPreferences:{nodeIntegration:false,
+        contextIsolation:true,sandbox:true,webSecurity:true,javascript:false,webviewTag:false}});
+      recoveryOverlay.webContents.setWindowOpenHandler(()=>({action:'deny'}));
+      recoveryOverlay.webContents.on('will-navigate',e=>e.preventDefault());
+      owner.contentView.addChildView(recoveryOverlay);
+    }
+    const encode=(value:string)=>value.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;',
+      '>':'&gt;','"':'&quot;',"'":'&#39;'}[c]??''));
+    const body='<!doctype html><html lang="zh"><meta charset="utf-8"><style>'+
+      'body{margin:0;background:#f8fafc;color:#172033;font:15px system-ui;padding:42px 50px}'+
+      'h1{font-size:21px}p{max-width:610px;line-height:1.8}small{color:#55667d}'+
+      '</style><h1>'+encode(message.title)+'</h1><p>'+encode(message.detail)+'</p>'+
+      '<p><small>请使用顶部「ChatGPT 网页 → 安全重新加载网页」；不会删除 ChatGPT 登录或本地项目。</small></p></html>';
+    void recoveryOverlay.webContents.loadURL('data:text/html;charset=utf-8,'+encodeURIComponent(body));
+    const [w=1,h=1]=owner.getContentSize();const x=sidebarVisible?268:0;
+    recoveryOverlay.setBounds({x,y:48,width:Math.max(1,w-x),height:Math.max(1,h-48)});
+  };
+  const hideRecoveryOverlay=()=>{
+    if(!recoveryOverlay)return;
+    owner.contentView.removeChildView(recoveryOverlay);
+    if(!recoveryOverlay.webContents.isDestroyed())recoveryOverlay.webContents.close();
+    recoveryOverlay=null;
+  };
+
   // The project sidecar runs in a completely separate renderer WITHOUT preload,
   // JavaScript, network access, native IPC or access to the ChatGPT partition.
   const sidebar = new WebContentsView({webPreferences:{
@@ -206,6 +246,8 @@ export function launchNextWebFirstHost(options: {
     const w=size[0]??1, h=size[1]??1, x=sidebarVisible?sidebarWidth:0;
     sidebar.setBounds({x:0,y:headerHeight,width:sidebarVisible?sidebarWidth:0,height:Math.max(1,h-headerHeight)});
     view.setBounds({x,y:headerHeight,width:Math.max(1,w-x),height:Math.max(1,h-headerHeight)});
+    if(recoveryOverlay)recoveryOverlay.setBounds({x,y:headerHeight,
+      width:Math.max(1,w-x),height:Math.max(1,h-headerHeight)});
   };
   void refreshSidebar();
   owner.on('resize',resize);
@@ -252,6 +294,7 @@ export function launchNextWebFirstHost(options: {
   });
   owner.on('closed',()=>{
     stopReplyCapture();
+    hideRecoveryOverlay();
     void disableNativeCore().catch(()=>undefined);
     // BaseWindow-based children must be explicitly closed; do not leave a web
     // renderer process keeping an authenticated session alive after its owner.
@@ -300,6 +343,10 @@ export function launchNextWebFirstHost(options: {
       event.preventDefault();
     }
   });
+  view.webContents.on('did-start-navigation',(_event,_url,_inPlace,isMainFrame)=>{
+    if(!offline&&isMainFrame){pageRecovery.navigate(Date.now());hideRecoveryOverlay();
+      status.state='starting';status.lastErrorCode=null;}
+  });
   view.webContents.on('did-navigate',(_event,url)=>{
     if(!offline)status.location=classifyWebFirstNavigation(url);
   });
@@ -313,8 +360,47 @@ export function launchNextWebFirstHost(options: {
   view.webContents.on('did-fail-load',(_event,code,isMainFrame)=>{
     if(!isMainFrame || code===-3)return; // ordinary redirect cancellation
     status.state='load-failed'; status.lastErrorCode=code;
+    if(!offline){pageRecovery.renderFailure(code);showRecoveryOverlay();}
     options.onNavigationOutcome?.({...status});
   });
+  view.webContents.on('render-process-gone',()=>{
+    if(offline||owner.isDestroyed())return;
+    status.state='load-failed';pageRecovery.rendererGone();showRecoveryOverlay();
+  });
+  // A completed but entirely empty document produces no did-fail-load event.
+  // Observe counts ONLY, never HTML/text/conversation content or cookies.
+  let probing=false;
+  const blankPoll=setInterval(()=>{
+    if(offline||probing||owner.isDestroyed()||view.webContents.isDestroyed()||
+      status.location!=='chatgpt'||pageRecovery.issue)return;
+    probing=true;
+    void (async()=>{
+      let sample:SafePageProbe|null=null;
+      try{
+        const reply:unknown=await view.webContents.executeJavaScript(`(() => {
+          const body=document.body;
+          return {readyState:document.readyState,hasBody:!!body,
+            bodyElements:body?.querySelectorAll('*').length??0,
+            buttons:document.querySelectorAll('button').length,
+            editorPresent:!!document.querySelector('[contenteditable="true"],[role="textbox"],textarea'),
+            visibleElements:body?[...body.children].filter(e=>{
+              const r=e.getBoundingClientRect();const s=getComputedStyle(e);
+              return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';
+            }).length:0};
+        })()`,true);
+        if(reply&&typeof reply==='object')sample=reply as SafePageProbe;
+      }catch{/* renderer not accessible; manual recovery remains available */}
+      const result=pageRecovery.probe(sample,Date.now());
+      if(result.retry&&!view.webContents.isDestroyed()&&
+        classifyWebFirstNavigation(view.webContents.getURL())==='chatgpt'){
+        // At most once, only after sustained truly empty DOM with no editor.
+        pageRecovery.navigate(Date.now());
+        view.webContents.reloadIgnoringCache();
+      }else if(result.issue)showRecoveryOverlay();
+    })().finally(()=>{probing=false;});
+  },4000);
+  blankPoll.unref();
+  owner.on('closed',()=>clearInterval(blankPoll));
   const diagnostics = async ():Promise<WebHealthSnapshot>=>{
     const snapshot=health.snapshot();
     try{
@@ -346,7 +432,10 @@ export function launchNextWebFirstHost(options: {
     await dialog.showMessageBox(owner,{
       type:'info',title:'CoS Next · Web-First 安全诊断',
       message:'网页状态（不读取 Cookie 或聊天正文）',
-      detail:JSON.stringify({navigation:status,...snap},null,2),
+      detail:JSON.stringify({navigation:status,
+        recovery:{mainFrameHttpStatus:pageRecovery.http,issue:pageRecovery.issue,
+          blankAutoRetryUsed:pageRecovery.autoRetried,overlayVisible:!!recoveryOverlay},
+        ...snap},null,2),
       buttons:['关闭']
     });
   };
@@ -900,7 +989,15 @@ export function launchNextWebFirstHost(options: {
     ]},
     {label:'ChatGPT 网页',submenu:[
       {label:'检查网页健康状态',click:()=>{void showDiagnostics();}},
-      {label:'重新加载网页',accelerator:'CmdOrCtrl+R',click:()=>view.webContents.reload()},
+      {label:'重新加载网页',accelerator:'CmdOrCtrl+R',click:()=>{
+        hideRecoveryOverlay();pageRecovery.navigate(Date.now());view.webContents.reload();
+      }},
+      {label:'安全重新加载网页（保留登录）',click:()=>{
+        if(!view.webContents.isDestroyed()){
+          hideRecoveryOverlay();pageRecovery.navigate(Date.now());
+          view.webContents.reloadIgnoringCache();
+        }
+      }},
       {label:'返回',accelerator:'Alt+Left',click:()=>{if(view.webContents.navigationHistory.canGoBack())view.webContents.navigationHistory.goBack();}},
       {label:'前进',accelerator:'Alt+Right',click:()=>{if(view.webContents.navigationHistory.canGoForward())view.webContents.navigationHistory.goForward();}}
     ]}
@@ -912,6 +1009,19 @@ export function launchNextWebFirstHost(options: {
     // 'did-fail-load' owns the error code; never log full URL or auth redirect.
     if(status.state!=='load-failed')status.state='load-failed';
   });
+  const testRecoveryOverlayOffline=async():Promise<boolean>=>{
+    if(!offline||owner.isDestroyed())throw Error('RECOVERY_TEST_ONLY_OFFLINE');
+    pageRecovery.renderFailure(-105);
+    showRecoveryOverlay();
+    await new Promise(resolve=>setTimeout(resolve,350));
+    const ok=!!recoveryOverlay&&!recoveryOverlay.webContents.isDestroyed()&&
+      owner.contentView.children.includes(recoveryOverlay)&&
+      recoveryOverlay.getBounds().width>100&&recoveryOverlay.getBounds().height>100;
+    hideRecoveryOverlay();pageRecovery.clearIssue();
+    return ok;
+  };
   return {window:owner,status:()=>({...status}),reload:()=>view.webContents.reload(),diagnostics,
-    nativeProjects:()=>projects.list(),enableNativeCore,disableNativeCore,getCorePosture:()=>mcpState,snapshotVisibleAssistant};
+    nativeProjects:()=>projects.list(),enableNativeCore,disableNativeCore,
+    getCorePosture:()=>mcpState,snapshotVisibleAssistant,
+    ...(offline?{testRecoveryOverlayOffline}:{})};
 }
