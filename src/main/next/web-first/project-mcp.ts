@@ -3,6 +3,13 @@ import {createMcpHandler,McpServer} from '@modelcontextprotocol/server';
 import {z} from 'zod';
 import type {WebFirstReadAuthority} from './project-read.js';
 
+/** Stable local catalogue. ChatGPT's *approved* tool snapshot is independent. */
+export const WEBFIRST_CORE_TOOLS = Object.freeze([
+  'runtime_health','identity_diagnostics','project_list','project_ls','project_read'
+]);
+export const WEBFIRST_CORE_TOOLSET = 'web-first-readonly-p2b-v1';
+
+
 export function createWebFirstCoreMcp(authority:WebFirstReadAuthority){
   const handler=createMcpHandler(()=>{
     const server=new McpServer({name:'cos-next-webfirst',version:'4.0.0-alpha.1'});
@@ -10,8 +17,13 @@ export function createWebFirstCoreMcp(authority:WebFirstReadAuthority){
       description:'Local Web-First bridge readiness; not proof of an authorized ChatGPT identity.',
       inputSchema:{},annotations:{readOnlyHint:true,idempotentHint:true,openWorldHint:false}
     },async()=>{
+      // Additional fields are additive to the previously published health
+      // schema. They prove only the *server's* tool list, not ChatGPT approval.
       const result={runtime:'WEB_FIRST',mcp:'LOCAL_ONLY',identity_verified:false,
-        mission_authorized:false,model_inference:'NONE'};
+        mission_authorized:false,model_inference:'NONE',
+        server_toolset:WEBFIRST_CORE_TOOLSET,
+        server_tools:[...WEBFIRST_CORE_TOOLS],
+        chatgpt_tool_registry:'NOT_VERIFIED'};
       return {content:[{type:'text' as const,text:JSON.stringify(result)}],structuredContent:result};
     });
     server.registerTool('identity_diagnostics',{

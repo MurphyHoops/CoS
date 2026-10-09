@@ -201,3 +201,70 @@ plane success does not prove platform tool publication or conversation identity.
   native Core connection from the current live app and the platform reports
   a durable post-request poll and successful `project_list` tool call. One-shot
   broker network test is not proof of this final delivery gate.
+
+
+## P2c platform tool snapshot gate — 2026-10-09
+
+**Observed on the user's connected ChatGPT Core integration:** Both
+`runtime_health` and `identity_diagnostics` now work live, with actual
+`runtime=WEB_FIRST`, `identity_verified=false`, `mission_authorized=false`.
+Therefore the round trip ChatGPT -> Core Tunnel -> local MCP -> ChatGPT is
+**proven** for diagnostic tools. This is distinct from the unverified new
+project tools: the invoking ChatGPT conversation advertises only the two
+previously approved tools, not `project_list`, `project_ls`, `project_read`.
+
+OpenAI's own MCP app management documentation describes a **frozen approved
+snapshot** of tool names/inputs: adding handlers to a live server does not
+automatically expose them in already-approved apps. Refresh/publish the app's
+actions in an eligible workspace, or recreate the app in settings where
+refresh is not supported, reviewing the tools and preserving the existing
+Core connection. Do not claim an automatic plugin refresh occurred or that a
+new conversation alone will refresh the published tool snapshot.
+
+This Web-First build adds:
+
+- `WEBFIRST_CORE_TOOLS` authoritative server-side allowlist (five
+  read-only MCP tools), and a stable `server_toolset` version label.
+- **Backward-compatible** `runtime_health` response additions:
+  `server_tools`, `server_toolset` and
+  `chatgpt_tool_registry='NOT_VERIFIED'` — never claims that the tools are
+  actually available in a ChatGPT conversation.
+- A native `本地项目 → 核对 MCP 工具清单（仅本地）` menu item that performs a
+  real `tools/list` exchange with its own random-route loopback MCP service,
+  validates exactly the five tool names, and displays **only** tool names and
+  registration caveats, not the bearer URL or the user project contents.
+- The native sidebar now explicitly separates a successful Core handshake
+  from the pending ChatGPT tool list refresh and per-read native approval.
+
+Platform app update is not executed here: the current ASDK Core app identity
+is not editable via the available Plugin Creator interface. No plugin is
+uninstalled or replaced; the user can review the ChatGPT app management UI
+when the workspace/app-owner publishing control is available. **Do not try to
+smuggle a project read into `runtime_health` or `identity_diagnostics`** merely
+because they are currently advertised — that bypasses published tool
+semantics and safe review.
+
+The gate remains **P2c HOLD** until ChatGPT advertises `project_list` and
+receives its real return after a separate user-confirmed macOS native approval.
+
+### P2c catalogue-audit release check
+
+- `readWebFirstLocalToolList` performs a real, bounded, loopback-only MCP
+  `tools/list` request, requires the exact five read-only server tool names,
+  and never leaks the local random-route bearer URL.
+- `runtime_health` retains its existing diagnostic fields and now reports
+  `server_tools`, `server_toolset=web-first-readonly-p2b-v1`, and
+  `chatgpt_tool_registry=NOT_VERIFIED`. These describe the **local server only**.
+- Local menu `本地项目 → 核对 MCP 工具清单（仅本地）` shows actual local MCP
+  discovery and distinguishes it from the separately frozen ChatGPT app
+  tool snapshot. The sidebar also reflects this distinction.
+- Focused Web-First suite: 21 passed, 1 opt-in real-network test skipped.
+- Complete `npm run verify:ci`: 225 regular files / **5,067 tests passed**,
+  **131 skipped**, plus **2** separate MCP shutdown tests passed; **0 failed**.
+- macOS ARM64 standalone preview packaged and executed against an isolated
+  offline test profile: startup, project durability, native input, local MCP
+  fixture read, tool/menu checks and shutdown all passed.
+- **The running authenticated user's Web-First app and active Core Tunnel are
+  intentionally left undisturbed.** An upgrade of diagnostic UI is not worth
+  disconnecting a previously working control-plane session while platform
+  action refresh remains pending.

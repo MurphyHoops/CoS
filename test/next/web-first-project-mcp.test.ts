@@ -5,6 +5,7 @@ import path from 'node:path';
 import {WebFirstProjectRegistry} from '../../src/main/next/web-first/project-registry.js';
 import {WebFirstReadAuthority,type ReadAction} from '../../src/main/next/web-first/project-read.js';
 import {createWebFirstCoreLoopback} from '../../src/main/next/web-first/core-loopback.js';
+import {readWebFirstLocalToolList,EXPECTED_READ_ONLY_CORE_TOOLS} from '../../src/main/next/web-first/core-catalogue.js';
 const paths:string[]=[];
 afterEach(async()=>{for(const name of paths.splice(0))await rm(name,{recursive:true,force:true});});
 async function prepare(allow:ReadAction[]=[]){
@@ -30,8 +31,18 @@ async function rpc(url:string,method:string,name?:string,args?:Record<string,unk
   return {status:res.status,data:json};
 }
 describe('Web-First read-only MCP over a real owner-controlled loopback socket',()=>{
+  it('rejects discovery against any unapproved host, scheme, or route',async()=>{
+    for(const value of ['https://127.0.0.1:443/web-first/'+ 'a'.repeat(43)+'/mcp',
+      'http://localhost:9000/web-first/'+ 'a'.repeat(43)+'/mcp',
+      'http://127.0.0.1:9000/not-an-mcp',
+      'http://127.0.0.1:9000/web-first/'+ 'a'.repeat(43)+'/mcp?secret=1']){
+      await expect(readWebFirstLocalToolList(value)).rejects.toThrow('WEBFIRST_LOCAL_MCP_ENDPOINT_INVALID');
+    }
+  });
   it('advertises only read-only diagnostics and per-request approved project tools',async()=>{
     const {service}=await prepare();try{
+      const discovered=await readWebFirstLocalToolList(service.endpointUrl);
+      expect(discovered).toEqual(EXPECTED_READ_ONLY_CORE_TOOLS);
       const r=await rpc(service.endpointUrl,'tools/list');
       const tools=r.data.result.tools;
       expect(r.status).toBe(200);
@@ -39,7 +50,11 @@ describe('Web-First read-only MCP over a real owner-controlled loopback socket',
         'identity_diagnostics','project_list','project_ls','project_read','runtime_health']);
       expect(tools.every((x:{annotations:{readOnlyHint:boolean}})=>x.annotations.readOnlyHint)).toBe(true);
       const health=await rpc(service.endpointUrl,'tools/call','runtime_health');
-      expect(health.data.result.structuredContent).toMatchObject({mcp:'LOCAL_ONLY',identity_verified:false});
+      expect(health.data.result.structuredContent).toMatchObject({
+        mcp:'LOCAL_ONLY',identity_verified:false,chatgpt_tool_registry:'NOT_VERIFIED',
+        server_toolset:'web-first-readonly-p2b-v1'
+      });
+      expect(health.data.result.structuredContent.server_tools.sort()).toEqual([...EXPECTED_READ_ONLY_CORE_TOOLS]);
     }finally{await service.close();}
   });
   it('refuses project reads and forged host metadata without actual native approval',async()=>{

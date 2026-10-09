@@ -17,6 +17,7 @@ import {WebFirstProjectRegistry, type WebFirstProject} from './project-registry.
 import {renderProjectSidebar} from './project-sidebar.js';
 import {WebFirstReadAuthority, type ReadAction} from './project-read.js';
 import {createWebFirstCoreLoopback} from './core-loopback.js';
+import {readWebFirstLocalToolList,EXPECTED_READ_ONLY_CORE_TOOLS} from './core-catalogue.js';
 import {connectWebFirstImportedCore,type CoreTunnelState} from './core-transport.js';
 
 export interface NativeWebHostStatus {
@@ -365,6 +366,26 @@ export function launchNextWebFirstHost(options: {
     if(current)await current.close();
     if(!owner.isDestroyed())await refreshSidebar();
   }
+  const showCoreCatalogue=async()=>{
+    if(owner.isDestroyed())return;
+    const local=mcpService;
+    let message='本地 MCP 服务未启动。';
+    if(local){
+      try{
+        const actual=await readWebFirstLocalToolList(local.endpointUrl);
+        message='本机 MCP 已实际登记 '+actual.length+' 个工具：\n'+actual.join('、')+
+          '\n\nChatGPT 当前获批的工具列表是独立快照。'
+          +'本机 tools/list 成功不代表 ChatGPT 已更新或授予这些工具。';
+      }catch{message='本机 MCP 工具列表无法验证；请检查连接状态。';}
+    }
+    if(!owner.isDestroyed())await dialog.showMessageBox(owner,{
+      type:'info',title:'Core MCP 工具清单 · 两级验收',
+      message:'Core Tunnel：'+(mcpState==='REMOTE_CONNECTED'?'控制平面已握手':mcpState)+
+        '；ChatGPT 工具发布：未验证',
+      detail:message+'\n\n目标清单：'+EXPECTED_READ_ONLY_CORE_TOOLS.join('、'),
+      buttons:['关闭']
+    });
+  };
   const showLocalProjectStatus=async()=>{
     let list:ReadonlyArray<WebFirstProject>;
     try{list=await projects.list();}
@@ -394,6 +415,7 @@ export function launchNextWebFirstHost(options: {
       {type:'separator'},
       {label:'添加项目目录（仅本地登记）',click:()=>{void addProjectFromNativePicker();}},
       {label:'查看登记与 Core MCP 状态',click:()=>{void showLocalProjectStatus();}},
+      {label:'核对 MCP 工具清单（仅本地）',click:()=>{void showCoreCatalogue();}},
       {type:'separator'},
       {label:'显示/隐藏项目侧栏',accelerator:'CmdOrCtrl+Shift+P',click:()=>{
         sidebarVisible=!sidebarVisible;resize();
