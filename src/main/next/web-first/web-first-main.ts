@@ -26,11 +26,40 @@ app.whenReady().then(()=>{
     if(smokeTimeout)clearTimeout(smokeTimeout);
     process.stdout.write('WEB_FIRST_HTTPS_OUTCOME='+JSON.stringify(state)+'\n');
     setImmediate(()=>app.quit());
-  },onOfflineLoaded:()=>{
-    process.stdout.write('WEB_FIRST_OFFLINE_VIEW_READY\n');
-    if(offlineSmoke)setImmediate(()=>app.quit());
+  },onOfflineLoaded:async contents=>{
+    if(!offlineSmoke)return;
+    try{
+      // Real Chromium input dispatch into the offline WebContentsView, never a
+      // ChatGPT document or a web account. No model turn is created.
+      contents.debugger.attach('1.3');
+      await new Promise(resolve=>setTimeout(resolve,150));
+      await contents.debugger.sendCommand('Input.dispatchMouseEvent',{
+        type:'mousePressed',x:75,y:55,button:'left',clickCount:1});
+      await contents.debugger.sendCommand('Input.dispatchMouseEvent',{
+        type:'mouseReleased',x:75,y:55,button:'left',clickCount:1});
+      await contents.debugger.sendCommand('Input.insertText',{text:'COS_OFFLINE_NATIVE_INPUT'});
+      const result=await contents.executeJavaScript(`document.querySelector('#native-smoke-input')?.value`);
+      contents.debugger.detach();
+      if(result!=='COS_OFFLINE_NATIVE_INPUT')throw Error('OFFLINE_NATIVE_INPUT_MISMATCH');
+      process.stdout.write('WEB_FIRST_OFFLINE_INPUT_PASS\n');
+      process.stdout.write('WEB_FIRST_OFFLINE_VIEW_READY\n');
+      setImmediate(()=>app.quit());
+    }catch{
+      process.stderr.write('WEB_FIRST_OFFLINE_INPUT_FAILED\n');
+      app.exit(3);
+    }
   }});
   host.window.on('closed',()=>{if(!quitting)app.quit();});
+  if(process.env.COS_NEXT_WEBFIRST_DIAG_ONCE==='1'){
+    for(const delay of [6000,18000,32000]){
+      setTimeout(()=>{
+        void host.diagnostics().then(snapshot=>{
+          // Includes only status tallies, button counts and standardized network errors.
+          process.stdout.write('WEB_FIRST_SAFE_DIAG='+JSON.stringify({elapsedMs:delay, ...snapshot})+'\n');
+        }).catch(()=>{process.stdout.write('WEB_FIRST_SAFE_DIAG_UNAVAILABLE\n');});
+      },delay).unref();
+    }
+  }
   if(!offlineSmoke){
     // Readiness is merely navigation visibility; it does NOT prove ChatGPT
     // account sign-in, available models or any MCP tool registration.

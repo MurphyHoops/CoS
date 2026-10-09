@@ -96,3 +96,61 @@ It is a P1 **developer preview**, not a production replacement for Classic.
 No `COS_NEXT_WEBFIRST_HTTPS_SMOKE` or `COS_NEXT_WEBFIRST_OFFLINE_SMOKE` needs to be
 set for normal interactive use. The smoke flags use disposable userData,
 perform no model inference and automatically close.
+
+## P1.1 Google OAuth and post-login UI investigation (2026-10-09)
+
+The user reported seeing a Google Passkey identity challenge and, after login,
+ChatGPT's apparently empty/inert chat shell. We investigated the **existing**
+Web-First persistent Electron session without inspecting account cookies, text,
+conversation titles, credentials, model replies or private response bodies.
+
+### Evidence from the real user profile
+
+- A separately packaged diagnostic build reopened **the same preserved**
+  `chat-on-steroids-next-webfirst-preview` profile. The first run completed
+  ~60 ChatGPT API requests (56 success, 4 HTTP 4xx) over 32 seconds, no network
+  transport error; the initial prompt CSS selector was outdated for the current UI.
+- A second fresh-process run had 48 successful API responses and 2 unrelated
+  HTTP 404s; **20** conversation links had rendered. No authenticated-API 401/403.
+- With guarded login storage and official SSO popup support, another fresh-process
+  run reached 47 successful API requests, 0 HTTP 4xx/5xx, 0 network errors,
+  10 history links, **one contenteditable + one textbox role** after 6–32 seconds.
+  The earlier check for `#prompt-textarea` gave false negatives: ChatGPT's
+  current composer is not reliably identified by that legacy CSS selector.
+- App logs show repeated Chromium FIDO/Bluetooth authenticator errors on the
+  **Passkey** path. This is a separate macOS/Electron authenticator limitation;
+  no password/cookie workaround or security bypass was implemented. Alternative
+  account-approved verification methods may be required.
+- The user's screenshot omitted **CoS projects/tasks** for a different reason:
+  P1 is ONLY the embedded ChatGPT web host. It intentionally has no project
+  sidebar, Goal/Agent state or working MCP bridge yet. It is not a production
+  replacement for classic CoS.
+
+### Hardening changes
+
+- `login-permissions.ts` grants ONLY `storage-access` or
+  `top-level-storage-access` for exactly pinned ChatGPT/OAuth HTTPS origins,
+  with trusted embedder origin when supplied. Camera/mic, file APIs, screen,
+  remote device, clipboard and other permissions remain denied.
+- Official Google/OpenAI login URLs can open isolated in-app Electron popup
+  windows sharing the Web-First login partition. Arbitrary external URLs,
+  `about:blank` unknown-origin popups and nested popups remain blocked. No
+  external Chrome is launched or inherited.
+- `web-health.ts` aggregates *only* HTTP status counts by hard-coded service
+  class, sanitized standard network-error codes, and page control counts. The
+  app menu `ChatGPT 网页 → 检查网页健康状态` shows the statistics with no URLs,
+  credentials, page text or hidden browser content.
+- The safe readiness snapshot now checks `[role="textbox"]` and
+  `[contenteditable="true"]` instead of only a legacy ChatGPT composer ID.
+  This check indicates node presence; it is not proof of actual cloud Send.
+- **Real Chromium input smoke without model use:** in a disposable Electron
+  profile, `WebContentsView` loaded an offline HTML text field, received a CDP
+  mouse click and `Input.insertText`, then confirmed the exact local input
+  value. `WEB_FIRST_OFFLINE_INPUT_PASS`, exit 0. The synthetic fixture never
+  loads ChatGPT or consumes any account quota.
+
+The 404s observed on the second run were NOT proved the cause of the blank UI.
+The available evidence instead indicates eventual successful post-login API
+loading and a stale/inaccurate editor selector in the initial diagnostics.
+Do not claim an untested Google Passkey path was fixed. New interactive sign-in,
+full Conversation UX and P2 Core MCP remain gated on explicit real observation.
