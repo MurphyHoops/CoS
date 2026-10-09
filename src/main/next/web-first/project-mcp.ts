@@ -1,6 +1,7 @@
 /** Official MCP tool protocol, local-only until a verified user-owned Tunnel is connected. */
 import {createMcpHandler,McpServer} from '@modelcontextprotocol/server';
 import {z} from 'zod';
+import {createHostSessionDiagnostic} from './host-session-diagnostic.js';
 import type {WebFirstReadAuthority} from './project-read.js';
 import type {WebFirstOperationJournal,ProjectOperation} from './operation-journal.js';
 import type {WebFirstTaskTools} from './task-tools.js';
@@ -18,6 +19,7 @@ export const WEBFIRST_CORE_TOOLSET = 'web-first-project-goal-plan-p3.3-v1';
 
 export function createWebFirstCoreMcp(authority:WebFirstReadAuthority,journal?:WebFirstOperationJournal,
   tasks?:WebFirstTaskTools,writes?:WebFirstProjectWriter,plans?:WebFirstPlanTools){
+  const hostDiagnostic=createHostSessionDiagnostic();
   const handler=createMcpHandler(()=>{
     const server=new McpServer({name:'cos-next-webfirst',version:'4.0.0-alpha.1'});
     server.registerTool('runtime_health',{
@@ -36,8 +38,11 @@ export function createWebFirstCoreMcp(authority:WebFirstReadAuthority,journal?:W
     server.registerTool('identity_diagnostics',{
       description:'Cannot verify a ChatGPT caller from untrusted metadata.',inputSchema:{},
       annotations:{readOnlyHint:true,idempotentHint:true,openWorldHint:false}
-    },async()=>{
-      const result={identity_verified:false,mission_authorized:false,authority:'UNVERIFIED'};
+    },async(_args,ctx)=>{
+      // MCP _meta originates at the inbound tool call. The tunnel may drop
+      // fields; missing/invalid is faithfully reported, never inferred from
+      // ChatGPT webpage URL, ambient cookies or process identity.
+      const result=hostDiagnostic(ctx.mcpReq?._meta);
       return {content:[{type:'text' as const,text:JSON.stringify(result)}],structuredContent:result};
     });
     const register=(name:ProjectOperation,description:string,schema:Record<string,z.ZodTypeAny>,

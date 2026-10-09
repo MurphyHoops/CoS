@@ -70,3 +70,7 @@ Use the app menu CoS Next Web-First Preview > Quit CoS Next Web-First Preview: t
 ## P3.4-D native safe window closure
 
 ChatGPT 网页 -> 安全关闭主窗口（停止 Core） (Cmd+W) is now available. The exact new menu action was clicked in an authenticated-to-native, live Core session and shut down parent App, Broker and tunnel-client. Forced child and Broker retirement were also tested independently with successful Core tool recovery and unchanged waiting Goal. This does not prove red-X or autonomous AI Worker identity. See P34D_LIVE_CORE_FAULT_AND_WINDOW_CLOSE_20261010.md for scope and evidence.
+
+## P3.5 real metadata and browser UI control
+
+This lane operates only the signed-in ChatGPT website with its ordinary usage quota, never Codex or pay-per-token inference. The native ChatGPT webpage menu now offers a read-only interaction readiness check. Real ChatGPT tool calls delivered both official anonymous session and subject metadata; repeat-call fingerprints matched in the same chat. These are correlation signals only, not authorization. See P35_G1B_AND_WEBPAGE_ONLY_LIVE_20261010.md.

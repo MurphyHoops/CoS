@@ -227,6 +227,9 @@ app.whenReady().then(async()=>{
       if(!await host.testNativeAcceptanceOffline?.())
         throw Error('WEBFIRST_OFFLINE_NATIVE_ACCEPTANCE_SUMMARY_FAILED');
       process.stdout.write('WEB_FIRST_OFFLINE_NATIVE_ACCEPTANCE_SUMMARY_PASS\n');
+      if(!await host.testNativePageControlsOffline?.())
+        throw Error('WEBFIRST_OFFLINE_NATIVE_PAGE_CONTROL_PROBE_FAILED');
+      process.stdout.write('WEB_FIRST_OFFLINE_NATIVE_PAGE_CONTROL_PASS\n');
       if(!projectMenu?.submenu?.items.some(item=>item.label==='管理/撤销只读授权')||
          !projectMenu.submenu.items.some(item=>item.label==='查看本地操作收据'))
         throw Error('WEBFIRST_NATIVE_P3_GRANTS_MENU_MISSING');

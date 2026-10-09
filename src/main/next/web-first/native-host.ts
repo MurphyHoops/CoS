@@ -33,6 +33,7 @@ import {renderGoalWorkbench,parseWorkbenchAction,parsePlanLines,completePlanStep
 import {conversationFromUrl,VISIBLE_REPLY_SCRIPT,WebReplySettleTracker,WebFirstReplyJournal,type VisibleWebReply} from './web-reply-observer.js';
 import {WebFirstWebOutbox} from './web-outbox.js';
 import {sendNativeWebFirstMessage} from './native-web-input.js';
+import {inspectNativeChatGPTPage} from './web-page-controls.js';
 import {randomUUID} from 'node:crypto';
 import {appendFileSync} from 'node:fs';
 import os from 'node:os';
@@ -63,6 +64,7 @@ export interface NativeWebHost {
   testRecoveryOverlayOffline?:()=>Promise<boolean>;
   testGoalWorkbenchOffline?:()=>Promise<boolean>;
   testNativeAcceptanceOffline?:()=>Promise<boolean>;
+  testNativePageControlsOffline?:()=>Promise<boolean>;
 }
 export function launchNextWebFirstHost(options: {
   /** Only a fixture launch may use data URLs; the production path is fixed. */
@@ -814,6 +816,31 @@ export function launchNextWebFirstHost(options: {
     if(!owner.isDestroyed()&&!closingForTunnelStop)await refreshSidebar();
     quitTrace('CORE_CLOSE_FINISHED');
   }
+  const inspectWebComputerUse=async()=>{
+    if(owner.isDestroyed())return;
+    try{
+      const out=await inspectNativeChatGPTPage(view.webContents,offline);
+      const message=out.page==='OFFLINE_FIXTURE'?'离线界面探针成功（不可发送模型消息）':
+        out.canAttemptOneApprovedTurn?'ChatGPT 网页输入框就绪（发送仍需单次批准）':
+          '当前网页尚不可安全发送模型消息';
+      await dialog.showMessageBox(owner,{
+        type:'info',title:'ChatGPT 网页 · 原生操作能力检查',message,
+        detail:'页面：'+out.page+'；会话路由：'+(out.conversation?'有效':'不可确认')+
+          '\\n输入框：'+out.composer+'；发送按钮显示：'+(out.sendButtonVisible?'是':'否')+
+          '\\n显示的用户消息：'+out.userMessages+'，助手回复：'+out.assistantMessages+
+          '\\n通过 Electron WebContents 操作当前网页，不使用 Codex 或付费 API。'+
+          '\\n只检查界面结构，不读取聊天正文、Cookie、Token，也不发送消息。'+
+          '\\n发送仍须走原有的一次性原生批准和回执门禁。',
+        buttons:['关闭']
+      });
+    }catch{
+      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{
+        type:'warning',title:'网页原生操作检查',
+        message:'无法安全确认当前页面输入状态；未发送任何消息。',
+        buttons:['关闭']
+      });
+    }
+  };
   let webDispatchInProgress=false;
   const continueTaskOneNativeTurn=async()=>{
     if(webDispatchInProgress||owner.isDestroyed())return;
@@ -1367,6 +1394,8 @@ export function launchNextWebFirstHost(options: {
       }}
     ]},
     {label:'ChatGPT 网页',submenu:[
+      {label:'检查网页原生操作能力（只读）',
+        click:()=>{void inspectWebComputerUse();}},
       {label:'安全关闭主窗口（停止 Core）',accelerator:'CmdOrCtrl+W',
         click:()=>{if(!owner.isDestroyed())owner.close();}},
       {type:'separator'},
@@ -1625,6 +1654,12 @@ export function launchNextWebFirstHost(options: {
       output.detail.includes('ChatGPT 工具发布/调用者身份')&&
       output.detail.includes('真实多 AI Worker 执行');
   };
+  const testNativePageControlsOffline=async():Promise<boolean>=>{
+    if(!offline)throw Error('WEB_CONTROL_SMOKE_OFFLINE_ONLY');
+    const out=await inspectNativeChatGPTPage(view.webContents,true);
+    return out.page==='OFFLINE_FIXTURE'&&!out.canAttemptOneApprovedTurn&&
+      out.assistantMessages>=1;
+  };
   const testRecoveryOverlayOffline=async():Promise<boolean>=>{
     if(!offline||owner.isDestroyed())throw Error('RECOVERY_TEST_ONLY_OFFLINE');
     pageRecovery.renderFailure(-105);
@@ -1639,5 +1674,5 @@ export function launchNextWebFirstHost(options: {
   return {window:owner,status:()=>({...status}),reload:()=>view.webContents.reload(),diagnostics,
     nativeProjects:()=>projects.list(),enableNativeCore,disableNativeCore,shutdownForAppExit,
     getCorePosture:()=>mcpState,snapshotVisibleAssistant,
-    ...(offline?{testRecoveryOverlayOffline,testGoalWorkbenchOffline,testNativeAcceptanceOffline}:{})};
+    ...(offline?{testRecoveryOverlayOffline,testGoalWorkbenchOffline,testNativeAcceptanceOffline,testNativePageControlsOffline}:{})};
 }

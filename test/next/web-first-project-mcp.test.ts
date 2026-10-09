@@ -74,6 +74,28 @@ describe('Web-First read-only MCP over a real owner-controlled loopback socket',
       expect(health.data.result.structuredContent.server_tools.sort()).toEqual([...EXPECTED_READ_ONLY_CORE_TOOLS]);
     }finally{await service.close();}
   });
+  it('G1b diagnostic reads actual MCP request _meta on local HTTP; never authorizes',async()=>{
+    const {service}=await prepare();
+    try{
+      const a=await rpc(service.endpointUrl,'tools/call','identity_diagnostics',{},
+        {'openai/session':'synthetic-chat-a','openai/subject':'synthetic-user'});
+      const a2=await rpc(service.endpointUrl,'tools/call','identity_diagnostics',{},
+        {'openai/session':'synthetic-chat-a','openai/subject':'synthetic-user'});
+      const b=await rpc(service.endpointUrl,'tools/call','identity_diagnostics',{},
+        {'openai/session':'synthetic-chat-b','openai/subject':'synthetic-user'});
+      const x=a.data.result.structuredContent,y=a2.data.result.structuredContent,
+        z=b.data.result.structuredContent;
+      expect(x).toMatchObject({session_present:true,subject_present:true,
+        session_field:'PRESENT',identity_verified:false,mission_authorized:false});
+      expect(y.session_fingerprint).toBe(x.session_fingerprint);
+      expect(z.session_fingerprint).not.toBe(x.session_fingerprint);
+      expect(z.subject_fingerprint).toBe(x.subject_fingerprint);
+      expect(JSON.stringify(x)).not.toContain('synthetic-chat-a');
+      const empty=await rpc(service.endpointUrl,'tools/call','identity_diagnostics',{});
+      expect(empty.data.result.structuredContent).toMatchObject({
+        session_present:false,subject_present:false,identity_verified:false});
+    }finally{await service.close();}
+  });
   it('updates a task-scoped plan only with separate native approval, exact revision and nonce',async()=>{
     const {service,p}=await prepare([],true,false,false);
     try{
