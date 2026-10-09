@@ -5,17 +5,19 @@ import type {WebFirstReadAuthority} from './project-read.js';
 import type {WebFirstOperationJournal,ProjectOperation} from './operation-journal.js';
 import type {WebFirstTaskTools} from './task-tools.js';
 import type {WebFirstProjectWriter} from './project-write.js';
+import type {WebFirstPlanTools} from './plan-tools.js';
 
 /** Stable local catalogue. ChatGPT's *approved* tool snapshot is independent. */
 export const WEBFIRST_CORE_TOOLS = Object.freeze([
   'runtime_health','identity_diagnostics','project_list','project_ls','project_read','project_find','project_replace',
-  'task_begin','task_status','task_checkpoint','task_wait','task_finish_request'
+  'task_begin','task_status','task_checkpoint','task_wait','task_finish_request',
+  'task_plan_status','task_plan_update'
 ]);
-export const WEBFIRST_CORE_TOOLSET = 'web-first-project-workflow-p3.2-v1';
+export const WEBFIRST_CORE_TOOLSET = 'web-first-project-goal-plan-p3.3-v1';
 
 
 export function createWebFirstCoreMcp(authority:WebFirstReadAuthority,journal?:WebFirstOperationJournal,
-  tasks?:WebFirstTaskTools,writes?:WebFirstProjectWriter){
+  tasks?:WebFirstTaskTools,writes?:WebFirstProjectWriter,plans?:WebFirstPlanTools){
   const handler=createMcpHandler(()=>{
     const server=new McpServer({name:'cos-next-webfirst',version:'4.0.0-alpha.1'});
     server.registerTool('runtime_health',{
@@ -123,6 +125,33 @@ export function createWebFirstCoreMcp(authority:WebFirstReadAuthority,journal?:W
       taskTool('task_finish_request','Request native operator review; not an automatic success claim.',
         {task_id:z.string().uuid(),revision:z.number().int().min(1),nonce:z.string().min(8).max(100),note:z.string().min(1).max(1000)},
         a=>tasks.finishRequest(a.task_id as string,a.revision as number,a.nonce as string,a.note as string));
+    }
+    if(plans){
+      const planCall=(name:string,schema:Record<string,z.ZodTypeAny>,
+        call:(args:Record<string,unknown>)=>Promise<unknown>,readOnly:boolean)=>{
+        server.registerTool(name,{description:readOnly?
+          'Get task-specific, locally persisted plan status with no model calls.':
+          'Replace entire task plan (max 12 steps) at an exact revision; native approval required, no automatic execution.',
+          inputSchema:schema,annotations:{readOnlyHint:readOnly,idempotentHint:readOnly,openWorldHint:false}
+        },async args=>{
+          try{const result=await call(args);
+            return {content:[{type:'text' as const,text:JSON.stringify(result)}],structuredContent:{result:result??null}};
+          }catch(err){const message=err instanceof Error?err.message:'PLAN_DENIED';
+            return {isError:true,content:[{type:'text' as const,
+              text:/^[A-Z_]+$/.test(message)?message:'PLAN_DENIED'}]};}
+        });
+      };
+      planCall('task_plan_status',{task_id:z.string().uuid()},
+        a=>plans.status(a.task_id as string),true);
+      const step=z.object({step:z.string().trim().min(1).max(160),
+        status:z.enum(['pending','in_progress','completed']),details:z.string().max(2000).optional()}).strict();
+      planCall('task_plan_update',{
+        task_id:z.string().uuid(),expected_revision:z.number().int().min(0),
+        nonce:z.string().min(8).max(100),explanation:z.string().max(1000),
+        plan:z.array(step).max(12).refine(steps=>steps.filter(s=>s.status==='in_progress').length<=1)
+      },a=>plans.update({taskId:a.task_id as string,expectedRevision:a.expected_revision as number,
+        nonce:a.nonce as string,explanation:a.explanation as string,
+        steps:a.plan as Array<{step:string;status:'pending'|'in_progress'|'completed';details?:string}>}),false);
     }
     return server;
   });

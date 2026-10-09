@@ -149,8 +149,12 @@ export class WebFirstTaskLedger {
       task.phase='review';event(task,'review-requested',note,nonce);
     });
   }
-  async nativeDecision(id:string,revision:number,choice:'resume'|'complete'|'cancel'):Promise<DurableTask>{
+  async nativeDecision(id:string,revision:number,choice:'pause'|'resume'|'complete'|'cancel'):Promise<DurableTask>{
     return this.mutate(id,revision,null,task=>{
+      if(choice==='pause'){
+        if(task.phase!=='active')throw Error('TASK_CANNOT_PAUSE');
+        task.phase='paused';task.waitUntil=null;event(task,'paused');return;
+      }
       if(choice==='resume'){
         if(!['paused','waiting','recovery-hold','review'].includes(task.phase))throw Error('TASK_CANNOT_RESUME');
         task.phase='active';task.waitUntil=null;event(task,'resume-approved');return;

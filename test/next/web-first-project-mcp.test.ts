@@ -6,6 +6,8 @@ import {WebFirstProjectRegistry} from '../../src/main/next/web-first/project-reg
 import {WebFirstReadAuthority,type ReadAction} from '../../src/main/next/web-first/project-read.js';
 import {WebFirstTaskLedger} from '../../src/main/next/web-first/task-ledger.js';
 import {WebFirstTaskTools} from '../../src/main/next/web-first/task-tools.js';
+import {WebFirstPlanLedger} from '../../src/main/next/web-first/plan-ledger.js';
+import {WebFirstPlanTools} from '../../src/main/next/web-first/plan-tools.js';
 import {WebFirstProjectWriter} from '../../src/main/next/web-first/project-write.js';
 import {createHash} from 'node:crypto';
 import {createWebFirstCoreLoopback} from '../../src/main/next/web-first/core-loopback.js';
@@ -14,7 +16,7 @@ import {WebFirstReadGrants} from '../../src/main/next/web-first/read-grants.js';
 import {WebFirstOperationJournal} from '../../src/main/next/web-first/operation-journal.js';
 const paths:string[]=[];
 afterEach(async()=>{for(const name of paths.splice(0))await rm(name,{recursive:true,force:true});});
-async function prepare(allow:ReadAction[]=[],allowTask=false,allowWrite=false){
+async function prepare(allow:ReadAction[]=[],allowTask=false,allowWrite=false,allowPlan=false){
   const temp=await mkdtemp(path.join(os.tmpdir(),'cos-web-first-mcp-'));paths.push(temp);
   await mkdir(path.join(temp,'profile'));await mkdir(path.join(temp,'project'));
   await writeFile(path.join(temp,'project','hello.txt'),'CONTENTS FROM DISPOSABLE FIXTURE');
@@ -23,10 +25,13 @@ async function prepare(allow:ReadAction[]=[],allowTask=false,allowWrite=false){
   const p=await store.register(path.join(temp,'project'));
   const approvals:ReadAction[]=[];
   const authority=new WebFirstReadAuthority(store,async desc=>{approvals.push(desc.action);return allow.includes(desc.action);});
-  const tasks=new WebFirstTaskTools(new WebFirstTaskLedger(path.join(temp,'profile')),store,async()=>allowTask);
+  const taskLedger=new WebFirstTaskLedger(path.join(temp,'profile'));
+  const tasks=new WebFirstTaskTools(taskLedger,store,async()=>allowTask);
+  const plans=new WebFirstPlanTools(new WebFirstPlanLedger(path.join(temp,'profile'),taskLedger),
+    taskLedger,async()=>allowPlan);
   const journal=new WebFirstOperationJournal(path.join(temp,'profile'));
   const write=new WebFirstProjectWriter(store,async()=>allowWrite);
-  const service=await createWebFirstCoreLoopback(authority,journal,tasks,write);
+  const service=await createWebFirstCoreLoopback(authority,journal,tasks,write,plans);
   return {temp,service,p,approvals,journal};
 }
 async function rpc(url:string,method:string,name?:string,args?:Record<string,unknown>,meta:Record<string,unknown>={}){
@@ -57,17 +62,49 @@ describe('Web-First read-only MCP over a real owner-controlled loopback socket',
       expect(r.status).toBe(200);
       expect(tools.map((x:{name:string})=>x.name).sort()).toEqual([
         'identity_diagnostics','project_find','project_list','project_ls','project_read','project_replace','runtime_health',
-        'task_begin','task_checkpoint','task_finish_request','task_status','task_wait']);
+        'task_begin','task_checkpoint','task_finish_request','task_plan_status','task_plan_update','task_status','task_wait']);
       expect(tools.find((x:{name:string})=>x.name==='project_read').annotations.readOnlyHint).toBe(true);
       expect(tools.find((x:{name:string})=>x.name==='project_replace').annotations.readOnlyHint).toBe(false);
       expect(tools.find((x:{name:string})=>x.name==='task_checkpoint').annotations.readOnlyHint).toBe(false);
       const health=await rpc(service.endpointUrl,'tools/call','runtime_health');
       expect(health.data.result.structuredContent).toMatchObject({
         mcp:'LOCAL_ONLY',identity_verified:false,chatgpt_tool_registry:'NOT_VERIFIED',
-        server_toolset:'web-first-project-workflow-p3.2-v1'
+        server_toolset:'web-first-project-goal-plan-p3.3-v1'
       });
       expect(health.data.result.structuredContent.server_tools.sort()).toEqual([...EXPECTED_READ_ONLY_CORE_TOOLS]);
     }finally{await service.close();}
+  });
+  it('updates a task-scoped plan only with separate native approval, exact revision and nonce',async()=>{
+    const {service,p}=await prepare([],true,false,false);
+    try{
+      const newTask=await rpc(service.endpointUrl,'tools/call','task_begin',{
+        project_id:p.id,goal:'Local plan integration test'});
+      const id=newTask.data.result.structuredContent.result.task_id;
+      const values={task_id:id,expected_revision:0,nonce:'approval-test-001',explanation:'Run checks',
+        plan:[{step:'Run tests',status:'in_progress'}]};
+      const refused=await rpc(service.endpointUrl,'tools/call','task_plan_update',values);
+      expect(refused.data.result.isError).toBe(true);
+      expect(JSON.stringify(refused.data)).toContain('PLAN_NATIVE_APPROVAL_DENIED');
+      const status=await rpc(service.endpointUrl,'tools/call','task_plan_status',{task_id:id});
+      expect(status.data.result.structuredContent.result).toBeNull();
+    }finally{await service.close();}
+    const accepted=await prepare([],true,false,true);
+    try{
+      const task=await rpc(accepted.service.endpointUrl,'tools/call','task_begin',{
+        project_id:accepted.p.id,goal:'Approved native plan'});
+      const id=task.data.result.structuredContent.result.task_id;
+      const values={task_id:id,expected_revision:0,nonce:'approved-plan-001',explanation:'Proof',
+        plan:[{step:'Check files',status:'completed'},{step:'Test app',status:'in_progress'}]};
+      const changed=await rpc(accepted.service.endpointUrl,'tools/call','task_plan_update',values);
+      expect(changed.data.result.structuredContent.result.revision).toBe(1);
+      const again=await rpc(accepted.service.endpointUrl,'tools/call','task_plan_update',values);
+      expect(again.data.result.structuredContent.result.revision).toBe(1);
+      const stale=await rpc(accepted.service.endpointUrl,'tools/call','task_plan_update',{
+        ...values,nonce:'other-plan-001'});
+      expect(stale.data.result.isError).toBe(true);
+      const reread=await rpc(accepted.service.endpointUrl,'tools/call','task_plan_status',{task_id:id});
+      expect(reread.data.result.structuredContent.result.plan).toEqual(values.plan);
+    }finally{await accepted.service.close();}
   });
   it('native approval is mandatory for task creation and user cannot claim task completion',async()=>{
     const {service,p}=await prepare();try{

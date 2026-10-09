@@ -24,6 +24,15 @@ describe('P3 task lifecycle: durable, idempotent, no blind automatic continuatio
     const mode=(await stat(path.join(x.profile,'web-first-tasks.json'))).mode;
     expect(mode&0o077).toBe(0);
   });
+  it('native pause survives restart and requires explicit operator resume',async()=>{
+    const x=await make();const a=await x.store.begin({projectId:'project-opaque-1',projectRoot:x.project,goal:'Pause/Resume scenario'});
+    const paused=await x.store.nativeDecision(a.id,1,'pause');
+    expect(paused.phase).toBe('paused');
+    expect((await new WebFirstTaskLedger(x.profile).get(a.id)).phase).toBe('paused');
+    await expect(x.store.checkpoint(a.id,2,n('illegal'),'No unapproved work')).rejects.toThrow('TASK_NOT_ACTIVE');
+    const resumed=await x.store.nativeDecision(a.id,2,'resume');
+    expect(resumed.phase).toBe('active');expect(resumed.revision).toBe(3);
+  });
   it('handles wait, restart HOLD, operator resume, review and operator completion',async()=>{
     const x=await make();const task=await x.store.begin({projectId:'project-one',projectRoot:x.project,goal:'Long task'});
     const waited=await x.store.wait(task.id,1,n('wait'),15);

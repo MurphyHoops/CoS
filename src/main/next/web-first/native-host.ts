@@ -24,6 +24,9 @@ import {WebFirstOperationJournal} from './operation-journal.js';
 import {WebFirstProjectWriter} from './project-write.js';
 import {WebFirstTaskLedger} from './task-ledger.js';
 import {WebFirstTaskTools} from './task-tools.js';
+import {WebFirstPlanLedger} from './plan-ledger.js';
+import {WebFirstPlanTools} from './plan-tools.js';
+import {renderGoalWorkbench,parseWorkbenchAction,parsePlanLines} from './goal-workbench.js';
 import {conversationFromUrl,VISIBLE_REPLY_SCRIPT,WebReplySettleTracker,WebFirstReplyJournal,type VisibleWebReply} from './web-reply-observer.js';
 import {WebFirstWebOutbox} from './web-outbox.js';
 import {sendNativeWebFirstMessage} from './native-web-input.js';
@@ -50,6 +53,7 @@ export interface NativeWebHost {
   getCorePosture:()=>string;
   snapshotVisibleAssistant:()=>Promise<VisibleWebReply|null>;
   testRecoveryOverlayOffline?:()=>Promise<boolean>;
+  testGoalWorkbenchOffline?:()=>Promise<boolean>;
 }
 export function launchNextWebFirstHost(options: {
   /** Only a fixture launch may use data URLs; the production path is fixed. */
@@ -187,6 +191,7 @@ export function launchNextWebFirstHost(options: {
   });
 
   const taskLedger=new WebFirstTaskLedger(options.projectStoreDir);
+  const planLedger=new WebFirstPlanLedger(options.projectStoreDir,taskLedger);
   const webReplies=new WebFirstReplyJournal(options.projectStoreDir);
   const webOutbox=new WebFirstWebOutbox(options.projectStoreDir);
   const replyTracker=new WebReplySettleTracker();
@@ -239,6 +244,19 @@ export function launchNextWebFirstHost(options: {
     });
     return !owner.isDestroyed()&&approve.response===1;
   });
+  const planTools=new WebFirstPlanTools(planLedger,taskLedger,async (_action,details)=>{
+    if(offline)return true;
+    if(owner.isDestroyed())return false;
+    const approve=await dialog.showMessageBox(owner,{
+      type:'question',title:'批准 ChatGPT 更新本地计划',
+      message:'允许更新任务计划（'+details.steps.length+' 个步骤）吗？',
+      detail:details.goal.slice(0,300)+'\n\n'+
+        details.steps.slice(0,12).map(st=>st.status+' · '+st.step).join('\n').slice(0,1700)+
+        '\n\n只保存任务元数据；不授予文件修改、终端或自动 Loop 权限。',
+      buttons:['拒绝','保存本次计划'],defaultId:0,cancelId:0,noLink:true
+    });
+    return !owner.isDestroyed()&&approve.response===1;
+  });
   let approvals:Promise<unknown>=Promise.resolve();
   let mcpService:Awaited<ReturnType<typeof createWebFirstCoreLoopback>>|null=null;
   let mcpStartFlight:Promise<{endpointUrl:string;port:number}>|null=null;
@@ -264,9 +282,16 @@ export function launchNextWebFirstHost(options: {
       const info=await grants.inspect();
       grantSummary={permanent:info.persistent.length,session:info.session.length,error:false};
     }catch{grantSummary.error=true;}
+    let goalSummary={total:0,active:0,waiting:0,error:false};
+    try{const saved=await taskLedger.list();
+      goalSummary={total:saved.length,active:saved.filter(t=>t.phase==='active').length,
+        waiting:saved.filter(t=>['waiting','recovery-hold','paused'].includes(t.phase)).length,
+        error:false};
+    }catch{goalSummary.error=true;}
     if(closingForTunnelStop||owner.isDestroyed()||sidebar.webContents.isDestroyed())return;
     await sidebar.webContents.loadURL('data:text/html;charset=utf-8,'+
-      encodeURIComponent(renderProjectSidebar(cachedProjects,state,registryError,grantSummary)));
+      encodeURIComponent(renderProjectSidebar(cachedProjects,state,registryError,
+        grantSummary,goalSummary)));
   };
   const headerHeight = 48;
   const sidebarWidth=268;
@@ -614,7 +639,7 @@ export function launchNextWebFirstHost(options: {
         if(consent.response!==1)throw Error('WEBFIRST_CORE_NOT_APPROVED');
       }
       const authority=new WebFirstReadAuthority(projects,approveScopedRead);
-      const created=await createWebFirstCoreLoopback(authority,journal,taskTools,writeAuthority);
+      const created=await createWebFirstCoreLoopback(authority,journal,taskTools,writeAuthority,planTools);
       if(owner.isDestroyed()){
         await created.close();throw Error('WEBFIRST_WINDOW_CLOSED');
       }
@@ -907,6 +932,86 @@ export function launchNextWebFirstHost(options: {
       buttons:['关闭']
     });
   };
+  let goalWindow:BrowserWindow|null=null;
+  let goalFormBusy=false;
+  const openGoalWorkbench=async():Promise<void>=>{
+    if(owner.isDestroyed())return;
+    if(goalWindow&&!goalWindow.isDestroyed()){
+      goalWindow.show();goalWindow.focus();return;
+    }
+    const goalUi=new BrowserWindow({parent:owner,title:'CoS Next · Goal / 计划工作台',
+      width:850,height:760,minWidth:580,minHeight:460,show:true,
+      backgroundColor:'#111c29',webPreferences:{nodeIntegration:false,
+        contextIsolation:true,sandbox:true,webSecurity:true,javascript:false,webviewTag:false}});
+    goalWindow=goalUi;
+    goalUi.webContents.setWindowOpenHandler(()=>({action:'deny'}));
+    goalUi.webContents.on('will-attach-webview',event=>event.preventDefault());
+    goalUi.webContents.on('will-redirect',event=>event.preventDefault());
+    const render=async(message='')=>{
+      if(goalUi.isDestroyed())return;
+      const [projectList,taskList,planList,limit]=await Promise.all([
+        projects.list(),taskLedger.list(),planLedger.list(),
+        throttle.status().catch(()=>null)]);
+      if(goalUi.isDestroyed())return;
+      const html=renderGoalWorkbench({projects:projectList,tasks:taskList,plans:planList,message,limit});
+      await goalUi.webContents.loadURL('data:text/html;charset=utf-8,'+encodeURIComponent(html));
+    };
+    goalUi.webContents.on('will-navigate',(event,url)=>{
+      // All navigation is rejected; the native main process validates one
+      // exact local action and handles it without ever touching the network.
+      event.preventDefault();
+      if(offline)process.stdout.write('WEB_FIRST_OFFLINE_GOAL_FORM_NAV_EVENT\n');
+      if(goalFormBusy||goalUi.isDestroyed())return;
+      goalFormBusy=true;
+      void (async()=>{
+        try{
+          const command=parseWorkbenchAction(url);
+          if(command.kind==='refresh'){await render('已刷新');return;}
+          if(command.kind==='create'){
+            const steps=parsePlanLines(command.lines);
+            const project=(await projects.list()).find(p=>p.id===command.projectId);
+            if(!project)throw Error('GOAL_PROJECT_NOT_REGISTERED');
+            const task=await taskLedger.begin({projectId:project.id,projectRoot:project.root,
+              goal:command.goal.trim()});
+            // An interrupted plan save must not silently delete the goal.
+            if(steps.length)await planLedger.update({taskId:task.id,expectedRevision:0,
+              nonce:randomUUID(),explanation:'由原生 Goal 工作台创建',steps});
+            await render('目标已保存到本机。创建目标不会启动自动模型循环。');
+            void refreshSidebar();return;
+          }
+          if(command.kind==='update-plan'){
+            const steps=parsePlanLines(command.lines);
+            await planLedger.update({taskId:command.taskId,expectedRevision:command.revision,
+              nonce:randomUUID(),explanation:'由原生工作台更新计划',steps});
+            await render('计划已保存并更新版本；尚未自动执行步骤。');return;
+          }
+          const task=await taskLedger.get(command.taskId);
+          if(task.revision!==command.revision)throw Error('GOAL_TASK_STALE_REVISION');
+          if(command.decision==='complete'||command.decision==='cancel'){
+            const sure=await dialog.showMessageBox(goalUi,{
+              type:'warning',title:'确认更改任务状态',
+              message:command.decision==='complete'?'确认为已验收完成？':'确认取消这个目标？',
+              detail:task.goal.slice(0,500)+'\n\n不会删除已有记录，也不会触发新的模型消息。',
+              buttons:['返回','确认'],defaultId:0,cancelId:0,noLink:true
+            });
+            if(sure.response!==1||goalUi.isDestroyed())return;
+          }
+          await taskLedger.nativeDecision(task.id,task.revision,command.decision);
+          await render('任务状态已持久化。');void refreshSidebar();
+        }catch(err){
+          const reason=err instanceof Error&&/^[A-Z_]+$/.test(err.message)?err.message:'GOAL_ACTION_REJECTED';
+          try{await render('未执行修改：'+reason+'；可刷新查看当前保存的任务。');}
+          catch{/* corrupted ledger: preserve on-disk record */}
+        }finally{goalFormBusy=false;}
+      })();
+    });
+    goalUi.on('closed',()=>{if(goalWindow===goalUi)goalWindow=null;});
+    try{await render();}catch{
+      if(!goalUi.isDestroyed())await dialog.showMessageBox(goalUi,{type:'error',
+        message:'本机目标或计划记录不可安全读取。未覆盖现有数据。',buttons:['关闭']});
+    }
+  };
+  owner.on('closed',()=>{if(goalWindow&&!goalWindow.isDestroyed())goalWindow.close();});
   const manageDurableTasks=async()=>{
     if(owner.isDestroyed())return;
     try{
@@ -1063,6 +1168,7 @@ export function launchNextWebFirstHost(options: {
       {label:'管理/撤销只读授权',click:()=>{void manageReadGrants();}},
       {label:'撤销全部只读授权',click:()=>{void revokeAllReadGrants();}},
       {label:'查看本地操作收据',click:()=>{void showOperations();}},
+      {label:'Goal / 计划工作台（创建、编辑、恢复）',click:()=>{void openGoalWorkbench();}},
       {label:'P3 持久任务与恢复',click:()=>{void manageDurableTasks();}},
       {label:'在当前 ChatGPT 网页续接任务一次（需确认）',click:()=>{void continueTaskOneNativeTurn();}},
       {label:'开始/停止当前对话连续工作观察（不自动发送）',click:()=>{void armContinuityObservation();}},
@@ -1097,6 +1203,62 @@ export function launchNextWebFirstHost(options: {
     // 'did-fail-load' owns the error code; never log full URL or auth redirect.
     if(status.state!=='load-failed')status.state='load-failed';
   });
+  const testGoalWorkbenchOffline=async():Promise<boolean>=>{
+    if(!offline||owner.isDestroyed())throw Error('GOAL_SMOKE_ONLY_OFFLINE');
+    await openGoalWorkbench();
+    const window=goalWindow;
+    if(!window||window.isDestroyed())return false;
+    const before=await taskLedger.list();
+    const fixtureProject=(await projects.list())[0];
+    if(!fixtureProject)return false;
+    // The native test drives the sandboxed JavaScript-disabled form. It does
+    // not access the real ChatGPT page or any actual user workspace.
+    const wc=window.webContents;
+    let attached=false;
+    try{
+      wc.debugger.attach('1.3');attached=true;
+      const root=(await wc.debugger.sendCommand('DOM.getDocument',{depth:-1})) as {
+        root:{nodeId:number}};
+      const point=async(selector:string)=>{
+        const node=(await wc.debugger.sendCommand('DOM.querySelector',{
+          nodeId:root.root.nodeId,selector})) as {nodeId:number};
+        if(!node.nodeId)throw Error('GOAL_FORM_ELEMENT_MISSING');
+        const box=(await wc.debugger.sendCommand('DOM.getBoxModel',{nodeId:node.nodeId})) as {
+          model:{content:number[]}};
+        const [x1,y1,x2,y2,x3,y3,x4,y4]=box.model.content;
+        return {x:((x1??0)+(x2??0)+(x3??0)+(x4??0))/4,
+          y:((y1??0)+(y2??0)+(y3??0)+(y4??0))/4};
+      };
+      const click=async(selector:string)=>{
+        const {x,y}=await point(selector);
+        await wc.debugger.sendCommand('Input.dispatchMouseEvent',{
+          type:'mousePressed',x,y,button:'left',clickCount:1});
+        await wc.debugger.sendCommand('Input.dispatchMouseEvent',{
+          type:'mouseReleased',x,y,button:'left',clickCount:1});
+      };
+      await click('textarea[name="goal"]');
+      await wc.debugger.sendCommand('Input.insertText',{text:'OFFLINE_NATIVE_GOAL_FORM_PASS'});
+      await click('textarea[name="steps"]');
+      await wc.debugger.sendCommand('Input.insertText',{
+        text:'[>] Verify native goal\n[ ] Review checkpoint'});
+      await click('form[action$="create"] button[type="submit"]');
+    }catch{
+      process.stderr.write('WEB_FIRST_OFFLINE_GOAL_NATIVE_INPUT_FAILED\n');return false;
+    }finally{if(attached&&wc.debugger.isAttached())wc.debugger.detach();}
+    let found=false;
+    for(let i=0;i<18;i++){
+      await new Promise(resolve=>setTimeout(resolve,150));
+      const tasks=await taskLedger.list();
+      const task=tasks.find(t=>t.goal==='OFFLINE_NATIVE_GOAL_FORM_PASS');
+      if(task){const plan=await planLedger.status(task.id);
+        found=tasks.length===before.length+1&&plan?.steps.length===2;
+        if(found)break;
+      }
+    }
+    if(!found)process.stderr.write('WEB_FIRST_OFFLINE_GOAL_FORM_DID_NOT_PERSIST\n');
+    if(!window.isDestroyed())window.close();
+    return found;
+  };
   const testRecoveryOverlayOffline=async():Promise<boolean>=>{
     if(!offline||owner.isDestroyed())throw Error('RECOVERY_TEST_ONLY_OFFLINE');
     pageRecovery.renderFailure(-105);
@@ -1111,5 +1273,5 @@ export function launchNextWebFirstHost(options: {
   return {window:owner,status:()=>({...status}),reload:()=>view.webContents.reload(),diagnostics,
     nativeProjects:()=>projects.list(),enableNativeCore,disableNativeCore,
     getCorePosture:()=>mcpState,snapshotVisibleAssistant,
-    ...(offline?{testRecoveryOverlayOffline}:{})};
+    ...(offline?{testRecoveryOverlayOffline,testGoalWorkbenchOffline}:{})};
 }
