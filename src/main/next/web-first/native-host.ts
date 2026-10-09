@@ -11,7 +11,8 @@ import {
   CHATGPT_START_URL, WEB_FIRST_PARTITION, isAllowedWebFirstNavigation,
   classifyWebFirstNavigation
 } from './host-policy.js';
-import {newWebHealthTracker, type WebHealthSnapshot} from './web-health.js';
+import {newWebHealthTracker,safeApiRouteClass,type WebHealthSnapshot} from './web-health.js';
+import {WebFirstHealthLedger,type NativeHealthKind,type NativeHealthRoute} from './health-ledger.js';
 import {PageRecoveryGate,type SafePageProbe} from './page-recovery.js';
 import {allowedOAuthStoragePermission,allowedOAuthPopup} from './login-permissions.js';
 import {WebFirstProjectRegistry, type WebFirstProject} from './project-registry.js';
@@ -61,6 +62,16 @@ export function launchNextWebFirstHost(options: {
 }): NativeWebHost {
   const offline = options.offlineSmoke === true;
   const health=newWebHealthTracker();
+  const healthLedger=new WebFirstHealthLedger(options.projectStoreDir);
+  const healthReceipt=(kind:NativeHealthKind,route:NativeHealthRoute,
+    status:number|null=null,code:number|null=null)=>{
+    if(offline)return;
+    void healthLedger.record({kind,route,status,code}).catch(()=>{
+      // Diagnostic journal is non-authoritative; corruption never grants
+      // privileges or triggers a browser reload or model send.
+    });
+  };
+  healthReceipt('app-started','not-applicable');
   const pageRecovery=new PageRecoveryGate();
   pageRecovery.navigate(Date.now());
   const webSession = session.fromPartition(WEB_FIRST_PARTITION);
@@ -77,8 +88,16 @@ export function launchNextWebFirstHost(options: {
   webSession.on('will-download', event => event.preventDefault());
   webSession.webRequest.onCompleted(details=>{
     if(details.webContentsId)health.completed(details.url,details.statusCode);
-    if(details.webContentsId===view.webContents.id && details.resourceType==='mainFrame')
+    if(details.webContentsId!==view.webContents.id)return;
+    if(details.resourceType==='mainFrame'){
       pageRecovery.httpStatus(details.statusCode);
+      if(details.statusCode>=400)healthReceipt('main-frame-http-error',
+        'chatgpt-main',details.statusCode);
+    }else if(details.statusCode===429&&safeApiRouteClass(details.url)==='conversation-list'){
+      // Route classification is an ephemeral yes/no test only. Neither the URL,
+      // query string nor conversation ID is persisted.
+      healthReceipt('api-rate-limited','conversation-list',429);
+    }
   });
   webSession.webRequest.onErrorOccurred(details=>{if(details.webContentsId)health.failed(details.url,details.error);});
   const owner = new BrowserWindow({
@@ -360,12 +379,17 @@ export function launchNextWebFirstHost(options: {
   view.webContents.on('did-fail-load',(_event,code,isMainFrame)=>{
     if(!isMainFrame || code===-3)return; // ordinary redirect cancellation
     status.state='load-failed'; status.lastErrorCode=code;
-    if(!offline){pageRecovery.renderFailure(code);showRecoveryOverlay();}
+    if(!offline){
+      healthReceipt('main-frame-network-error','chatgpt-main',null,code);
+      pageRecovery.renderFailure(code);showRecoveryOverlay();
+    }
     options.onNavigationOutcome?.({...status});
   });
   view.webContents.on('render-process-gone',()=>{
     if(offline||owner.isDestroyed())return;
-    status.state='load-failed';pageRecovery.rendererGone();showRecoveryOverlay();
+    status.state='load-failed';
+    healthReceipt('web-renderer-gone','chatgpt-main');
+    pageRecovery.rendererGone();showRecoveryOverlay();
   });
   // A completed but entirely empty document produces no did-fail-load event.
   // Observe counts ONLY, never HTML/text/conversation content or cookies.
@@ -391,6 +415,7 @@ export function launchNextWebFirstHost(options: {
         if(reply&&typeof reply==='object')sample=reply as SafePageProbe;
       }catch{/* renderer not accessible; manual recovery remains available */}
       const result=pageRecovery.probe(sample,Date.now());
+      if(result.issue)healthReceipt('page-empty','chatgpt-main',result.issue.status);
       if(result.retry&&!view.webContents.isDestroyed()&&
         classifyWebFirstNavigation(view.webContents.getURL())==='chatgpt'){
         // At most once, only after sustained truly empty DOM with no editor.
@@ -429,13 +454,15 @@ export function launchNextWebFirstHost(options: {
   const showDiagnostics=async()=>{
     const snap=await diagnostics();
     if(owner.isDestroyed())return;
+    let recentHealth:unknown='NO_HEALTH_RECEIPTS';
+    try{recentHealth=await healthLedger.last(8);}catch{recentHealth='LOCAL_HEALTH_LEDGER_INVALID';}
     await dialog.showMessageBox(owner,{
       type:'info',title:'CoS Next · Web-First 安全诊断',
       message:'网页状态（不读取 Cookie 或聊天正文）',
       detail:JSON.stringify({navigation:status,
         recovery:{mainFrameHttpStatus:pageRecovery.http,issue:pageRecovery.issue,
           blankAutoRetryUsed:pageRecovery.autoRetried,overlayVisible:!!recoveryOverlay},
-        ...snap},null,2),
+        recentNativeHealthReceipts:recentHealth,...snap},null,2),
       buttons:['关闭']
     });
   };

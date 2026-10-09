@@ -105,3 +105,25 @@ from messages.
 recent receipts, task ledger, ChatGPT page health and tunnel owner before
 running any mutation. Never replay an ambiguous action just because a
 previous chat was compacted or interrupted.
+
+## Next implementation: privacy-bounded health ledger
+
+A follow-up P3 hardening introduces `WebFirstHealthLedger` at
+`src/main/next/web-first/health-ledger.ts`. It uses a single 0600,
+append-only, fsync'd local file `web-first-health.jsonl`; events have only a
+random receipt ID, local timestamp, whitelisted event kind/route label,
+HTTP status and bounded numeric error code. The schema rejects unexpected
+fields and malformed/untrusted files. The storage limit is 512 KiB; a full
+or tampered file causes a diagnostic-only rejection, **not** a project or
+login reset. Browser main-frame HTTP errors, conversation-list 429s,
+main-frame transport errors, dead renderer, and sustained-empty-page
+conditions are recorded without storing URL/query/header/cookie/chat text.
+
+`ChatGPT 网页 → 检查网页健康状态` adds a recent sanitized receipt view to the
+existing coarse network and DOM counts. A user's chat history is not treated
+as lost merely because the history endpoint returns 429. No background
+retries, extra model calls or automatic ChatGPT turn submissions were added.
+The new capability was packaged into a separate ARM64 candidate and passed
+its isolated Electron offline smoke; it must not be represented as deployed
+until that candidate is explicitly installed. Keep the current system-owned
+healthy app running unless a controlled update is appropriate.
