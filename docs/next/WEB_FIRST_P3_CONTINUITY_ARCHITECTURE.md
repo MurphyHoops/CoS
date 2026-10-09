@@ -117,3 +117,48 @@ follow-up loop.
 The default task model deliberately stays **user-and-tool-driven** in P3b;
 next build must add durable exact-conversation outbox, post-send receipt,
 fail-closed replay protection and opt-in turn/time budget before auto-followups.
+
+## P3c — native one-shot web continuation with crash-safe delivery receipt
+
+`WebFirstWebOutbox` stores a per-task/per-conversation explicit instruction,
+operator-approved local nonce and delivery state in a 0600 fsync'd atomic
+ledger. Its lifecycle is `queued → dispatching → delivered` on positive
+visible DOM evidence, otherwise `uncertain`; restart downgrades both queued
+and dispatching messages to **uncertain**, never replays either automatically.
+Nonce collisions with changed arguments and corrupted/tampered journals fail
+closed. A task can submit at most five explicit follow-ups per ChatGPT chat,
+with no other automatic message submissions.
+
+The native `本地项目 → 在当前 ChatGPT 网页续接任务一次（需确认）`
+menu operates only on an already **ACTIVE** and user-approved task. The
+operator chooses a task, sees the exact outgoing prompt and confirms once;
+there is no browser-autopilot default. The recipient must be the exact live
+`https://chatgpt.com/c/<conversation-uuid>` currently open in the app; an
+existing draft, active generation or changed navigation refuses dispatch.
+Electron's OWN WebContents debugger dispatches genuine pointer/keyboard/text
+input directly into the official page's visible composer, without an external
+Chrome instance/extension or backend model API. A new rendered user message
+matching the exact proposed text is required for DELIVERED; otherwise the
+status remains UNCERTAIN and CoS cannot automatically resend it. The local
+request must be durably marked DISPATCHING before the first input event.
+
+A **real packaged macOS ARM64 Electron offline browser fixture** has passed
+`WEB_FIRST_OFFLINE_BROWSER_CONTINUATION_PASS`: a native click/type/Enter
+created a user message in the fixture, and the exact outbox proof survived
+fresh on-disk reload. The same smoke also passed native assistant reply
+capture, task begin/checkpoint/wait, file reads, grant recovery and browser
+input. No ChatGPT account, Codex CLI, Chrome extension or model usage was
+involved. Actual ChatGPT **website** acceptance is still HOLD until user
+opts in to a real one-shot message and we compare authoritative turn state.
+
+### Remaining gates for uninterrupted Goal/Loop
+
+A bounded automatic follow-up supervisor with verified current-chat ownership,
+provider turn-settle evidence, task-specific opt-in, pause/stop, time/turn
+budgets and per-message durable receipts is **not yet enabled**. The current
+WebContents stable DOM observer is not strong enough to authorize automatic
+continuations by itself, especially across chat switches, virtualized history
+and provider changes. Old Classic multi-agent, exec/patch, project runtime,
+session wait and goal-loop backends remain in their original modules and the
+compatibility matrix; they have not yet been fully migrated into this new
+Web-First server. Keep the independent Core/Plugins/Desktop tool boundaries.

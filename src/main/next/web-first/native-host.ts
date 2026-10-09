@@ -21,6 +21,9 @@ import {WebFirstOperationJournal} from './operation-journal.js';
 import {WebFirstTaskLedger} from './task-ledger.js';
 import {WebFirstTaskTools} from './task-tools.js';
 import {conversationFromUrl,VISIBLE_REPLY_SCRIPT,WebReplySettleTracker,WebFirstReplyJournal,type VisibleWebReply} from './web-reply-observer.js';
+import {WebFirstWebOutbox} from './web-outbox.js';
+import {sendNativeWebFirstMessage} from './native-web-input.js';
+import {randomUUID} from 'node:crypto';
 import {createWebFirstCoreLoopback} from './core-loopback.js';
 import {readWebFirstLocalToolList,EXPECTED_READ_ONLY_CORE_TOOLS} from './core-catalogue.js';
 import {connectWebFirstImportedCore,type CoreTunnelState} from './core-transport.js';
@@ -99,6 +102,7 @@ export function launchNextWebFirstHost(options: {
   const journal=new WebFirstOperationJournal(options.projectStoreDir);
   const taskLedger=new WebFirstTaskLedger(options.projectStoreDir);
   const webReplies=new WebFirstReplyJournal(options.projectStoreDir);
+  const webOutbox=new WebFirstWebOutbox(options.projectStoreDir);
   const replyTracker=new WebReplySettleTracker();
   let recordingChat:string|null=null;
   let replyTimer:NodeJS.Timeout|null=null;
@@ -520,6 +524,64 @@ export function launchNextWebFirstHost(options: {
     if(current)await current.close();
     if(!owner.isDestroyed())await refreshSidebar();
   }
+  let webDispatchInProgress=false;
+  const continueTaskOneNativeTurn=async()=>{
+    if(webDispatchInProgress||owner.isDestroyed())return;
+    const conversationId=conversationFromUrl(view.webContents.getURL());
+    if(!conversationId){await dialog.showMessageBox(owner,{type:'warning',
+      message:'请先进入 ChatGPT 的具体对话，才可发送任务续接消息。',buttons:['关闭']});return;}
+    try{
+      const tasks=(await taskLedger.list()).filter(t=>t.phase==='active').slice(-4).reverse();
+      if(!tasks.length){await dialog.showMessageBox(owner,{type:'info',
+        message:'当前没有已经启动并授权的活动任务。请先通过 Core task_begin 创建任务。',
+        buttons:['关闭']});return;}
+      const chosen=await dialog.showMessageBox(owner,{
+        type:'question',title:'选择一次 Web-First 续接任务',
+        message:'此操作将使用已登录的 ChatGPT 网页发送一条普通消息',
+        detail:'它不使用 Codex CLI 或 API 模型，但仍计入 ChatGPT 网站的正常使用限额。',
+        buttons:['取消',...tasks.map(t=>t.goal.slice(0,65))],defaultId:0,cancelId:0,noLink:true
+      });
+      const task=tasks[chosen.response-1];
+      if(!task||conversationFromUrl(view.webContents.getURL())!==conversationId)return;
+      const prompt='继续当前已授权的项目任务（CoS 本地任务 ID：'+task.id+
+        '）。请依照当前对话和项目实际状态推进尚未完成的步骤。'
+        +'如果需要等待，请使用 task_wait；完成时使用 task_finish_request 请求本地审核。';
+      if(prompt.length>2000)throw Error('WEB_INPUT_PROMPT_INVALID');
+      const previous=(await webOutbox.list()).filter(x=>x.taskId===task.id&&x.conversationId===conversationId);
+      if(previous.some(x=>x.state==='uncertain'||x.state==='queued'||x.state==='dispatching'))
+        throw Error('WEB_INPUT_PREVIOUS_DELIVERY_UNCERTAIN');
+      if(previous.length>=5)throw Error('WEB_INPUT_TASK_TURN_BUDGET_EXHAUSTED');
+      const confirmed=await dialog.showMessageBox(owner,{
+        type:'warning',title:'确认向 ChatGPT 网页发送一次续接',
+        message:'确认发送以下一次性任务续接指令？',
+        detail:prompt+'\n\n如果网页是否已接收不能确认，会保留不确定收据而不自动重发。',
+        buttons:['取消','确认发送这一次'],defaultId:0,cancelId:0,noLink:true
+      });
+      if(confirmed.response!==1||owner.isDestroyed()||
+        conversationFromUrl(view.webContents.getURL())!==conversationId)return;
+      webDispatchInProgress=true;
+      const queued=await webOutbox.enqueue({taskId:task.id,conversationId,text:prompt,nonce:randomUUID()});
+      await webOutbox.transition(queued.id,'queued','dispatching');
+      let proof:string|null=null;
+      try{
+        const sent=await sendNativeWebFirstMessage(view.webContents,conversationId,prompt);
+        if(sent.proved)proof=sent.proof;
+      }finally{
+        await webOutbox.transition(queued.id,'dispatching',proof?'delivered':'uncertain',proof);
+      }
+      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{
+        type:proof?'info':'warning',
+        message:proof?'网页已出现匹配的用户消息，发送收据已保存。':
+          '网页发送结果不确定，CoS 不会自动重发。',
+        buttons:['关闭']
+      });
+    }catch{
+      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{type:'warning',
+        message:'续接发送被安全门禁阻止，或无法可靠确认网页收据。',
+        detail:'请检查当前对话是否有未发送草稿、模型是否仍在生成，以及本地操作收据。',
+        buttons:['关闭']});
+    }finally{webDispatchInProgress=false;}
+  };
   const toggleReplyCapture=async()=>{
     if(recordingChat){
       stopReplyCapture();
@@ -649,6 +711,7 @@ export function launchNextWebFirstHost(options: {
       {label:'撤销全部只读授权',click:()=>{void revokeAllReadGrants();}},
       {label:'查看本地操作收据',click:()=>{void showOperations();}},
       {label:'P3 持久任务与恢复',click:()=>{void manageDurableTasks();}},
+      {label:'在当前 ChatGPT 网页续接任务一次（需确认）',click:()=>{void continueTaskOneNativeTurn();}},
       {label:'开始/停止当前 ChatGPT 回复记录',click:()=>{void toggleReplyCapture();}},
       {label:'查看已接收的 ChatGPT 最新回复',click:()=>{void inspectCapturedReplies();}},
       {type:'separator'},
@@ -665,7 +728,7 @@ export function launchNextWebFirstHost(options: {
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(menus));
   resize();
-  const url=offline?'data:text/html;charset=utf-8,'+encodeURIComponent('<!doctype html><html><body><input id="native-smoke-input" contenteditable="true" style="position:fixed;left:40px;top:40px;height:30px;width:220px"><article data-message-author-role="assistant" data-message-id="offline-assistant-1">COS_WEBFIRST_OFFLINE_ASSISTANT_REPLY_OK</article></body></html>'):CHATGPT_START_URL;
+  const url=offline?'data:text/html;charset=utf-8,'+encodeURIComponent('<!doctype html><html><body><input id="native-smoke-input" contenteditable="true" style="position:fixed;left:40px;top:40px;height:30px;width:220px"><article data-message-author-role="assistant" data-message-id="offline-assistant-1">COS_WEBFIRST_OFFLINE_ASSISTANT_REPLY_OK</article><script>document.getElementById("native-smoke-input").addEventListener("keydown",function(event){if(event.key==="Enter"){event.preventDefault();let row=document.createElement("article");row.setAttribute("data-message-author-role","user");row.textContent=this.value;document.body.appendChild(row);this.value="";}});</script></body></html>'):CHATGPT_START_URL;
   void view.webContents.loadURL(url).catch(()=>{
     // 'did-fail-load' owns the error code; never log full URL or auth redirect.
     if(status.state!=='load-failed')status.state='load-failed';

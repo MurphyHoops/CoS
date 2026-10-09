@@ -4,6 +4,9 @@ import {mkdtempSync,mkdirSync,rmSync} from 'node:fs';
 import {WebFirstProjectRegistry} from './project-registry.js';
 import {WebFirstTaskLedger} from './task-ledger.js';
 import {WebFirstReplyJournal} from './web-reply-observer.js';
+import {WebFirstWebOutbox} from './web-outbox.js';
+import {sendNativeWebFirstMessage} from './native-web-input.js';
+import {randomUUID} from 'node:crypto';
 import {WebFirstReadGrants} from './read-grants.js';
 import {WebFirstOperationJournal} from './operation-journal.js';
 import {inspectExistingCredentialProfiles} from './credential-diagnostics.js';
@@ -63,6 +66,11 @@ app.whenReady().then(async()=>{
   }catch{
     if(offlineSmoke)throw Error('WEBFIRST_TASK_RECOVERY_LEDGER_FAILED');
   }
+  // If an earlier process died around a browser send, never re-submit it.
+  try{
+    const uncertain=await new WebFirstWebOutbox(profile).holdUncertain();
+    if(offlineSmoke)process.stdout.write('WEB_FIRST_OFFLINE_OUTBOX_RECOVERY_HOLD='+uncertain+'\n');
+  }catch{if(offlineSmoke)throw Error('WEBFIRST_OUTBOX_RECOVERY_FAILED');}
   let httpsReported=false;
   const smokeTimeout=httpsSmoke?setTimeout(()=>{
     process.stdout.write('WEB_FIRST_HTTPS_TIMEOUT\n'); app.quit();
@@ -139,6 +147,18 @@ app.whenReady().then(async()=>{
       await new WebFirstReplyJournal(profile).record(visible);
       if((await new WebFirstReplyJournal(profile).last(1))[0]?.text!==visible.text)
         throw Error('WEBFIRST_OFFLINE_ASSISTANT_PERSIST_FAILED');
+      await contents.executeJavaScript('document.querySelector("#native-smoke-input").value=""');
+      const syntheticOutbox=new WebFirstWebOutbox(profile);
+      const delivery=await syntheticOutbox.enqueue({taskId:task.task_id,
+        conversationId:randomUUID(),nonce:randomUUID(),text:'COS_WEBFIRST_OFFLINE_NATIVE_FOLLOWUP'});
+      await syntheticOutbox.transition(delivery.id,'queued','dispatching');
+      const sent=await sendNativeWebFirstMessage(contents,delivery.conversationId,delivery.text,true);
+      if(!sent.proved||!sent.proof)throw Error('WEBFIRST_OFFLINE_NATIVE_BROWSER_SEND_NOT_PROVED');
+      await syntheticOutbox.transition(delivery.id,'dispatching','delivered',sent.proof);
+      const savedOutbox=(await new WebFirstWebOutbox(profile).list()).at(-1);
+      if(savedOutbox?.state!=='delivered'||savedOutbox.proof!==sent.proof)
+        throw Error('WEBFIRST_OFFLINE_BROWSER_SEND_RECEIPT_NOT_DURABLE');
+      process.stdout.write('WEB_FIRST_OFFLINE_BROWSER_CONTINUATION_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_ASSISTANT_RECEIVE_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_DURABLE_TASK_RPC_PASS\n');
       await host.disableNativeCore();
