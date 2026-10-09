@@ -15,7 +15,9 @@ import {newWebHealthTracker, type WebHealthSnapshot} from './web-health.js';
 import {allowedOAuthStoragePermission,allowedOAuthPopup} from './login-permissions.js';
 import {WebFirstProjectRegistry, type WebFirstProject} from './project-registry.js';
 import {renderProjectSidebar} from './project-sidebar.js';
-import {WebFirstReadAuthority, type ReadAction} from './project-read.js';
+import {WebFirstReadAuthority, type ReadAction, type NativeReadApproval} from './project-read.js';
+import {WebFirstReadGrants,isSensitiveProjectPath} from './read-grants.js';
+import {WebFirstOperationJournal} from './operation-journal.js';
 import {createWebFirstCoreLoopback} from './core-loopback.js';
 import {readWebFirstLocalToolList,EXPECTED_READ_ONLY_CORE_TOOLS} from './core-catalogue.js';
 import {connectWebFirstImportedCore,type CoreTunnelState} from './core-transport.js';
@@ -89,6 +91,9 @@ export function launchNextWebFirstHost(options: {
   owner.contentView.addChildView(sidebar);
   owner.contentView.addChildView(view);
   const projects=new WebFirstProjectRegistry(options.projectStoreDir);
+  const grants=new WebFirstReadGrants(options.projectStoreDir);
+  const journal=new WebFirstOperationJournal(options.projectStoreDir);
+  let approvals:Promise<unknown>=Promise.resolve();
   let mcpService:Awaited<ReturnType<typeof createWebFirstCoreLoopback>>|null=null;
   let mcpStartFlight:Promise<{endpointUrl:string;port:number}>|null=null;
   let mcpState:'UNCONNECTED'|'LOCAL_ONLY'|'REMOTE_CONNECTING'|'REMOTE_CONNECTED'|'HOLD'='UNCONNECTED';
@@ -101,9 +106,14 @@ export function launchNextWebFirstHost(options: {
     let registryError=false;
     try{cachedProjects=await projects.list();}
     catch{registryError=true;cachedProjects=[];}
+    let grantSummary={permanent:0,session:0,error:false};
+    try{
+      const info=await grants.inspect();
+      grantSummary={permanent:info.persistent.length,session:info.session.length,error:false};
+    }catch{grantSummary.error=true;}
     if(sidebar.webContents.isDestroyed())return;
     await sidebar.webContents.loadURL('data:text/html;charset=utf-8,'+
-      encodeURIComponent(renderProjectSidebar(cachedProjects,state,registryError)));
+      encodeURIComponent(renderProjectSidebar(cachedProjects,state,registryError,grantSummary)));
   };
   const headerHeight = 48;
   const sidebarWidth=268;
@@ -229,6 +239,100 @@ export function launchNextWebFirstHost(options: {
       buttons:['关闭']
     });
   };
+  const manageReadGrants=async()=>{
+    try{
+      const state=await grants.inspect();
+      const entries=[...state.persistent.map(g=>({...g,mode:'永久'})),
+        ...state.session.map(g=>({...g,mode:'本次运行'}))];
+      if(!entries.length){
+        await dialog.showMessageBox(owner,{type:'info',message:'当前没有已授予的只读权限。',
+          detail:'你也可以在下次读取弹窗中选择“本次运行允许”或“始终允许”。',buttons:['关闭']});return;
+      }
+      for(let i=0;i<entries.length;i++){
+        const grant=entries[i];if(!grant||owner.isDestroyed())return;
+        const decision=await dialog.showMessageBox(owner,{
+          type:'question',title:'管理与撤销本地只读授权',
+          message:(i+1)+' / '+entries.length+'：'+grant.mode+' · '+
+            (grant.scope==='catalog'?'仅项目名称与 ID':'项目目录只读'),
+          detail:(grant.root??'项目名称列表')+'\n\n撤销立即生效。正在处理中的已获批请求不能被撤回。',
+          buttons:['撤销这一项','查看下一项','关闭'],defaultId:2,cancelId:2,noLink:true
+        });
+        if(decision.response===2)return;
+        if(decision.response===0)await grants.revoke(grant.scope,grant.projectId);
+      }
+      await refreshSidebar();
+    }catch{
+      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{type:'error',
+        message:'授权记录无法安全读取或更新。所有自动批准已暂停。',buttons:['关闭']});
+    }
+  };
+  const revokeAllReadGrants=async()=>{
+    if(owner.isDestroyed())return;
+    const decision=await dialog.showMessageBox(owner,{
+      type:'warning',title:'撤销所有本地只读授权',
+      message:'确定撤销全部永久授权和本次运行授权？',
+      detail:'以后访问每个项目都将重新请求明确批准。不会删除项目目录或原有 ChatGPT 登录。',
+      buttons:['取消','撤销全部'],defaultId:0,cancelId:0,noLink:true
+    });
+    if(decision.response!==1)return;
+    try{await grants.revokeAll();await refreshSidebar();}
+    catch{if(!owner.isDestroyed())await dialog.showMessageBox(owner,{
+      type:'error',message:'撤销未能安全完成，请暂停使用项目工具。',buttons:['关闭']});}
+  };
+  const showOperations=async()=>{
+    try{
+      const receipts=await journal.last(18);
+      const details=receipts.map(r=>new Date(r.at).toLocaleString()+'  '+
+        r.action+'  '+r.stage).join('\n');
+      await dialog.showMessageBox(owner,{title:'P3 · 本地工具执行收据',
+        message:'本地只读工具事件（仅元数据）',detail:details||'目前没有本地工具执行记录。',
+        buttons:['关闭']});
+    }catch{if(!owner.isDestroyed())await dialog.showMessageBox(owner,{type:'error',
+      message:'本地操作收据验证失败，操作应暂停。',buttons:['关闭']});}
+  };
+  const approveScopedRead:NativeReadApproval=async request=>{
+    const review=async():Promise<boolean>=>{
+      if(offline)return true; // disposable offline smoke fixture only
+      if(owner.isDestroyed())return false;
+      const scope=request.action==='project_list'?'catalog':'project-read';
+      const projectId=request.projectId??null;
+      const root=request.projectRoot??null;
+      try{
+        if(await grants.allowed(scope,projectId,root,request.target??null,request.action))return true;
+        const sensitive=scope==='project-read'&&(!root||!request.target||isSensitiveProjectPath(root,request.target));
+        const label:Record<ReadAction,string>={
+          project_list:'查看项目名称与 ID',
+          project_ls:'列举项目目录中的文件名',
+          project_read:'读取项目内文件正文（上限 32 KiB）'
+        };
+        const buttons=sensitive?['拒绝','仅允许这一次']:
+          ['拒绝','仅允许这一次','本次运行允许','始终允许（该范围只读）'];
+        const result=await dialog.showMessageBox(owner,{
+          type:'question',title:'CoS Next · 本地项目只读授权',
+          message:'是否'+label[request.action]+'？',
+          detail:(request.projectName?'项目：'+request.projectName+'\n':'')+
+            (request.target?'路径：'+request.target+'\n':'')+
+            (sensitive?'敏感目录或文件不会授予持久自动访问。\n':'')+
+            '注意：目前无法可靠绑定具体 ChatGPT 会话。\n'
+            +'永久授权可被同一 Core 连接中的其他对话使用；请只授予你信任的项目。\n'
+            +'本次/永久授权不包括文件写入、终端执行或 Git 发布。',
+          buttons,defaultId:0,cancelId:0,noLink:true
+        });
+        if(result.response===0||owner.isDestroyed())return false;
+        if(result.response===2)await grants.grant(scope,projectId,root,'session');
+        if(result.response===3)await grants.grant(scope,projectId,root,'always');
+        if(result.response>=2)await refreshSidebar();
+        return true;
+      }catch{
+        if(!owner.isDestroyed())await dialog.showMessageBox(owner,{type:'error',
+          message:'只读授权记录校验失败，已拒绝本次自动访问。',buttons:['关闭']});
+        return false;
+      }
+    };
+    // Coalesce racing requests: the first durable approval covers subsequent
+    // reads in its approved scope, preventing a storm of duplicate dialogs.
+    const wait=approvals.then(review);approvals=wait.catch(()=>undefined);return wait;
+  };
   const addProjectFromNativePicker=async()=>{
     const chosen=await dialog.showOpenDialog(owner,{
       title:'CoS Next — 选择本地项目目录',properties:['openDirectory']
@@ -268,28 +372,8 @@ export function launchNextWebFirstHost(options: {
         });
         if(consent.response!==1)throw Error('WEBFIRST_CORE_NOT_APPROVED');
       }
-      const authority=new WebFirstReadAuthority(projects,async request=>{
-        if(offline){ // smoke is isolated to synthetic /tmp project
-          return request.action==='project_list'||request.action==='project_ls'||request.action==='project_read';
-        }
-        if(owner.isDestroyed())return false;
-        const action:Record<ReadAction,string>={
-          project_list:'查看已登记的项目名称和 ID',
-          project_ls:'列举项目目录中的文件名',
-          project_read:'读取文件正文（最多 32 KiB）'
-        };
-        const approval=await dialog.showMessageBox(owner,{
-          type:'question',title:'CoS Next · 单次本地工具请求',
-          message:'允许此次 '+action[request.action]+'？',
-          detail:(request.projectName?'项目：'+request.projectName+'\n':'')+
-            (request.target?'路径：'+request.target+'\n':'')+
-            '请求方身份尚未建立可信绑定。请确认这是你刚刚发起的操作。\n'
-            +'仅批准当前一次读取，不授权任何后续请求。',
-          buttons:['拒绝','批准一次'],defaultId:0,cancelId:0,noLink:true
-        });
-        return !owner.isDestroyed()&&approval.response===1;
-      });
-      const created=await createWebFirstCoreLoopback(authority);
+      const authority=new WebFirstReadAuthority(projects,approveScopedRead);
+      const created=await createWebFirstCoreLoopback(authority,journal);
       if(owner.isDestroyed()){
         await created.close();throw Error('WEBFIRST_WINDOW_CLOSED');
       }
@@ -416,6 +500,10 @@ export function launchNextWebFirstHost(options: {
       {label:'添加项目目录（仅本地登记）',click:()=>{void addProjectFromNativePicker();}},
       {label:'查看登记与 Core MCP 状态',click:()=>{void showLocalProjectStatus();}},
       {label:'核对 MCP 工具清单（仅本地）',click:()=>{void showCoreCatalogue();}},
+      {type:'separator'},
+      {label:'管理/撤销只读授权',click:()=>{void manageReadGrants();}},
+      {label:'撤销全部只读授权',click:()=>{void revokeAllReadGrants();}},
+      {label:'查看本地操作收据',click:()=>{void showOperations();}},
       {type:'separator'},
       {label:'显示/隐藏项目侧栏',accelerator:'CmdOrCtrl+Shift+P',click:()=>{
         sidebarVisible=!sidebarVisible;resize();

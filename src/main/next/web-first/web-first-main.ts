@@ -2,6 +2,8 @@
 import {app,Menu} from 'electron';
 import {mkdtempSync,mkdirSync,rmSync} from 'node:fs';
 import {WebFirstProjectRegistry} from './project-registry.js';
+import {WebFirstReadGrants} from './read-grants.js';
+import {WebFirstOperationJournal} from './operation-journal.js';
 import {inspectExistingCredentialProfiles} from './credential-diagnostics.js';
 import {runWebFirstCoreBroker} from './core-broker.js';
 import os from 'node:os';
@@ -38,6 +40,17 @@ app.whenReady().then(async()=>{
     const restored=await new WebFirstProjectRegistry(profile).list();
     if(restored.length!==1 || restored[0]?.id!==project.id)
       throw new Error('WEBFIRST_OFFLINE_PROJECT_RESTORE_FAILED');
+    const grants=new WebFirstReadGrants(profile);
+    await grants.grant('project-read',project.id,project.root,'always');
+    const verified=new WebFirstReadGrants(profile);
+    if(!await verified.allowed('project-read',project.id,project.root,
+      path.join(project.root,'fixture.txt'),'project_read'))
+      throw Error('WEB_FIRST_OFFLINE_DURABLE_GRANT_INVALID');
+    await grants.revoke('project-read',project.id);
+    if(await verified.allowed('project-read',project.id,project.root,
+      path.join(project.root,'fixture.txt'),'project_read'))
+      throw Error('WEB_FIRST_OFFLINE_GRANT_REVOCATION_INVALID');
+    process.stdout.write('WEB_FIRST_OFFLINE_GRANT_LIFECYCLE_PASS\n');
     process.stdout.write('WEB_FIRST_OFFLINE_PROJECT_RESTORED\n');
   }
   let httpsReported=false;
@@ -85,6 +98,13 @@ app.whenReady().then(async()=>{
         throw Error('WEBFIRST_LOCAL_MCP_SMOKE_FAILED');
       await host.disableNativeCore();
       process.stdout.write('WEB_FIRST_OFFLINE_LOCAL_MCP_PASS\n');
+      if(!projectMenu?.submenu?.items.some(item=>item.label==='管理/撤销只读授权')||
+         !projectMenu.submenu.items.some(item=>item.label==='查看本地操作收据'))
+        throw Error('WEBFIRST_NATIVE_P3_GRANTS_MENU_MISSING');
+      const receipts=await new WebFirstOperationJournal(profile).last();
+      if(receipts.length<2||receipts.at(-2)?.stage!=='STARTED'||receipts.at(-1)?.stage!=='SUCCEEDED')
+        throw Error('WEBFIRST_OFFLINE_OPERATION_RECEIPT_MISSING');
+      process.stdout.write('WEB_FIRST_OFFLINE_RECEIPT_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_PROJECT_MENU_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_PROJECT_UI_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_INPUT_PASS\n');

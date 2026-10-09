@@ -4,13 +4,14 @@ import {randomBytes} from 'node:crypto';
 import {Readable} from 'node:stream';
 import {createWebFirstCoreMcp} from './project-mcp.js';
 import type {WebFirstReadAuthority} from './project-read.js';
+import type {WebFirstOperationJournal} from './operation-journal.js';
 const MAX_REQUEST=64*1024;
 function reject(res:http.ServerResponse,status:number,code:string){
   res.writeHead(status,{'content-type':'application/json','cache-control':'no-store'});
   res.end(JSON.stringify({error:code}));
 }
-export async function createWebFirstCoreLoopback(authority:WebFirstReadAuthority){
-  const core=createWebFirstCoreMcp(authority);
+export async function createWebFirstCoreLoopback(authority:WebFirstReadAuthority,journal?:WebFirstOperationJournal){
+  const core=createWebFirstCoreMcp(authority,journal);
   const secret=randomBytes(32).toString('base64url');
   const route='/web-first/'+secret+'/mcp';
   const metadata='/.well-known/oauth-protected-resource'+route;

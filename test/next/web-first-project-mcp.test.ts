@@ -6,6 +6,8 @@ import {WebFirstProjectRegistry} from '../../src/main/next/web-first/project-reg
 import {WebFirstReadAuthority,type ReadAction} from '../../src/main/next/web-first/project-read.js';
 import {createWebFirstCoreLoopback} from '../../src/main/next/web-first/core-loopback.js';
 import {readWebFirstLocalToolList,EXPECTED_READ_ONLY_CORE_TOOLS} from '../../src/main/next/web-first/core-catalogue.js';
+import {WebFirstReadGrants} from '../../src/main/next/web-first/read-grants.js';
+import {WebFirstOperationJournal} from '../../src/main/next/web-first/operation-journal.js';
 const paths:string[]=[];
 afterEach(async()=>{for(const name of paths.splice(0))await rm(name,{recursive:true,force:true});});
 async function prepare(allow:ReadAction[]=[]){
@@ -90,6 +92,59 @@ describe('Web-First read-only MCP over a real owner-controlled loopback socket',
         expect(JSON.stringify(out.data)).not.toContain('NEVER_READ_OUTSIDE');
       }
     }finally{await service.close();}
+  });
+  it('reuses a durable project-only read grant and records successful MCP receipts without content',async()=>{
+    const temp=await mkdtemp(path.join(os.tmpdir(),'cos-webfirst-p3-granted-mcp-'));paths.push(temp);
+    const profile=path.join(temp,'profile'),root=path.join(temp,'project');
+    await mkdir(profile);await mkdir(root);await writeFile(path.join(root,'README.md'),'P3_REDACTED_FIXTURE');
+    const store=new WebFirstProjectRegistry(profile),project=await store.register(root);
+    const grants=new WebFirstReadGrants(profile),journal=new WebFirstOperationJournal(profile);
+    let approvalCount=0;
+    const approval=new WebFirstReadAuthority(store,async context=>{
+      const scope=context.action==='project_list'?'catalog':'project-read';
+      const granted=await grants.allowed(scope,context.projectId??null,context.projectRoot??null,
+        context.target??null,context.action);
+      if(granted)return true;
+      approvalCount++;
+      await grants.grant(scope,context.projectId??null,context.projectRoot??null,'always');return true;
+    });
+    const server=await createWebFirstCoreLoopback(approval,journal);
+    try{
+      const first=await rpc(server.endpointUrl,'tools/call','project_read',{
+        project_id:project.id,relative_path:'README.md'});
+      const second=await rpc(server.endpointUrl,'tools/call','project_read',{
+        project_id:project.id,relative_path:'README.md'});
+      expect(first.data.result.structuredContent.result.text).toBe('P3_REDACTED_FIXTURE');
+      expect(second.data.result.structuredContent.result.text).toBe('P3_REDACTED_FIXTURE');
+      expect(approvalCount).toBe(1);
+      const records=await journal.last();
+      expect(records.map(r=>r.stage)).toEqual(['STARTED','SUCCEEDED','STARTED','SUCCEEDED']);
+      expect(JSON.stringify(records)).not.toContain('P3_REDACTED_FIXTURE');
+      const resumed=new WebFirstReadGrants(profile);
+      expect(await resumed.allowed('project-read',project.id,project.root,
+        path.join(project.root,'README.md'),'project_read')).toBe(true);
+      await grants.revokeAll();
+      expect(await resumed.allowed('project-read',project.id,project.root,
+        path.join(project.root,'README.md'),'project_read')).toBe(false);
+    }finally{await server.close();}
+  });
+  it('writes STARTED/REJECTED receipts for denied reads without storing the attempted path',async()=>{
+    const base=await mkdtemp(path.join(os.tmpdir(),'cos-webfirst-p3-deny-'));paths.push(base);
+    const profile=path.join(base,'profile'),root=path.join(base,'project');
+    await mkdir(profile);await mkdir(root);await writeFile(path.join(root,'NO_READ.txt'),'SECRET_CANARY_NEVER_RETURNED');
+    const registry=new WebFirstProjectRegistry(profile),p=await registry.register(root);
+    const journal=new WebFirstOperationJournal(profile);
+    const authority=new WebFirstReadAuthority(registry,async()=>false);
+    const socket=await createWebFirstCoreLoopback(authority,journal);
+    try{
+      const denied=await rpc(socket.endpointUrl,'tools/call','project_read',{
+        project_id:p.id,relative_path:'NO_READ.txt'});
+      expect(denied.data.result.isError).toBe(true);
+      const receipts=await new WebFirstOperationJournal(profile).last();
+      expect(receipts.map(r=>r.stage)).toEqual(['STARTED','REJECTED']);
+      expect(JSON.stringify(receipts)).not.toContain('NO_READ.txt');
+      expect(JSON.stringify(denied.data)).not.toContain('SECRET_CANARY_NEVER_RETURNED');
+    }finally{await socket.close();}
   });
   it('rejects browser-origin requests, wrong paths, oversized bodies and script execution tools',async()=>{
     const {service}=await prepare();try{

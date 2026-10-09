@@ -4,7 +4,7 @@ export function escapeSidebarText(value:string):string {
   return value.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
-export function renderProjectSidebar(projects:ReadonlyArray<WebFirstProject>,status:'UNCONNECTED'|'LOCAL_ONLY'|'REMOTE_CONNECTING'|'REMOTE_CONNECTED'|'HOLD',registryError=false):string {
+export function renderProjectSidebar(projects:ReadonlyArray<WebFirstProject>,status:'UNCONNECTED'|'LOCAL_ONLY'|'REMOTE_CONNECTING'|'REMOTE_CONNECTED'|'HOLD',registryError=false,grantSummary?:{permanent:number;session:number;error:boolean}):string {
   const cards=projects.map(p=>
     `<article><strong>${escapeSidebarText(p.name)}</strong><div class="root" title="${escapeSidebarText(p.root)}">${escapeSidebarText(p.root)}</div><small>仅本地登记 · 未授予 AI 权限</small></article>`).join('');
   return `<!doctype html><html lang="zh"><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
@@ -12,5 +12,8 @@ export function renderProjectSidebar(projects:ReadonlyArray<WebFirstProject>,sta
   <header><h2>本地项目</h2><div class="minor">Web-First · 原生工作区</div></header>
   <section><h3>项目目录 · ${projects.length}</h3>${cards||'<div class="empty">尚未登记本地项目<br>请使用菜单「本地项目 → 添加项目目录」</div>'}
   <h3>Core MCP</h3><aside>${registryError?'项目登记文件异常 · 操作暂停':status==='HOLD'?'Core Tunnel 连接受阻 · 项目登记仍正常':status==='LOCAL_ONLY'?'本地 MCP 已启动 · ChatGPT 插件未连接':status==='REMOTE_CONNECTED'?'Core 已握手 · 服务器有 5 个只读工具，ChatGPT 工具发布待确认。读取仍需逐次批准':status==='REMOTE_CONNECTING'?'正在验证 Core 握手':'尚未连接／未授权'}<br><span class="minor">网页对话不会自动获得项目、文件或终端权限。</span></aside>
+  <h3>只读访问授权</h3><aside>${grantSummary?.error?'授权记录异常 · 自动放行已禁用':
+    '永久 '+(grantSummary?.permanent??0)+' 项 · 本次运行 '+(grantSummary?.session??0)+' 项'}<br>
+    <span class="minor">已授权范围内免重复弹窗；敏感文件仍单次确认。通过「本地项目」菜单可撤销。</span></aside>
   <div class="tip">添加目录只保存一个本地书签，不上传文件、不启动任务、不消耗 Codex/API 模型额度。<br><br>管理入口：顶部菜单「本地项目」。</div></section></html>`;
 }

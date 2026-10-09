@@ -7,6 +7,8 @@ export type ReadAction='project_list'|'project_ls'|'project_read';
 export type NativeReadApproval=(description:{
   readonly action:ReadAction;
   readonly projectName?:string;
+  readonly projectId?:string;
+  readonly projectRoot?:string;
   readonly target?:string;
 })=>Promise<boolean>;
 const MAX_FILE=32*1024;
@@ -51,7 +53,7 @@ export class WebFirstReadAuthority {
   async listDirectory(projectId:string,relativePath:string){
     const project=await this.project(projectId);
     const {canonical,stat}=await this.target(project.root,relativePath,'directory');
-    if(!await this.approve({action:'project_ls',projectName:project.name,target:canonical}))
+    if(!await this.approve({action:'project_ls',projectName:project.name,projectId:project.id,projectRoot:project.root,target:canonical}))
       throw Error('NATIVE_APPROVAL_DENIED');
     const checked=await this.target(project.root,relativePath,'directory');
     if(checked.canonical!==canonical||checked.stat.dev!==stat.dev||checked.stat.ino!==stat.ino)
@@ -69,7 +71,7 @@ export class WebFirstReadAuthority {
   async readFile(projectId:string,relativePath:string){
     const project=await this.project(projectId);
     const {canonical,stat}=await this.target(project.root,relativePath,'file');
-    if(!await this.approve({action:'project_read',projectName:project.name,target:canonical}))
+    if(!await this.approve({action:'project_read',projectName:project.name,projectId:project.id,projectRoot:project.root,target:canonical}))
       throw Error('NATIVE_APPROVAL_DENIED');
     // Re-check path and file identity AFTER the operator dialog (TOCTOU fence).
     const checked=await this.target(project.root,relativePath,'file');

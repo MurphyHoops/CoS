@@ -46,6 +46,10 @@ describe('Web-First native-only project bookmarks',()=>{
     expect(html).not.toContain('<img');
     expect(html).not.toContain('<script');
     expect(html).toContain('未连接／未授权');
+    expect(renderProjectSidebar([],'LOCAL_ONLY',false,{permanent:2,session:1,error:false}))
+      .toContain('永久 2 项 · 本次运行 1 项');
+    expect(renderProjectSidebar([],'HOLD',false,{permanent:0,session:0,error:true}))
+      .toContain('授权记录异常 · 自动放行已禁用');
     expect(html).not.toContain('nodeIntegration');
   });
 });
