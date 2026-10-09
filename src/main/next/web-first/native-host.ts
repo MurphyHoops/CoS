@@ -25,6 +25,7 @@ import {conversationFromUrl,VISIBLE_REPLY_SCRIPT,WebReplySettleTracker,WebFirstR
 import {WebFirstWebOutbox} from './web-outbox.js';
 import {sendNativeWebFirstMessage} from './native-web-input.js';
 import {randomUUID} from 'node:crypto';
+import {createContinuityLease,assessContinuity,type ContinuityLease} from './continuity-gate.js';
 import {createWebFirstCoreLoopback} from './core-loopback.js';
 import {readWebFirstLocalToolList,EXPECTED_READ_ONLY_CORE_TOOLS} from './core-catalogue.js';
 import {connectWebFirstImportedCore,existingTunnelOwnerPresent,coreRecoveryDecision,type CoreTunnelState} from './core-transport.js';
@@ -689,6 +690,85 @@ export function launchNextWebFirstHost(options: {
     }catch{if(!owner.isDestroyed())await dialog.showMessageBox(owner,{
       type:'error',message:'本地回复记录不安全或已损坏，读取已拒绝。',buttons:['关闭']});}
   };
+  // P3 continuity mode is an opt-in OBSERVATION lease only. It cannot
+  // schedule chat sends while caller identity / provider completion is not
+  // verified. The one-shot send menu keeps its independent native approval.
+  let continuityLease:ContinuityLease|null=null;
+  let continuationReply:VisibleWebReply|null=null;
+  let continuationReplyAt:number|null=null;
+  const continuationTracker=new WebReplySettleTracker();
+  let continuationTimer:NodeJS.Timeout|null=null;
+  const clearContinuityObservation=()=>{
+    continuityLease=null;continuationReply=null;continuationReplyAt=null;continuationTracker.reset();
+    if(continuationTimer){clearInterval(continuationTimer);continuationTimer=null;}
+  };
+  owner.on('closed',clearContinuityObservation);
+  const sampleContinuity=async()=>{
+    if(!continuityLease||owner.isDestroyed())return;
+    const current=conversationFromUrl(view.webContents.getURL());
+    if(Date.now()>continuityLease.expiresAt){clearContinuityObservation();return;}
+    if(current!==continuityLease.conversationId){clearContinuityObservation();return;}
+    const snapshot=await snapshotVisibleAssistant();
+    const settled=continuationTracker.observe(snapshot);
+    if(settled){continuationReply=settled;continuationReplyAt=Date.now();}
+  };
+  const armContinuityObservation=async()=>{
+    if(continuityLease){clearContinuityObservation();
+      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{type:'info',
+        message:'当前连续工作观察已停止，不会自动发送消息。',buttons:['关闭']});
+      return;
+    }
+    const conversationId=conversationFromUrl(view.webContents.getURL());
+    if(!conversationId||owner.isDestroyed()){
+      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{type:'warning',
+        message:'请先打开需要长期工作的 ChatGPT 具体对话。',buttons:['关闭']});
+      return;
+    }
+    const active=(await taskLedger.list()).filter(t=>t.phase==='active').slice(-4).reverse();
+    if(!active.length){await dialog.showMessageBox(owner,{type:'warning',
+      message:'没有可绑定的 ACTIVE 项目任务。等待中的任务需先由你批准恢复。',
+      buttons:['关闭']});return;}
+    const chosen=await dialog.showMessageBox(owner,{
+      type:'question',title:'绑定当前网页与本地任务（只读观察）',
+      message:'请选择一个当前 ACTIVE 的持久任务',
+      detail:'绑定仅在本次运行有效。最多观察 3 次续接，15 分钟后自动失效。'
+        +'不会自动点击“发送”、不会修改本地文件，不使用额外 Codex/API 模型调用。',
+      buttons:['取消',...active.map(t=>t.goal.slice(0,60))],defaultId:0,cancelId:0,noLink:true
+    });
+    const task=active[chosen.response-1];
+    if(!task||owner.isDestroyed()||conversationFromUrl(view.webContents.getURL())!==conversationId)return;
+    const baseline=await snapshotVisibleAssistant();
+    continuityLease=createContinuityLease({taskId:task.id,conversationId,now:Date.now(),
+      maxTurns:3,maxMinutes:15,baselineAssistantMessage:baseline?.messageId??null});
+    continuationTracker.reset();continuationReply=null;continuationReplyAt=null;
+    continuationTimer=setInterval(()=>{void sampleContinuity().catch(()=>{
+      // DOM errors are non-evidence. Never promote the session to auto-send.
+    });},2500);
+    continuationTimer.unref();void sampleContinuity();
+  };
+  const inspectContinuity=async()=>{
+    if(owner.isDestroyed())return;
+    const lease=continuityLease;
+    let task=null;
+    try{if(lease)task=await taskLedger.get(lease.taskId);}catch{/* fail closed */}
+    let outbox=[] as Awaited<ReturnType<typeof webOutbox.list>>;
+    let outboxReadFailed=false;
+    try{outbox=await webOutbox.list();}catch{outboxReadFailed=true;}
+    const result=assessContinuity({lease,now:Date.now(),
+      currentUrl:view.webContents.getURL(),task,outbox,
+      latestReply:continuationReply,replySettled:continuationReply!==null,
+      replyObservedAt:continuationReplyAt});
+    if(outboxReadFailed){result.manualNextTurnReady=false;result.reason='OUTBOX_AMBIGUOUS';}
+    await dialog.showMessageBox(owner,{type:'info',
+      title:'P3 连续工作准备度 · 安全核对',
+      message:result.manualNextTurnReady?'可申请一次人工批准的网页续接':'当前不应继续发送网页消息',
+      detail:'状态：'+(result.reason??'NO_BLOCKER')+'\n'
+        +'当前续接：'+result.sentTurns+'/'+result.maxTurns+'\n'
+        +'无人值守自动续接：关闭（平台会话身份及完成证据仍未验证）\n'
+        +'当前 App 不会自行向 ChatGPT 发送消息。',
+      buttons:['关闭']
+    });
+  };
   const manageDurableTasks=async()=>{
     if(owner.isDestroyed())return;
     try{
@@ -809,6 +889,8 @@ export function launchNextWebFirstHost(options: {
       {label:'查看本地操作收据',click:()=>{void showOperations();}},
       {label:'P3 持久任务与恢复',click:()=>{void manageDurableTasks();}},
       {label:'在当前 ChatGPT 网页续接任务一次（需确认）',click:()=>{void continueTaskOneNativeTurn();}},
+      {label:'开始/停止当前对话连续工作观察（不自动发送）',click:()=>{void armContinuityObservation();}},
+      {label:'检查连续工作安全门禁',click:()=>{void inspectContinuity();}},
       {label:'开始/停止当前 ChatGPT 回复记录',click:()=>{void toggleReplyCapture();}},
       {label:'查看已接收的 ChatGPT 最新回复',click:()=>{void inspectCapturedReplies();}},
       {type:'separator'},

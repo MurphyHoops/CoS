@@ -264,3 +264,24 @@ consent path. No project read, file mutation, shell operation or third-party
 plugin permission is broadened by this change. Reentrant Connect clicks are
 coalesced while the approval is pending; native Disconnect still stops and
 revokes the process-local reconnect grant.
+
+## P3i bounded continuity observer and safety gate
+
+A new pure, unit-tested `continuity-gate.ts` assesses the next-turn boundary
+against an exact user-approved task and ChatGPT conversation, a process-local
+15-minute/3-turn observation lease, active task phase, durable outbox delivery
+receipts, a new settled visible assistant message and checkpoint timing.
+Expired grants, changed chats, waiting/review/recovery-hold tasks, any
+UNCERTAIN outbox, exhausted turn budget, old replies or missing progress hold
+rather than proceed. The type explicitly sets `autonomousNextTurnAllowed`
+to `false` because DOM stability and the native task revision do not prove
+provider-final turn state or which ChatGPT principal issued a tool call.
+
+The operator can activate an in-memory, read-only observation session from
+`本地项目 → 开始/停止当前对话连续工作观察（不自动发送）` and inspect the decision at
+`本地项目 → 检查连续工作安全门禁`. This requires one native selection of an
+ACTIVE task, binds exactly one ChatGPT conversation, automatically ends on
+chat navigation, expiry or App exit, and does not store any credentials or
+initiate a ChatGPT model turn. It does **not** grant write/exec permissions or
+activate unattended autopilot. The existing **one-shot** continuation retains
+its separate explicit native confirmation.
