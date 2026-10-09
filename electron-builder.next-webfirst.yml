@@ -21,4 +21,8 @@ mac:
   identity: null
   notarize: false
   minimumSystemVersion: '13.0'
+  extraResources:
+    - from: resources/packaging/tunnel/darwin/${arch}
+      to: tunnel
+      filter: ['tunnel-client']
   category: public.app-category.developer-tools

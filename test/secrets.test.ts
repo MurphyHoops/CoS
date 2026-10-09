@@ -18,6 +18,7 @@ vi.mock('electron', () => ({
 const {
   deleteAllSecrets,
   getSecret,
+  peekSecretWithoutRotation,
   initSecretsPath,
   resetSecretsCacheForTests,
   secureStorageCiphertextIsProtected,
@@ -49,6 +50,16 @@ afterEach(async () => {
 });
 
 describe('secret store', () => {
+  it('offers a read-only encrypted-secret lookup that does not rotate source ciphertext',async()=>{
+    await setSecret('openaiApiKey','SYNTHETIC_KEY_FOR_READ_ONLY_TEST');
+    resetSecretsCacheForTests();
+    vi.clearAllMocks();
+    vi.mocked(safeStorage.decryptStringAsync).mockImplementation(async buffer=>({
+      result:buffer.toString('utf8'),shouldReEncrypt:true
+    }));
+    expect(await peekSecretWithoutRotation('openaiApiKey')).toBe('SYNTHETIC_KEY_FOR_READ_ONLY_TEST');
+    expect(safeStorage.encryptStringAsync).not.toHaveBeenCalled();
+  });
   it('refuses Linux v10 hard-coded-key ciphertext instead of trusting the legacy backend label', async () => {
     vi.mocked(safeStorage.getSelectedStorageBackend).mockReturnValue('basic_text');
     vi.mocked(safeStorage.encryptStringAsync).mockResolvedValueOnce(Buffer.from('v10fallback-ciphertext', 'ascii'));

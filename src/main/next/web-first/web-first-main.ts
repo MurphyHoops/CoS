@@ -24,6 +24,7 @@ app.whenReady().then(async()=>{
     mkdirSync(syntheticProject,{mode:0o700});
     const store=new WebFirstProjectRegistry(profile);
     const project=await store.register(syntheticProject);
+    await import('node:fs/promises').then(fs=>fs.writeFile(path.join(syntheticProject,'fixture.txt'),'WEBFIRST_LOCAL_MCP_READ_OK'));
     const restored=await new WebFirstProjectRegistry(profile).list();
     if(restored.length!==1 || restored[0]?.id!==project.id)
       throw new Error('WEBFIRST_OFFLINE_PROJECT_RESTORE_FAILED');
@@ -33,7 +34,7 @@ app.whenReady().then(async()=>{
   const smokeTimeout=httpsSmoke?setTimeout(()=>{
     process.stdout.write('WEB_FIRST_HTTPS_TIMEOUT\n'); app.quit();
   },25000):null;
-  const host=launchNextWebFirstHost({offlineSmoke,projectStoreDir:profile,onNavigationOutcome:state=>{
+  const host=launchNextWebFirstHost({offlineSmoke,projectStoreDir:profile,appDataDir:app.getPath('appData'),onNavigationOutcome:state=>{
     if(!httpsSmoke||httpsReported)return;
     httpsReported=true;
     if(smokeTimeout)clearTimeout(smokeTimeout);
@@ -61,6 +62,19 @@ app.whenReady().then(async()=>{
       if(!projectMenu?.submenu || projectMenu.submenu.items.length<3 ||
          !projectMenu.submenu.items.some(item=>item.label.startsWith('添加项目目录')))
         throw Error('WEBFIRST_NATIVE_PROJECT_MENU_MISSING');
+      const local=await host.enableNativeCore();
+      const headers={'content-type':'application/json',accept:'application/json, text/event-stream',
+        'MCP-Protocol-Version':'2026-07-28','Mcp-Method':'tools/call','Mcp-Name':'project_read'};
+      const body={jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'project_read',
+        arguments:{project_id:(await host.nativeProjects())[0]?.id,relative_path:'fixture.txt'},
+        _meta:{'io.modelcontextprotocol/protocolVersion':'2026-07-28',
+          'io.modelcontextprotocol/clientCapabilities':{}}}};
+      const response=await fetch(local.endpointUrl,{method:'POST',headers,body:JSON.stringify(body)});
+      const raw=await response.text();
+      if(response.status!==200||!raw.includes('WEBFIRST_LOCAL_MCP_READ_OK'))
+        throw Error('WEBFIRST_LOCAL_MCP_SMOKE_FAILED');
+      await host.disableNativeCore();
+      process.stdout.write('WEB_FIRST_OFFLINE_LOCAL_MCP_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_PROJECT_MENU_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_PROJECT_UI_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_INPUT_PASS\n');

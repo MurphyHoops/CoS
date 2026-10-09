@@ -15,6 +15,9 @@ import {newWebHealthTracker, type WebHealthSnapshot} from './web-health.js';
 import {allowedOAuthStoragePermission,allowedOAuthPopup} from './login-permissions.js';
 import {WebFirstProjectRegistry, type WebFirstProject} from './project-registry.js';
 import {renderProjectSidebar} from './project-sidebar.js';
+import {WebFirstReadAuthority, type ReadAction} from './project-read.js';
+import {createWebFirstCoreLoopback} from './core-loopback.js';
+import {connectWebFirstImportedCore,type CoreTunnelState} from './core-transport.js';
 
 export interface NativeWebHostStatus {
   state: 'starting' | 'loaded' | 'load-failed';
@@ -28,12 +31,16 @@ export interface NativeWebHost {
   reload: () => void;
   diagnostics: () => Promise<WebHealthSnapshot>;
   nativeProjects: () => Promise<ReadonlyArray<WebFirstProject>>;
+  enableNativeCore: () => Promise<{endpointUrl:string;port:number}>;
+  disableNativeCore: () => Promise<void>;
+  getCorePosture:()=>string;
 }
 export function launchNextWebFirstHost(options: {
   /** Only a fixture launch may use data URLs; the production path is fixed. */
   offlineSmoke?: boolean;
   /** Entirely native and isolated from the ChatGPT partition. */
   projectStoreDir:string;
+  appDataDir:string;
   onOfflineLoaded?: (contents:WebContents) => void;
   /** HTTPS P1 smoke emits status categories only; never page content/cookies. */
   onNavigationOutcome?: (state: Readonly<NativeWebHostStatus>) => void;
@@ -81,10 +88,15 @@ export function launchNextWebFirstHost(options: {
   owner.contentView.addChildView(sidebar);
   owner.contentView.addChildView(view);
   const projects=new WebFirstProjectRegistry(options.projectStoreDir);
+  let mcpService:Awaited<ReturnType<typeof createWebFirstCoreLoopback>>|null=null;
+  let mcpStartFlight:Promise<{endpointUrl:string;port:number}>|null=null;
+  let mcpState:'UNCONNECTED'|'LOCAL_ONLY'|'REMOTE_CONNECTING'|'REMOTE_CONNECTED'|'HOLD'='UNCONNECTED';
+  let coreTunnel:Awaited<ReturnType<typeof connectWebFirstImportedCore>>|null=null;
+  let remoteConnectionFlight:Promise<void>|null=null;
   let sidebarVisible=true;
   let cachedProjects:ReadonlyArray<WebFirstProject>=[];
   const refreshSidebar=async()=>{
-    let state:'UNCONNECTED'|'HOLD'='UNCONNECTED';
+    let state:typeof mcpState=mcpState;
     try{cachedProjects=await projects.list();}
     catch{state='HOLD';cachedProjects=[];}
     if(sidebar.webContents.isDestroyed())return;
@@ -105,7 +117,19 @@ export function launchNextWebFirstHost(options: {
   owner.on('enter-full-screen',resize);
   owner.on('leave-full-screen',resize);
   owner.once('ready-to-show',()=>{resize();if(!owner.isDestroyed())owner.show();});
+  let nativeQuitting=false;
+  owner.on('close',event=>{
+    if(nativeQuitting||(!coreTunnel&&!remoteConnectionFlight))return;
+    event.preventDefault();
+    void (async()=>{
+      try{
+        await disconnectRemoteCore();
+        if(!owner.isDestroyed()){nativeQuitting=true;owner.close();}
+      }catch{/* Retain window and tunnel ownership on uncertain shutdown. */}
+    })();
+  });
   owner.on('closed',()=>{
+    void disableNativeCore().catch(()=>undefined);
     // BaseWindow-based children must be explicitly closed; do not leave a web
     // renderer process keeping an authenticated session alive after its owner.
     if(!view.webContents.isDestroyed())view.webContents.close();
@@ -113,7 +137,7 @@ export function launchNextWebFirstHost(options: {
   });
   const toolbar = '<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'">'+
     '<style>body{margin:0;background:#121820;color:#f1f5f9;font:13px system-ui;padding:14px 18px}strong{color:#9ad3ff}small{margin-left:12px;color:#b5bbc6}</style>'+
-    '<strong>CoS Next · Web-First</strong><small>ChatGPT 官方网页 · 独立登录空间 · 不加载 Chrome 扩展 · P1 预览</small>';
+    '<strong>CoS Next · Web-First</strong><small>ChatGPT 官方网页 · 原生项目侧栏 · 独立 MCP · 不使用 Chrome 扩展</small>';
   void owner.loadURL('data:text/html;charset=utf-8,'+encodeURIComponent(toolbar));
   owner.webContents.setWindowOpenHandler(()=>({action:'deny'}));
   owner.webContents.on('will-navigate',e=>e.preventDefault());
@@ -226,6 +250,120 @@ export function launchNextWebFirstHost(options: {
       });
     }
   };
+  async function enableNativeCore():Promise<{endpointUrl:string;port:number}>{
+    if(mcpStartFlight)return mcpStartFlight;
+    if(mcpService)return {endpointUrl:mcpService.endpointUrl,port:mcpService.port};
+    const work=async()=>{
+      if(!offline){
+        if(owner.isDestroyed())throw Error('WEBFIRST_WINDOW_CLOSED');
+        const consent=await dialog.showMessageBox(owner,{
+          type:'warning',title:'启用本机只读 MCP 服务',
+          message:'仅在此 Mac 启动一个本地只读 MCP 服务？',
+          detail:'此步骤不会连接 ChatGPT 插件，也不会自动授权任何项目。\n'
+            +'项目列表、目录和文件读取仍需每次由你在 macOS 原生弹窗批准。\n'
+            +'禁止写入、终端执行和自动任务。',
+          buttons:['取消','启用本地服务'],defaultId:0,cancelId:0,noLink:true
+        });
+        if(consent.response!==1)throw Error('WEBFIRST_CORE_NOT_APPROVED');
+      }
+      const authority=new WebFirstReadAuthority(projects,async request=>{
+        if(offline){ // smoke is isolated to synthetic /tmp project
+          return request.action==='project_list'||request.action==='project_ls'||request.action==='project_read';
+        }
+        if(owner.isDestroyed())return false;
+        const action:Record<ReadAction,string>={
+          project_list:'查看已登记的项目名称和 ID',
+          project_ls:'列举项目目录中的文件名',
+          project_read:'读取文件正文（最多 32 KiB）'
+        };
+        const approval=await dialog.showMessageBox(owner,{
+          type:'question',title:'CoS Next · 单次本地工具请求',
+          message:'允许此次 '+action[request.action]+'？',
+          detail:(request.projectName?'项目：'+request.projectName+'\n':'')+
+            (request.target?'路径：'+request.target+'\n':'')+
+            '请求方身份尚未建立可信绑定。请确认这是你刚刚发起的操作。\n'
+            +'仅批准当前一次读取，不授权任何后续请求。',
+          buttons:['拒绝','批准一次'],defaultId:0,cancelId:0,noLink:true
+        });
+        return !owner.isDestroyed()&&approval.response===1;
+      });
+      const created=await createWebFirstCoreLoopback(authority);
+      if(owner.isDestroyed()){
+        await created.close();throw Error('WEBFIRST_WINDOW_CLOSED');
+      }
+      mcpService=created;mcpState='LOCAL_ONLY';
+      await refreshSidebar();
+      return {endpointUrl:created.endpointUrl,port:created.port};
+    };
+    mcpStartFlight=work().finally(()=>{mcpStartFlight=null;});
+    return mcpStartFlight;
+  }
+  async function disconnectRemoteCore():Promise<void>{
+    if(remoteConnectionFlight)await remoteConnectionFlight.catch(()=>undefined);
+    if(!coreTunnel)return;
+    const target=coreTunnel;
+    const proven=await target.stopWithProof();
+    if(!proven){mcpState='HOLD';await refreshSidebar();
+      throw Error('CORE_TUNNEL_SHUTDOWN_UNVERIFIED');}
+    coreTunnel=null;mcpState='LOCAL_ONLY';
+    await refreshSidebar();
+  }
+  async function connectRemoteCore():Promise<void>{
+    if(offline)throw Error('NO_REMOTE_IN_OFFLINE_SMOKE');
+    if(coreTunnel||remoteConnectionFlight)return;
+    const local=await enableNativeCore();
+    if(owner.isDestroyed())throw Error('WEBFIRST_WINDOW_CLOSED');
+    const consent=await dialog.showMessageBox(owner,{
+      type:'warning',title:'连接现有 ChatGPT Core Tunnel',
+      message:'从原有 Next 加密配置连接 ChatGPT Core？',
+      detail:'这只复用现有 Next 的 Tunnel 登记与系统 Keychain，不复制凭证、不调用模型。\n'
+        +'文件仍然每次单独请求 macOS 批准。\n'
+        +'远端 ChatGPT 工具注册和会话身份必须另行验收；连接不等于授权。',
+      buttons:['取消','连接 Core'],defaultId:0,cancelId:0,noLink:true
+    });
+    if(consent.response!==1)return;
+    remoteConnectionFlight=(async()=>{
+      mcpState='REMOTE_CONNECTING';await refreshSidebar();
+      try{
+        const target=await connectWebFirstImportedCore({appData:options.appDataDir,
+          localUrl:local.endpointUrl,onChange:(state:CoreTunnelState)=>{
+            if(state==='CONNECTED')mcpState='REMOTE_CONNECTED';
+            else if(state==='HOLD')mcpState='HOLD';
+            else if(state==='OFFLINE')mcpState='REMOTE_CONNECTING';
+            void refreshSidebar();
+          }});
+        coreTunnel=target;
+        const ok=await target.connected;
+        if(!ok){
+          const proven=await target.stopWithProof();
+          if(!proven)throw Error('CORE_TUNNEL_SHUTDOWN_UNVERIFIED');
+          coreTunnel=null;mcpState='HOLD';await refreshSidebar();
+          throw Error('CORE_TUNNEL_NOT_READY');
+        }
+        mcpState='REMOTE_CONNECTED';await refreshSidebar();
+      }catch(error){
+        mcpState='HOLD';await refreshSidebar();throw error;
+      }
+    })();
+    try{await remoteConnectionFlight;}
+    catch(error){
+      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{
+        type:'warning',title:'Core 连接尚未通过验收',
+        message:'无法确认当前 Core Tunnel 完成了真实握手。',
+        detail:'既有凭证和 Classic 配置未被复制或清空。\n原因：'+
+          (error instanceof Error&&/^[A-Z_]+$/.test(error.message)?error.message:'连接条件不满足'),
+        buttons:['关闭']
+      });
+    }finally{remoteConnectionFlight=null;}
+  }
+  async function disableNativeCore():Promise<void>{
+    await disconnectRemoteCore();
+    if(mcpStartFlight)await mcpStartFlight.catch(()=>undefined);
+    const current=mcpService;
+    mcpService=null;mcpState='UNCONNECTED';
+    if(current)await current.close();
+    if(!owner.isDestroyed())await refreshSidebar();
+  }
   const showLocalProjectStatus=async()=>{
     let list:ReadonlyArray<WebFirstProject>;
     try{list=await projects.list();}
@@ -236,7 +374,7 @@ export function launchNextWebFirstHost(options: {
     }
     if(!owner.isDestroyed())await dialog.showMessageBox(owner,{
       title:'CoS Next 本地项目与 MCP',
-      message:list.length+' 个已登记项目 · Core MCP 未连接/未授权',
+      message:list.length+' 个已登记项目 · '+(mcpState==='REMOTE_CONNECTED'?'Core 控制平面握手成功；权限仍需批准':mcpState==='LOCAL_ONLY'?'本机 MCP 已启动，ChatGPT 尚未连接':'Core MCP 未连接/未授权'),
       detail:'选择项目目录不会授予 ChatGPT 对文件和终端的访问。\n'
        +'必须通过另行验证的 Core 插件身份、权限和工具发布门禁后才能操作本地项目。',
       buttons:['关闭']
@@ -245,6 +383,14 @@ export function launchNextWebFirstHost(options: {
   const menus: MenuItemConstructorOptions[] = [
     {label:'CoS Next',submenu:[{role:'quit'}]},
     {label:'本地项目',submenu:[
+      {label:'连接现有 ChatGPT Core Tunnel（需批准）',click:()=>{void connectRemoteCore();}},
+      {label:'断开 ChatGPT Core Tunnel',click:()=>{void disconnectRemoteCore().catch(()=>undefined);}},
+      {type:'separator'},
+      {label:'启用本机只读 MCP（需批准）',click:()=>{
+        void enableNativeCore().catch(()=>undefined);
+      }},
+      {label:'关闭本机 MCP',click:()=>{void disableNativeCore().catch(()=>undefined);}},
+      {type:'separator'},
       {label:'添加项目目录（仅本地登记）',click:()=>{void addProjectFromNativePicker();}},
       {label:'查看登记与 Core MCP 状态',click:()=>{void showLocalProjectStatus();}},
       {type:'separator'},
@@ -267,5 +413,5 @@ export function launchNextWebFirstHost(options: {
     if(status.state!=='load-failed')status.state='load-failed';
   });
   return {window:owner,status:()=>({...status}),reload:()=>view.webContents.reload(),diagnostics,
-    nativeProjects:()=>projects.list()};
+    nativeProjects:()=>projects.list(),enableNativeCore,disableNativeCore,getCorePosture:()=>mcpState};
 }

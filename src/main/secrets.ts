@@ -248,6 +248,17 @@ async function rotateIfNeeded(): Promise<void> {
   });
 }
 
+/**
+ * Explicitly read-only decrypt for importing an existing Next Tunnel into a
+ * separate preview. Unlike getSecret(), this cannot re-encrypt or rotate the
+ * source ciphertext even if the keychain advertises a pending migration.
+ * Does NOT grant permission to copy, log or retain the returned credential.
+ */
+export async function peekSecretWithoutRotation(key: SecretKey): Promise<string | null> {
+  const value=(await readAll())[key];
+  return value && value.length>0 ? value : null;
+}
+
 export async function getSecret(key: SecretKey): Promise<string | null> {
   const all = await readAll();
   const value = all[key];

@@ -18,13 +18,15 @@ if(!files.includes('/out-webfirst/main/web-first-main.js'))throw Error('MISSING_
 const forbidden=['/out-next/','/extension/','/tunnel/','/out-webfirst/preload/','/out-webfirst/renderer/'];
 for(const item of forbidden)if(files.some(f=>f.includes(item)))throw Error('LEGACY_DEPENDENCY_BUNDLED_'+item);
 const main=asar.extractFile(archive,'out-webfirst/main/web-first-main.js').toString('utf8');
-for(const marker of ['WebContentsView','chatgpt.com','cos-next-web-first-chatgpt','web-first-projects.json','添加项目目录']){
+for(const marker of ['WebContentsView','chatgpt.com','cos-next-web-first-chatgpt','web-first-projects.json','WEB_FIRST_OFFLINE_PROJECT_MENU_PASS','WEB_FIRST_OFFLINE_LOCAL_MCP_PASS']){
   if(!main.includes(marker))throw Error('WEB_FIRST_RUNTIME_MARKER_MISSING');
 }
-for(const marker of ['tunnel-client','codex-cli','COS_NEXT_CLASSIC_WORKFLOW','CHROME_EXTENSION']){
+for(const marker of ['codex-cli','COS_NEXT_CLASSIC_WORKFLOW','CHROME_EXTENSION']){
   if(main.includes(marker))throw Error('LEGACY_RUNTIME_MARKER_FOUND');
 }
-if((await stat(archive)).size<1024)throw Error('EMPTY_WEB_FIRST_ARCHIVE');
+const nativeTunnel=join(app,'Contents/Resources/tunnel/tunnel-client');
+if(!(await stat(nativeTunnel)).isFile())throw Error('WEBFIRST_BUNDLED_TUNNEL_MISSING');
+if((await stat(archive)).size<500_000)throw Error('WEBFIRST_MCP_SDK_NOT_BUNDLED');
 console.log('WEB_FIRST_P1_PACKAGE_GATE=PASS');
 console.log('WEB_FIRST_BUNDLE_ID='+bundle);
 console.log('WEB_FIRST_ARM64_EXECUTABLE=PASS');
