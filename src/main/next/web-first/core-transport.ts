@@ -17,6 +17,14 @@ export function webFirstBundledTunnelBinary(resourcesPath:string|undefined=proce
   return path.join(resourcesPath,'tunnel','tunnel-client');
 }
 export type CoreTunnelState='CONNECTING'|'CONNECTED'|'OFFLINE'|'HOLD';
+/** A process retiring its owner can NEVER be a source for a retry. */
+export function coreRecoveryEligible(x:{offline:boolean;closing:boolean;quitting:boolean;
+  requested:boolean;localService:boolean;windowAlive:boolean;
+  recovering:boolean;connectionInFlight:boolean}):boolean{
+  return !x.offline&&!x.closing&&!x.quitting&&x.requested&&x.localService&&
+    x.windowAlive&&!x.recovering&&!x.connectionInFlight;
+}
+
 export function coreRecoveryDecision(args:{requested:boolean;brokerAlive:boolean;
   ownerPresent:boolean;attempts:number;dueAt:number;now:number}):'idle'|'retry'|'hold'{
   if(!args.requested||args.brokerAlive)return 'idle';

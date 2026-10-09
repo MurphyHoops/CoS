@@ -1,6 +1,6 @@
 /** Standalone opt-in P1 preview. Does not import Classic Bridge, Chrome, Codex or inference. */
 import {app,Menu} from 'electron';
-import {mkdtempSync,mkdirSync,rmSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,rmSync,appendFileSync} from 'node:fs';
 import {WebFirstProjectRegistry} from './project-registry.js';
 import {WebFirstTaskLedger} from './task-ledger.js';
 import {WebFirstPlanLedger} from './plan-ledger.js';
@@ -244,7 +244,39 @@ app.whenReady().then(async()=>{
       app.exit(3);
     }
   }});
-  host.window.on('closed',()=>{if(!quitting)app.quit();});
+  // Application Quit and closing the last native window share ONE shutdown
+  // coordinator. Make no second app.quit attempt after canceled macOS events:
+  // only a proven Tunnel retirement + closed loopback unlocks app.exit.
+  let appQuitInFlight=false;
+  const quitTrace=(stage:string)=>{
+    if(process.env.COS_NEXT_WEBFIRST_QUIT_TRACE==='1'){
+      const line='WEBFIRST_QUIT_STAGE='+stage+'\n';
+      process.stdout.write(line);
+      try{appendFileSync(path.join(os.tmpdir(),'cos-next-quit-'+process.pid+'.log'),
+        line,{mode:0o600});}catch{/* diagnostics are not authoritative */}
+    }
+  };
+  app.on('before-quit',event=>{
+    if(offlineSmoke||httpsSmoke)return;
+    quitTrace('MAIN_BEFORE_QUIT');
+    event.preventDefault();
+    if(appQuitInFlight)return;
+    appQuitInFlight=true;
+    void host.shutdownForAppExit().then(()=>{
+      quitTrace('MAIN_EXIT_APPROVED');
+      app.exit(0);
+    }).catch(()=>{
+      quitTrace('MAIN_EXIT_BLOCKED');
+      appQuitInFlight=false;
+      if(!host.window.isDestroyed())host.window.show();
+    });
+  });
+  host.window.on('closed',()=>{
+    quitTrace('MAIN_WINDOW_CLOSED_CALLBACK');
+    if(!quitting)app.quit();
+  });
+  app.on('window-all-closed',()=>quitTrace('MAIN_ALL_WINDOWS_CLOSED'));
+  app.on('will-quit',()=>quitTrace('MAIN_WILL_QUIT'));
   if(process.env.COS_NEXT_WEBFIRST_DIAG_ONCE==='1'){
     for(const delay of [6000,18000,32000]){
       setTimeout(()=>{

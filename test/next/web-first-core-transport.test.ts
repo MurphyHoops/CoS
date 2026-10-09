@@ -1,7 +1,7 @@
 import {describe,it,expect} from 'vitest';
 import {parseBrokerSignal} from '../../src/main/next/web-first/core-broker.js';
 import path from 'node:path';
-import {importedProfile,validateImportedTunnelConfiguration,webFirstBundledTunnelBinary,coreRecoveryDecision} from '../../src/main/next/web-first/core-transport.js';
+import {importedProfile,validateImportedTunnelConfiguration,webFirstBundledTunnelBinary,coreRecoveryDecision,coreRecoveryEligible} from '../../src/main/next/web-first/core-transport.js';
 describe('Web-First existing Core adoption preflight only (no network / credential)',()=>{
   it('does not auto-retry on healthy owner, orphan or revoked approval; caps attempts',()=>{
     const basic={requested:true,brokerAlive:false,ownerPresent:false,attempts:0,dueAt:100,now:100};
@@ -13,6 +13,17 @@ describe('Web-First existing Core adoption preflight only (no network / credenti
     expect(coreRecoveryDecision({...basic,attempts:4})).toBe('hold');
   });
 
+  it('fences recovery during close/quit and after async connection-flight changes',()=>{
+    const good={offline:false,closing:false,quitting:false,requested:true,
+      localService:true,windowAlive:true,recovering:false,connectionInFlight:false};
+    expect(coreRecoveryEligible(good)).toBe(true);
+    for(const key of ['offline','closing','quitting','recovering','connectionInFlight'] as const){
+      expect(coreRecoveryEligible({...good,[key]:true})).toBe(false);
+    }
+    for(const key of ['requested','localService','windowAlive'] as const){
+      expect(coreRecoveryEligible({...good,[key]:false})).toBe(false);
+    }
+  });
   it('accepts only exact control-plane broker signals, not untrusted log text',()=>{
     expect(parseBrokerSignal('WEBFIRST_CORE_BROKER_READY')).toBe('READY');
     expect(parseBrokerSignal('WEBFIRST_CORE_BROKER_CONNECTED')).toBe('CONNECTED');

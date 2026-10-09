@@ -34,6 +34,11 @@ export async function runWebFirstCoreBroker(appData:string){
     status(proven?'STOPPED_PROVEN':'STOPPED_UNVERIFIED');
     app.exit(proven?0:4);
   };
+  // Electron/macOS can deliver a Quit Apple Event to *every running instance*
+  // with this bundle identity, including this separately launched broker.
+  // Prevent Electron from exiting before the tunnel child has a proven stop
+  // receipt. app.exit() inside finish deliberately bypasses before-quit.
+  app.on('before-quit',event=>{event.preventDefault();void finish();});
   // Parent owns the broker via an open pipe. Loss of parent drops stdin.
   process.stdin.resume();
   process.stdin.setEncoding('utf8');

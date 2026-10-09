@@ -4,7 +4,7 @@
  * the ChatGPT composer. P2 must use separately authenticated, approved MCP tools.
  */
 import {
-  BrowserWindow, Menu, WebContentsView, session, dialog, type WebContents,
+  app, BrowserWindow, Menu, WebContentsView, session, dialog, type WebContents,
   type MenuItemConstructorOptions
 } from 'electron';
 import {
@@ -34,11 +34,14 @@ import {conversationFromUrl,VISIBLE_REPLY_SCRIPT,WebReplySettleTracker,WebFirstR
 import {WebFirstWebOutbox} from './web-outbox.js';
 import {sendNativeWebFirstMessage} from './native-web-input.js';
 import {randomUUID} from 'node:crypto';
+import {appendFileSync} from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {summarizeNativeAcceptance,type AcceptanceRow} from './native-acceptance.js';
 import {createContinuityLease,assessContinuity,type ContinuityLease} from './continuity-gate.js';
 import {createWebFirstCoreLoopback} from './core-loopback.js';
 import {readWebFirstLocalToolList,EXPECTED_READ_ONLY_CORE_TOOLS} from './core-catalogue.js';
-import {connectWebFirstImportedCore,existingTunnelOwnerPresent,coreRecoveryDecision,type CoreTunnelState} from './core-transport.js';
+import {connectWebFirstImportedCore,existingTunnelOwnerPresent,coreRecoveryDecision,coreRecoveryEligible,type CoreTunnelState} from './core-transport.js';
 
 export interface NativeWebHostStatus {
   state: 'starting' | 'loaded' | 'load-failed';
@@ -54,6 +57,7 @@ export interface NativeWebHost {
   nativeProjects: () => Promise<ReadonlyArray<WebFirstProject>>;
   enableNativeCore: () => Promise<{endpointUrl:string;port:number}>;
   disableNativeCore: () => Promise<void>;
+  shutdownForAppExit: () => Promise<void>;
   getCorePosture:()=>string;
   snapshotVisibleAssistant:()=>Promise<VisibleWebReply|null>;
   testRecoveryOverlayOffline?:()=>Promise<boolean>;
@@ -348,36 +352,73 @@ export function launchNextWebFirstHost(options: {
     if(revealTimer){clearTimeout(revealTimer);revealTimer=null;}
   };
   owner.once('ready-to-show',revealWindow);
+  owner.on('show',()=>{if(!offline)process.env.COS_NEXT_WEBFIRST_QUIT_TRACE==='1'&&
+    process.stdout.write('WEBFIRST_QUIT_STAGE=OWNER_SHOWN\n');});
   revealTimer=setTimeout(revealWindow,2500);
   revealTimer.unref();
   owner.on('closed',()=>{if(revealTimer)clearTimeout(revealTimer);});
   let nativeQuitting=false;
+  let appExitShutdown:Promise<void>|null=null;
+  const quitTrace=(stage:string)=>{
+    if(process.env.COS_NEXT_WEBFIRST_QUIT_TRACE==='1'){
+      const line='WEBFIRST_QUIT_STAGE='+stage+'\n';
+      process.stdout.write(line);
+      try{appendFileSync(path.join(os.tmpdir(),'cos-next-quit-'+process.pid+'.log'),
+        line,{mode:0o600});}catch{/* diagnostics are not authoritative */}
+    }
+  };
+  // Synchronous shutdown fence: a model recovery tick or pending native
+  // authorization cannot start a new Broker while the owner is retiring.
+  const shutdownForAppExit=():Promise<void>=>{
+    if(appExitShutdown)return appExitShutdown;
+    quitTrace('NATIVE_SHUTDOWN_ENTER');
+    closingForTunnelStop=true;
+    nativeQuitting=true;
+    recoverApproved=false;
+    clearInterval(recoveryTimer);
+    appExitShutdown=disableNativeCore().then(()=>{
+      quitTrace('NATIVE_SHUTDOWN_DONE');
+    }).catch(error=>{
+      quitTrace('NATIVE_SHUTDOWN_FAILED');
+      // A failed receipt keeps the process alive; never app.exit on ambiguity.
+      // Recovery remains disabled until an explicit new operator action.
+      appExitShutdown=null;
+      nativeQuitting=false;
+      closingForTunnelStop=false;
+      throw error;
+    });
+    return appExitShutdown;
+  };
   owner.on('close',event=>{
-    if(nativeQuitting||(!coreTunnel&&!remoteConnectionFlight))return;
+    quitTrace('OWNER_WINDOW_CLOSE');
+    if(offline)return;
     event.preventDefault();
     if(closingForTunnelStop)return;
-    closingForTunnelStop=true;
-    void (async()=>{
-      try{
-        await disconnectRemoteCore();
-        if(!owner.isDestroyed()){nativeQuitting=true;owner.close();}
-      }catch{
-        // Keep the window and native authority alive when tunnel shutdown
-        // cannot be proved. Never make a sidecar reload gate the shutdown.
-        closingForTunnelStop=false;
-        if(!owner.isDestroyed())void dialog.showMessageBox(owner,{
+    void shutdownForAppExit().then(()=>{
+      // app.quit on macOS can be canceled after all windows have closed and
+      // strand an invisible main process. Electron app.exit bypasses the
+      // cancellable quit event ONLY after all owned Core handles are proved
+      // stopped and the local listener has closed.
+      app.exit(0);
+    }).catch(()=>{
+      if(!owner.isDestroyed()){
+        owner.show();
+        void dialog.showMessageBox(owner,{
           type:'warning',title:'CoS Next · 安全退出受阻',
-          message:'Core Tunnel 尚未确认完整退出，窗口已保留。',
-          detail:'请先从「本地项目」菜单断开 Core；在退出收据明确之前不要运行第二个连接。',
+          message:'Core Tunnel 尚未确认完整退出，程序已停止重连。',
+          detail:'请检查「本地项目」中的 Core 状态。未证明关闭前不会强制结束进程。',
           buttons:['关闭']
         });
       }
-    })();
+    });
   });
   owner.on('closed',()=>{
+    quitTrace('OWNER_WINDOW_CLOSED');
     stopReplyCapture();
     hideRecoveryOverlay();
-    void disableNativeCore().catch(()=>undefined);
+    // Native app-level Quit already owns and proved the one Core teardown.
+    // Avoid launching a redundant close while app.exit retires WebContents.
+    if(!nativeQuitting)void disableNativeCore().catch(()=>undefined);
     // BaseWindow-based children must be explicitly closed; do not leave a web
     // renderer process keeping an authenticated session alive after its owner.
     if(!view.webContents.isDestroyed())view.webContents.close();
@@ -696,6 +737,7 @@ export function launchNextWebFirstHost(options: {
   let coreConnectUiPending=false;
   async function connectRemoteCore(recovery=false):Promise<void>{
     if(offline)throw Error('NO_REMOTE_IN_OFFLINE_SMOKE');
+    if(closingForTunnelStop||nativeQuitting||owner.isDestroyed())return;
     if(coreConnectUiPending)return;
     coreConnectUiPending=true;
     try{
@@ -715,13 +757,14 @@ export function launchNextWebFirstHost(options: {
           +'你可以随时通过“断开 ChatGPT Core Tunnel”关闭自动重连。',
         buttons:['取消','连接并允许有限自愈'],defaultId:0,cancelId:0,noLink:true
       });
-      if(consent.response!==1)return;
+      if(consent.response!==1||closingForTunnelStop||nativeQuitting||owner.isDestroyed())return;
       recoverApproved=true;recoverAttempts=0;recoverDueAt=0;
     }
     // The one native consent above covers both safe local listener startup
     // and reusing the existing Core tunnel. Automatic retries use that grant.
     const local=await enableNativeCore(true);
-    if(owner.isDestroyed())throw Error('WEBFIRST_WINDOW_CLOSED');
+    if(owner.isDestroyed()||closingForTunnelStop||nativeQuitting)
+      throw Error('WEBFIRST_WINDOW_CLOSING');
     remoteConnectionFlight=(async()=>{
       mcpState='REMOTE_CONNECTING';await refreshSidebar();
       try{
@@ -760,12 +803,16 @@ export function launchNextWebFirstHost(options: {
     }finally{coreConnectUiPending=false;}
   }
   async function disableNativeCore():Promise<void>{
+    quitTrace('CORE_CLOSE_ENTER');
     await disconnectRemoteCore();
+    quitTrace('CORE_TUNNEL_STOPPED');
     if(mcpStartFlight)await mcpStartFlight.catch(()=>undefined);
     const current=mcpService;
     mcpService=null;mcpState='UNCONNECTED';
     if(current)await current.close();
-    if(!owner.isDestroyed())await refreshSidebar();
+    quitTrace('CORE_LISTENER_STOPPED');
+    if(!owner.isDestroyed()&&!closingForTunnelStop)await refreshSidebar();
+    quitTrace('CORE_CLOSE_FINISHED');
   }
   let webDispatchInProgress=false;
   const continueTaskOneNativeTurn=async()=>{
@@ -1126,8 +1173,10 @@ export function launchNextWebFirstHost(options: {
   // Native recovery timer never sends ChatGPT messages and never copies a
   // Keychain secret. Tunnel-owner conflict is a hard HOLD, not a retry loop.
   const recoveryTimer=setInterval(()=>{
-    if(offline||recovering||!recoverApproved||!mcpService||owner.isDestroyed()||
-      remoteConnectionFlight)return;
+    if(!coreRecoveryEligible({offline,closing:closingForTunnelStop,quitting:nativeQuitting,
+      requested:recoverApproved,localService:!!mcpService,
+      windowAlive:!owner.isDestroyed(),recovering,
+      connectionInFlight:!!remoteConnectionFlight}))return;
     if(coreTunnel?.alive){
       if(mcpState==='REMOTE_CONNECTED'&&Date.now()-lastConnectedAt>5*60_000)
         recoverAttempts=0;
@@ -1137,6 +1186,7 @@ export function launchNextWebFirstHost(options: {
     void (async()=>{
       try{
         const conflict=await existingTunnelOwnerPresent();
+        if(closingForTunnelStop||nativeQuitting||!recoverApproved||owner.isDestroyed())return;
         const choice=coreRecoveryDecision({requested:recoverApproved,
           brokerAlive:!!coreTunnel?.alive,ownerPresent:conflict,
           attempts:recoverAttempts,dueAt:recoverDueAt,now:Date.now()});
@@ -1146,6 +1196,7 @@ export function launchNextWebFirstHost(options: {
         if(choice!=='retry')return;
         recoverAttempts++;
         recoverDueAt=Date.now()+Math.min(90_000,5000*2**(recoverAttempts-1));
+        if(closingForTunnelStop||nativeQuitting||!recoverApproved||owner.isDestroyed())return;
         await connectRemoteCore(true);
       }catch{mcpState='HOLD';await refreshSidebar();}
       finally{recovering=false;}
@@ -1583,7 +1634,7 @@ export function launchNextWebFirstHost(options: {
     return ok;
   };
   return {window:owner,status:()=>({...status}),reload:()=>view.webContents.reload(),diagnostics,
-    nativeProjects:()=>projects.list(),enableNativeCore,disableNativeCore,
+    nativeProjects:()=>projects.list(),enableNativeCore,disableNativeCore,shutdownForAppExit,
     getCorePosture:()=>mcpState,snapshotVisibleAssistant,
     ...(offline?{testRecoveryOverlayOffline,testGoalWorkbenchOffline,testNativeAcceptanceOffline}:{})};
 }

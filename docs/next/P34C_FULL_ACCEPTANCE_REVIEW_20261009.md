@@ -31,3 +31,6 @@ The acceptance action can be repeated after a reload; unlike a synthetic CI gate
 5. Run real-account permitted fault injection, authenticated provider-limit tests, and packaging/accessibility verification on macOS, Windows and Linux before `deployment=GO`.
 
 **Scope verdict**: local P3.4-C audit and established Core read-only path are verified. Full production autonomous AI Goal/Loop, trusted caller auth and full remote MCP publication remain HOLD.
+
+## Native lifecycle follow-up
+Real connected Core quit through the application menu completed and all owned processes retired, with exact stage receipts. A windowless-main/reconnection race was reproduced and fenced. macOS red-X and externally injected AppleScript Quit are NOT separately accepted. See P34C_NATIVE_EXIT_LIFECYCLE_20261009.md.

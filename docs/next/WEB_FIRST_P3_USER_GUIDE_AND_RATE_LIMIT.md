@@ -63,3 +63,6 @@ Separately, **AI Worker 分工** lets you add/remove up to four planned roles (�
 ## P3.4-C one-click local acceptance
 
 Choose **本地项目 → 运行一键本机功能验收（只读）** to check current registered projects, Goal/plan/job/Worker ledger readability, grant storage, rate-limit state, website loading, the local Core MCP catalogue and broker handshake. Read the **通过 / 待完善 / 异常** breakdown, not only the PASS count. This view does not reveal stored secrets or inspect conversation text, issue a model turn, edit a project or change permission. The verification of ChatGPT-side tool publication and true multi-AI Worker execution remains HOLD until separately proved. Full evidence and failure boundaries are in `P34C_FULL_ACCEPTANCE_REVIEW_20261009.md`.
+
+## P3.4-C native Quit acceptance
+Use the app menu CoS Next Web-First Preview > Quit CoS Next Web-First Preview: this input was proven to close the Tunnel, local MCP and main process. A hidden window or a raw AppleScript Quit event does not prove app exit. Red-X closure awaits a reproducible acceptance test. See P34C_NATIVE_EXIT_LIFECYCLE_20261009.md.
