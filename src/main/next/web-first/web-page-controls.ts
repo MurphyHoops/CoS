@@ -7,6 +7,8 @@ export type WebControlSnapshot={
   page:'CHATGPT'|'OFFLINE_FIXTURE'|'OTHER';conversation:boolean;
   composer:'READY'|'EMPTY_OR_HIDDEN'|'DRAFT_PRESENT'|'GENERATING';
   sendButtonVisible:boolean;userMessages:number;assistantMessages:number;
+  conversationTurnNodes:number;authorRoleNodes:number;articleNodes:number;
+  composerFocused:boolean;requiresLoginUI:boolean;
   canAttemptOneApprovedTurn:boolean;
 };
 export const PAGE_CONTROLS_PROBE=[
@@ -19,8 +21,13 @@ export const PAGE_CONTROLS_PROBE=[
   'const send=document.querySelector("[data-testid=\\"send-button\\"],button[aria-label=\\"Send message\\"],button[aria-label=\\"发送消息\\"]");',
   'const sr=send?.getBoundingClientRect();',
   'return {visible,draft,generating,send:!!sr&&sr.width>0&&sr.height>0,',
-  'users:document.querySelectorAll("[data-message-author-role=\\"user\\"]").length,',
-  'assistants:document.querySelectorAll("[data-message-author-role=\\"assistant\\"]").length};',
+  'users:document.querySelectorAll("[data-message-author-role=\\"user\\"],[data-chatgpt-search-unit-key$=\\":user\\"] [data-user-message-bubble]").length,',
+  'assistants:document.querySelectorAll("[data-message-author-role=\\"assistant\\"],[data-chatgpt-search-unit-key$=\\":assistant\\"] [data-conversation-role]").length,',
+  'turns:document.querySelectorAll("[data-testid^=\\"conversation-turn\\"],[data-turn-key]").length,',
+  'roles:document.querySelectorAll("[data-message-author-role]").length,',
+  'articles:document.querySelectorAll("article").length,',
+  'focused:!!el&&(el===document.activeElement||el.contains(document.activeElement)),',
+  'login:!!document.querySelector("a[href*=\\"/auth/login\\"],a[href*=\\"/login\\"]")};',
   '})()'
 ].join('\n');
 export function classifyWebControls(url:string,value:unknown,offlineFixture=false):WebControlSnapshot{
@@ -37,6 +44,9 @@ export function classifyWebControls(url:string,value:unknown,offlineFixture=fals
     safe.visible===true?'READY':'EMPTY_OR_HIDDEN';
   return {page,conversation,composer,sendButtonVisible:safe.send===true,
     userMessages:bounded(safe.users),assistantMessages:bounded(safe.assistants),
+    conversationTurnNodes:bounded(safe.turns),authorRoleNodes:bounded(safe.roles),
+    articleNodes:bounded(safe.articles),composerFocused:safe.focused===true,
+    requiresLoginUI:safe.login===true,
     canAttemptOneApprovedTurn:conversation&&composer==='READY'};
 }
 export async function inspectNativeChatGPTPage(contents:WebContents,offlineFixture=false):Promise<WebControlSnapshot>{

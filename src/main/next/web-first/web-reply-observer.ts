@@ -26,19 +26,39 @@ export function conversationFromUrl(raw:string):string|null {
   }catch{return null;}
 }
 /** No cookies, localStorage, hidden tokens, network interception or DOM mutation. */
-export const VISIBLE_REPLY_SCRIPT=`(() => {
-  const candidates=[...document.querySelectorAll('[data-message-author-role="assistant"]')];
-  const latest=candidates.at(-1);
-  if(!latest)return null;
-  const text=(latest.innerText||'').slice(0,24576);
-  const messageId=latest.getAttribute('data-message-id')||
-    latest.querySelector('[data-message-id]')?.getAttribute('data-message-id')||
-    'assistant-index-'+candidates.length;
-  const stopping=!!document.querySelector('[data-testid="stop-button"],button[aria-label="Stop generating"],button[aria-label="停止生成"]');
-  const editor=!!document.querySelector('[contenteditable="true"]:not([aria-disabled="true"]),[role="textbox"]:not([aria-disabled="true"])');
-  const busy=!!latest.matches('[aria-busy="true"]')||!!latest.querySelector('[aria-busy="true"]');
-  return {messageId,text,editorReady:editor,generating:stopping||busy};
-})()`;
+export const VISIBLE_REPLY_SCRIPT=[
+  "(() => {",
+  "  // Preserve the legacy page route but reuse the live Classic October-2026",
+  "  // search-unit structure instead of guessing that old author-role exists.",
+  "  const stop=!!document.querySelector('[data-testid=\"stop-button\"],[data-testid=\"composer-stop-button\"],button[aria-label=\"Stop streaming\"],button[aria-label=\"Stop generating\"],button[aria-label=\"停止生成\"]');",
+  "  const editor=!!document.querySelector('#prompt-textarea,[data-composer-body] [data-composer-markdown][contenteditable=\"true\"][role=\"textbox\"],[contenteditable=\"true\"][role=\"textbox\"],#native-smoke-input');",
+  "  const transcript=document.querySelector('[data-chatgpt-conversation-selection-target=\"true\"]');",
+  "  const modern=transcript?[...transcript.querySelectorAll('[data-turn-key] [data-chatgpt-search-unit-key$=\":assistant\"][data-chatgpt-search-message-ids]')]:[];",
+  "  for(let i=modern.length-1;i>=0;i--){",
+  "    const unit=modern[i];",
+  "    if(!unit.querySelector('[data-conversation-role]'))continue;",
+  "    const prose=[...unit.querySelectorAll('.markdown')]",
+  "      .filter(el=>!el.closest('[data-interrupted],[aria-hidden=\"true\"]'));",
+  "    const latest=prose.at(-1);",
+  "    if(!latest)continue;",
+  "    const text=(latest.textContent||'').trim().slice(0,24576);",
+  "    if(!text)continue;",
+  "    const ids=(unit.getAttribute('data-chatgpt-search-message-ids')||'').split(/\\s+/).filter(Boolean);",
+  "    const messageId=ids.length&&ids.every(id=>id===ids[0])?ids[0]:'modern-assistant-index-'+i;",
+  "    const busy=!!unit.closest('[aria-busy=\"true\"]')||!!unit.querySelector('[aria-busy=\"true\"]');",
+  "    return {messageId,text,editorReady:editor,generating:stop||busy};",
+  "  }",
+  "  const candidates=[...document.querySelectorAll('[data-message-author-role=\"assistant\"]')];",
+  "  const latest=candidates.at(-1);",
+  "  if(!latest)return null;",
+  "  const text=(latest.innerText||'').slice(0,24576);",
+  "  const messageId=latest.getAttribute('data-message-id')||",
+  "    latest.querySelector('[data-message-id]')?.getAttribute('data-message-id')||",
+  "    'assistant-index-'+candidates.length;",
+  "  const busy=!!latest.matches('[aria-busy=\"true\"]')||!!latest.querySelector('[aria-busy=\"true\"]');",
+  "  return {messageId,text,editorReady:editor,generating:stop||busy};",
+  "})()"
+].join('\n');
 export class WebReplySettleTracker {
   private candidate:{key:string;firstSeen:number;count:number}|null=null;
   private emitted=new Set<string>();

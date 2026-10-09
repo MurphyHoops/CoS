@@ -32,8 +32,9 @@ import {WebFirstPlanTools} from './plan-tools.js';
 import {renderGoalWorkbench,parseWorkbenchAction,parsePlanLines,completePlanStep} from './goal-workbench.js';
 import {conversationFromUrl,VISIBLE_REPLY_SCRIPT,WebReplySettleTracker,WebFirstReplyJournal,type VisibleWebReply} from './web-reply-observer.js';
 import {WebFirstWebOutbox} from './web-outbox.js';
-import {sendNativeWebFirstMessage} from './native-web-input.js';
+import {sendNativeWebFirstMessage,sendNativeWebFirstNewChat} from './native-web-input.js';
 import {inspectNativeChatGPTPage} from './web-page-controls.js';
+import {runApprovedWebGoalLoop,webLoopPrompt,type WebLoopOutcome} from './approved-web-goal-loop.js';
 import {randomUUID} from 'node:crypto';
 import {appendFileSync} from 'node:fs';
 import os from 'node:os';
@@ -828,6 +829,10 @@ export function launchNextWebFirstHost(options: {
         detail:'页面：'+out.page+'；会话路由：'+(out.conversation?'有效':'不可确认')+
           '\\n输入框：'+out.composer+'；发送按钮显示：'+(out.sendButtonVisible?'是':'否')+
           '\\n显示的用户消息：'+out.userMessages+'，助手回复：'+out.assistantMessages+
+          '\\n会话消息节点：'+out.conversationTurnNodes+'；author-role：'+
+            out.authorRoleNodes+'；article：'+out.articleNodes+
+          '\\n输入焦点：'+(out.composerFocused?'是':'否')+
+            '；登录界面线索：'+(out.requiresLoginUI?'是':'否')+
           '\\n通过 Electron WebContents 操作当前网页，不使用 Codex 或付费 API。'+
           '\\n只检查界面结构，不读取聊天正文、Cookie、Token，也不发送消息。'+
           '\\n发送仍须走原有的一次性原生批准和回执门禁。',
@@ -904,6 +909,240 @@ export function launchNextWebFirstHost(options: {
         detail:'请检查当前对话是否有未发送草稿、模型是否仍在生成，以及本地操作收据。',
         buttons:['关闭']});
     }finally{webDispatchInProgress=false;}
+  };
+  // Bounded website-only worker turns. A native approval grants up to three
+  // webpage messages for ONE active task in ONE already visible chat.
+  // No Codex, paid inference API, private ChatGPT request or auto retry.
+  let approvedWebLoop:AbortController|null=null;
+  let approvedWebLoopLast:WebLoopOutcome|null=null;
+  const stopApprovedWebLoop=()=>{
+    approvedWebLoop?.abort(); // synchronous stop fence
+  };
+  owner.on('close',stopApprovedWebLoop);
+  const startApprovedWebLoop=async()=>{
+    if(owner.isDestroyed())return;
+    if(approvedWebLoop||webDispatchInProgress){
+      await dialog.showMessageBox(owner,{type:'info',message:'网页 Goal/Loop 已在执行或发送中。',
+        detail:'请使用「停止网页 Goal/Loop」终止新消息，已有网络投递将保留原有收据。',
+        buttons:['关闭']});return;
+    }
+    const conversationId=conversationFromUrl(view.webContents.getURL());
+    if(!conversationId){
+      await dialog.showMessageBox(owner,{type:'warning',
+        message:'请先打开 ChatGPT 中需要执行的具体对话，再启动 Goal/Loop。',
+        buttons:['关闭']});return;
+    }
+    const ready=await inspectNativeChatGPTPage(view.webContents).catch(()=>null);
+    if(!ready?.canAttemptOneApprovedTurn){
+      await dialog.showMessageBox(owner,{type:'warning',
+        message:'当前网页有草稿、正在生成或不具备稳定输入框，不能启动网页 Goal/Loop。',
+        buttons:['关闭']});return;
+    }
+    const all=(await taskLedger.list()).filter(t=>t.phase==='active').slice(-4).reverse();
+    if(!all.length){
+      await dialog.showMessageBox(owner,{type:'info',
+        message:'没有活动 Goal。请从「目标 → 打开 Goal / 计划工作台」创建或批准恢复任务。',
+        buttons:['关闭']});return;
+    }
+    const selected=await dialog.showMessageBox(owner,{
+      type:'question',title:'选择 ChatGPT 网页 Goal/Loop',
+      message:'请选择在当前 ChatGPT 网页运行的一个活动 Goal',
+      detail:'操作只作用于目前显示的对话。任务切换、限流或来源改变将自动停止。',
+      buttons:['取消',...all.map(t=>t.goal.slice(0,55))],cancelId:0,defaultId:0,noLink:true
+    });
+    const task=all[selected.response-1];
+    if(!task||owner.isDestroyed()||
+      conversationFromUrl(view.webContents.getURL())!==conversationId)return;
+    const approved=await dialog.showMessageBox(owner,{
+      type:'warning',title:'批准最多 3 轮网页 Goal/Loop',
+      message:'允许使用当前已登录 ChatGPT 网页，最多发送 3 条本 Goal 的续接消息？',
+      detail:'不使用 Codex 或付费 API；正常消耗 ChatGPT 网页额度。'+
+        '\n先通过 MCP 工具记录新 checkpoint，才允许发送下一条。'+
+        '\n总时限 15 分钟。发送前记录本地 outbox，投递不确定不自动重发。'+
+        '\n模型限流、切换对话、停止或任务状态改变将立即暂停。'+
+        '\n真实权限仍由 Core 的本机审批单独控制，不继承其他项目权限。',
+      buttons:['取消','批准当前任务最多 3 轮'],cancelId:0,defaultId:0,noLink:true
+    });
+    if(approved.response!==1||owner.isDestroyed()||
+      conversationFromUrl(view.webContents.getURL())!==conversationId)return;
+    if((await taskLedger.get(task.id)).phase!=='active')return;
+    approvedWebLoop=new AbortController();
+    webDispatchInProgress=true;
+    try{
+      approvedWebLoopLast=await runApprovedWebGoalLoop({
+        taskId:task.id,conversationId,maxTurns:3,deadline:Date.now()+15*60_000,
+        signal:approvedWebLoop.signal,services:{
+          getUrl:()=>view.webContents.getURL(),
+          getTask:()=>taskLedger.get(task.id),
+          getOutbox:()=>webOutbox.list(),
+          enqueue:args=>webOutbox.enqueue(args),
+          transition:(id,from,to,proof)=>webOutbox.transition(id,from,to,proof),
+          modelAllowed:async()=> (await throttle.status()).model==='clear',
+          snapshot:snapshotVisibleAssistant,
+          pageReady:async()=>{
+            const ui=await inspectNativeChatGPTPage(view.webContents).catch(()=>null);
+            return ui?.canAttemptOneApprovedTurn===true;
+          },
+          send:(id,text)=>sendNativeWebFirstMessage(view.webContents,id,text),
+          sleep:ms=>new Promise(resolve=>setTimeout(resolve,ms))
+        }
+      });
+      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{
+        type:approvedWebLoopLast.reason==='TASK_REVIEW'?'info':'warning',
+        title:'网页 Goal/Loop · 执行收据',
+        message:'已发送 '+approvedWebLoopLast.sent+' 条网页消息；确认 '+approvedWebLoopLast.replies+' 个稳定回复。',
+        detail:'停止原因：'+approvedWebLoopLast.reason+
+          '\n回复显示完成不等于项目自动验收，最终完成仍需本地确认。'+
+          '\n如需继续，请核对 Goal、网页回复和投递收据后重新批准。',
+        buttons:['关闭']
+      });
+    }catch{
+      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{
+        type:'warning',title:'网页 Goal/Loop 已暂停',
+        message:'出现网页或本地状态异常，未再次尝试任何不确定消息。',
+        buttons:['关闭']
+      });
+    }finally{approvedWebLoop=null;webDispatchInProgress=false;}
+  };
+  const startGoalInNewWebChat=async()=>{
+    if(owner.isDestroyed()||webDispatchInProgress||approvedWebLoop)return;
+    const address=view.webContents.getURL();
+    let isHome=false;
+    try{const u=new URL(address);
+      isHome=u.protocol==='https:'&&u.hostname==='chatgpt.com'&&u.pathname==='/';
+    }catch{/* homepage required */}
+    if(!isHome){
+      await dialog.showMessageBox(owner,{type:'warning',
+        message:'请先在内嵌 ChatGPT 网页打开首页「新聊天」，然后使用此功能。',
+        buttons:['关闭']});return;
+    }
+    const ready=await inspectNativeChatGPTPage(view.webContents).catch(()=>null);
+    if(ready?.composer!=='READY'){
+      await dialog.showMessageBox(owner,{type:'warning',
+        message:'网页输入框有草稿或当前正在生成，不能自动创建新对话。',
+        buttons:['关闭']});return;
+    }
+    const active=(await taskLedger.list()).filter(t=>t.phase==='active').slice(-4).reverse();
+    if(!active.length){
+      await dialog.showMessageBox(owner,{type:'info',
+        message:'请先从 Goal / 计划工作台创建任务，或批准恢复等待中的 Goal。',
+        buttons:['关闭']});return;
+    }
+    const choice=await dialog.showMessageBox(owner,{type:'question',
+      title:'网页创建新对话并启动 Goal',message:'选择一个已授权的活动 Goal',
+      detail:'将使用当前已登录的 ChatGPT 网页真实发送首条消息，不使用 Codex 或 API。',
+      buttons:['取消',...active.map(t=>t.goal.slice(0,55))],cancelId:0,defaultId:0,noLink:true});
+    const task=active[choice.response-1];if(!task||owner.isDestroyed())return;
+    const confirm=await dialog.showMessageBox(owner,{type:'warning',
+      title:'确认创建网页对话',message:'为此 Goal 创建一个 ChatGPT 对话并发送第一条网页消息？',
+      detail:'将消耗正常 ChatGPT 网页额度。必须在实际网页创建成功后才绑定新会话。'+
+        '\n投递状态不确定时不重复发送，原有任务也不会自动标记完成。',
+      buttons:['取消','批准本次网页消息'],cancelId:0,defaultId:0,noLink:true});
+    if(confirm.response!==1||owner.isDestroyed()||view.webContents.getURL()!==address||
+      (await taskLedger.get(task.id)).phase!=='active')return;
+    // One task cannot start a fresh website turn over an unreconciled send.
+    if((await webOutbox.list()).some(row=>row.taskId===task.id&&row.state!=='delivered')){
+      await dialog.showMessageBox(owner,{type:'warning',
+        message:'该任务存在不确定的网页发送记录，已阻止创建新对话。',buttons:['关闭']});
+      return;
+    }
+    webDispatchInProgress=true;
+    try{
+      await throttle.requireManualModelAvailable();
+      const placeholder=randomUUID(),text=webLoopPrompt(task,0);
+      const queued=await webOutbox.enqueue({taskId:task.id,conversationId:placeholder,
+        text,nonce:randomUUID()});
+      await webOutbox.transition(queued.id,'queued','dispatching');
+      let confirmed:{proved:boolean;conversationId:string|null;proof:string|null}|null=null;
+      try{confirmed=await sendNativeWebFirstNewChat(view.webContents,text);}
+      finally{
+        if(confirmed?.proved&&confirmed.conversationId&&confirmed.proof)
+          await webOutbox.bindNewChatDelivered(queued.id,placeholder,
+            confirmed.conversationId,confirmed.proof);
+        else await webOutbox.transition(queued.id,'dispatching','uncertain');
+      }
+      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{type:confirmed?.proved?'info':'warning',
+        message:confirmed?.proved?'ChatGPT 已创建 Goal 新对话并显示首条消息。':
+          '无法确认 ChatGPT 已接收新对话消息，禁止自动重发。',
+        detail:confirmed?.proved?'可从「目标 → 启动当前网页 Goal/Loop」继续已核实的任务。':
+          '请先检查实际网页与本地投递收据，再人工决定如何恢复。',
+        buttons:['关闭']});
+    }catch{
+      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{type:'warning',
+        message:'创建新对话被安全门禁阻止或收据异常；不会自动再次发送。',
+        buttons:['关闭']});
+    }finally{webDispatchInProgress=false;}
+  };
+  // Optional operator-approved real website smoke. It uses exactly one
+  // harmless chat message, independent of any real project or active Goal.
+  const testRealChatGPTWebsite=async()=>{
+    if(owner.isDestroyed()||webDispatchInProgress||approvedWebLoop)return;
+    let u:URL;try{u=new URL(view.webContents.getURL());}catch{return;}
+    if(u.protocol!=='https:'||u.hostname!=='chatgpt.com'||u.pathname!=='/'){
+      await dialog.showMessageBox(owner,{type:'warning',
+        message:'请打开 ChatGPT 首页「新聊天」，才可运行真实网页测试。',
+        buttons:['关闭']});return;
+    }
+    const ready=await inspectNativeChatGPTPage(view.webContents).catch(()=>null);
+    if(ready?.composer!=='READY'){
+      await dialog.showMessageBox(owner,{type:'warning',
+        message:'当前网页不是空白且就绪的 ChatGPT 新聊天输入框。',
+        buttons:['关闭']});return;
+    }
+    const consent=await dialog.showMessageBox(owner,{type:'question',
+      title:'真实 ChatGPT 网页模型测试',
+      message:'允许发送一条无项目数据的测试消息，并检查真实网页回复吗？',
+      detail:'仅使用当前登录的 ChatGPT 网页和正常网站额度；不调用 Codex 或付费 API。'+
+        '\n会在你的网页聊天历史中创建一条普通测试对话。'+
+        '\n不会读取任何本地项目，也不会调用 MCP 写操作。失败不自动重试。',
+      buttons:['取消','批准发送一次网页测试'],defaultId:0,cancelId:0,noLink:true});
+    if(consent.response!==1||owner.isDestroyed()||view.webContents.getURL()!==u.href)return;
+    const prompt='网页功能联通测试。请只回复：COS_NEXT_WEBPAGE_SMOKE_OK。不要调用任何工具。';
+    webDispatchInProgress=true;
+    let state:'PASS'|'UNPROVED'|'REPLY_TIMEOUT'|'REPLY_MISMATCH'|'FAIL'='FAIL';
+    try{
+      const result=await sendNativeWebFirstNewChat(view.webContents,prompt);
+      if(!result.proved||!result.conversationId){state='UNPROVED';return;}
+      state='REPLY_TIMEOUT';
+      const tracker=new WebReplySettleTracker();
+      const until=Date.now()+135_000;
+      while(!owner.isDestroyed()&&Date.now()<until){
+        if(conversationFromUrl(view.webContents.getURL())!==result.conversationId){
+          state='UNPROVED';break;
+        }
+        if((await throttle.status()).model!=='clear'){state='FAIL';break;}
+        const latest=tracker.observe(await snapshotVisibleAssistant());
+        if(latest){
+          state=latest.text.includes('COS_NEXT_WEBPAGE_SMOKE_OK')?'PASS':'REPLY_MISMATCH';
+          break;
+        }
+        await new Promise(resolve=>setTimeout(resolve,2400));
+      }
+    }catch{state='FAIL';}
+    finally{
+      webDispatchInProgress=false;
+      // Exposes only a small non-secret test verdict, never page text.
+      if(process.env.COS_NEXT_WEBFIRST_LIVE_SMOKE_TRACE==='1')
+        process.stdout.write('WEB_FIRST_REAL_WEBSITE_SMOKE='+state+'\\n');
+      if(!owner.isDestroyed())void dialog.showMessageBox(owner,{
+        type:state==='PASS'?'info':'warning',
+        title:'真实 ChatGPT 网页测试结果',message:state==='PASS'?
+          '真实网页消息与助手回复均已验证。':'真实网页测试未通过完整发送/回复门禁。',
+        detail:'结果：'+state+'\\n未使用 Codex 或额外付费 API；不会自动重试。',
+        buttons:['关闭']
+      });
+    }
+  };
+  const inspectApprovedWebLoop=async()=>{
+    if(owner.isDestroyed())return;
+    await dialog.showMessageBox(owner,{type:'info',title:'网页 Goal/Loop 状态',
+      message:approvedWebLoop?'当前网页 Goal/Loop 运行中':'当前没有正在运行的网页 Goal/Loop',
+      detail:approvedWebLoopLast?
+        '上一轮发送：'+approvedWebLoopLast.sent+'；稳定回复：'+
+          approvedWebLoopLast.replies+'；停止原因：'+approvedWebLoopLast.reason:
+        '请从当前 ChatGPT 具体对话启动。每轮的网页发送收据持久化保存。',
+      buttons:['关闭']
+    });
   };
   const toggleReplyCapture=async()=>{
     if(recordingChat){
@@ -1358,6 +1597,13 @@ export function launchNextWebFirstHost(options: {
     {label:'CoS Next',submenu:[{role:'quit'}]},
     {label:'目标',submenu:[
       {label:'打开 Goal / 计划工作台',accelerator:'CmdOrCtrl+Shift+G',click:()=>{void openGoalWorkbench();}},
+      {label:'新建 ChatGPT 对话并启动 Goal（需批准）',
+        click:()=>{void startGoalInNewWebChat();}},
+      {label:'真实 ChatGPT 网页发送/回复验收（单次，需批准）',
+        click:()=>{void testRealChatGPTWebsite();}},
+      {label:'启动当前网页 Goal/Loop（最多 3 轮，需批准）',click:()=>{void startApprovedWebLoop();}},
+      {label:'停止网页 Goal/Loop',click:()=>{stopApprovedWebLoop();void inspectApprovedWebLoop();}},
+      {label:'查看网页 Goal/Loop 状态',click:()=>{void inspectApprovedWebLoop();}},
       {label:'管理任务与恢复',click:()=>{void manageDurableTasks();}},
       {type:'separator'},
       {label:'查看限流暂停与恢复',click:()=>{void manageRateLimit();}},

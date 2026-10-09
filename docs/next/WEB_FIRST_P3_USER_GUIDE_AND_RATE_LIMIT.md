@@ -74,3 +74,7 @@ ChatGPT 网页 -> 安全关闭主窗口（停止 Core） (Cmd+W) is now availabl
 ## P3.5 real metadata and browser UI control
 
 This lane operates only the signed-in ChatGPT website with its ordinary usage quota, never Codex or pay-per-token inference. The native ChatGPT webpage menu now offers a read-only interaction readiness check. Real ChatGPT tool calls delivered both official anonymous session and subject metadata; repeat-call fingerprints matched in the same chat. These are correlation signals only, not authorization. See P35_G1B_AND_WEBPAGE_ONLY_LIVE_20261010.md.
+
+## P3.6 website-only Goal/Loop controls
+
+Use 目标 -> 打开 Goal / 计划工作台 to create or explicitly resume an ACTIVE Goal. At ChatGPT homepage, select 新建 ChatGPT 对话并启动 Goal（需批准） to send its first normal website turn. In the concrete chat, select 启动当前网页 Goal/Loop（最多 3 轮，需批准） for up to 3 turns / 15 minutes. 停止网页 Goal/Loop stops future new sends; 查看网页 Goal/Loop 状态 reports its last exit reason. Only the logged-in website and ordinary site plan usage is used. No Codex or paid model API fallback. An uncertain send, missing fresh task checkpoint, waiting/review, conversation switch or rate limit stops the loop until another authorization. See P36_CLASSIC_PARITY_WEB_GOAL_LOOP_20261010.md for accepted tests and remaining parity limits.

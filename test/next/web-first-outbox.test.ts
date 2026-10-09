@@ -38,3 +38,24 @@ describe('Web-First native delivery outbox fail-closed crash boundary',()=>{
     await expect(box.list()).rejects.toThrow('OUTBOX_UNSAFE');
   });
 });
+
+describe('atomic first-conversation binding',()=>{
+  it('holds an unresolved seed and accepts only one proved real chat identity',async()=>{
+    const {dir,box}=await setup();
+    try{
+      const placeholder='33333333-3333-4333-8333-333333333333';
+      const actual='44444444-4444-4444-8444-444444444444';
+      const seed=await box.enqueue({
+        taskId:'55555555-5555-4555-8555-555555555555',conversationId:placeholder,
+        text:'Start a new chat',nonce:'66666666-6666-4666-8666-666666666666'});
+      await box.transition(seed.id,'queued','dispatching');
+      await expect(box.bindNewChatDelivered(seed.id,placeholder,placeholder,'dom:test'))
+        .rejects.toThrow('OUTBOX_NEW_CHAT_BIND_INVALID');
+      const bound=await box.bindNewChatDelivered(seed.id,placeholder,actual,'dom:accepted');
+      expect(bound).toMatchObject({conversationId:actual,state:'delivered',proof:'dom:accepted'});
+      expect((await new WebFirstWebOutbox(dir).list())[0]?.conversationId).toBe(actual);
+      await expect(box.bindNewChatDelivered(seed.id,placeholder,actual,'dom:again'))
+        .rejects.toThrow('OUTBOX_NEW_CHAT_STALE_BIND');
+    }finally{await rm(dir,{recursive:true,force:true});}
+  });
+});

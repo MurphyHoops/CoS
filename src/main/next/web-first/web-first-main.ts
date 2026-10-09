@@ -9,6 +9,7 @@ import {WebFirstReplyJournal} from './web-reply-observer.js';
 import {WebFirstWebOutbox} from './web-outbox.js';
 import {WebFirstRateLimitSupervisor} from './rate-limit-supervisor.js';
 import {sendNativeWebFirstMessage} from './native-web-input.js';
+import {runApprovedWebGoalLoop} from './approved-web-goal-loop.js';
 import {randomUUID,createHash} from 'node:crypto';
 import {WebFirstReadGrants} from './read-grants.js';
 import {WebFirstOperationJournal} from './operation-journal.js';
@@ -230,6 +231,67 @@ app.whenReady().then(async()=>{
       if(!await host.testNativePageControlsOffline?.())
         throw Error('WEBFIRST_OFFLINE_NATIVE_PAGE_CONTROL_PROBE_FAILED');
       process.stdout.write('WEB_FIRST_OFFLINE_NATIVE_PAGE_CONTROL_PASS\n');
+      // P3.6 packaged integration: true Electron CDP keyboard input into the
+      // sandboxed offline browser + durable outbox + task checkpoint + stable
+      // reply settle. No remote model, Codex or user account is involved.
+      const loopLedger=new WebFirstTaskLedger(profile);
+      const loopProject=(await host.nativeProjects())[0];
+      if(!loopProject)throw Error('WEBFIRST_OFFLINE_LOOP_PROJECT_MISSING');
+      const loopTask=await loopLedger.begin({projectId:loopProject.id,
+        projectRoot:loopProject.root,goal:'Offline bounded web Goal/Loop smoke'});
+      const loopChatId=randomUUID();
+      const loopOutbox=new WebFirstWebOutbox(profile);
+      let fakeNow=Date.now();
+      const outcome=await runApprovedWebGoalLoop({
+        taskId:loopTask.id,conversationId:loopChatId,maxTurns:1,
+        deadline:fakeNow+180_000,signal:new AbortController().signal,
+        now:()=>fakeNow,waitForReplyMs:50_000,
+        services:{
+          getUrl:()=> 'https://chatgpt.com/c/'+loopChatId,
+          getTask:()=>loopLedger.get(loopTask.id),
+          getOutbox:()=>loopOutbox.list(),
+          enqueue:args=>loopOutbox.enqueue(args),
+          transition:(id,from,to,proof)=>loopOutbox.transition(id,from,to,proof),
+          modelAllowed:async()=>true,
+          pageReady:async()=>true,
+          snapshot:async()=>{
+            const value=await host.snapshotVisibleAssistant();
+            return value?{...value,conversationId:loopChatId}:null;
+          },
+          send:async(id,prompt)=>{
+            const result=await sendNativeWebFirstMessage(contents,id,prompt,true);
+            if(result.proved){
+              const current=await loopLedger.get(loopTask.id);
+              await loopLedger.checkpoint(loopTask.id,current.revision,randomUUID(),
+                'Offline test: actual native input and persistent MCP checkpoint');
+              await contents.executeJavaScript(
+                "(() => {const row=document.createElement('article');"+
+                "row.setAttribute('data-message-author-role','assistant');"+
+                "row.setAttribute('data-message-id','offline-web-loop-answer');"+
+                "row.textContent='Synthetic visible reply after real CDP browser input';"+
+                "document.body.appendChild(row)})()");
+            }
+            return result;
+          },
+          sleep:async ms=>{fakeNow+=ms;await new Promise(resolve=>setTimeout(resolve,20));}
+        }
+      });
+      process.stdout.write('WEB_FIRST_OFFLINE_LOOP_RESULT='+JSON.stringify({reason:outcome.reason,sent:outcome.sent,replies:outcome.replies})+'\n');
+      if(outcome.reason!=='TURN_BUDGET'||outcome.sent!==1||outcome.replies!==1||
+        (await loopOutbox.list()).filter(x=>x.taskId===loopTask.id)
+          .some(x=>x.state!=='delivered'))
+        throw Error('WEBFIRST_OFFLINE_APPROVED_WEB_LOOP_FAILED');
+      process.stdout.write('WEB_FIRST_OFFLINE_APPROVED_WEB_GOAL_LOOP_PASS\n');
+      const goalMenu=menus.find(m=>m.label==='目标');
+      const requiredGoalActions=['新建 ChatGPT 对话并启动 Goal（需批准）',
+        '启动当前网页 Goal/Loop（最多 3 轮，需批准）',
+        '停止网页 Goal/Loop','查看网页 Goal/Loop 状态'];
+      if(!goalMenu?.submenu||requiredGoalActions.some(action=>
+        !goalMenu.submenu?.items.some(item=>item.label===action)))
+        throw Error('WEBFIRST_OFFLINE_WEB_GOAL_MENU_MISSING');
+      process.stdout.write('WEB_FIRST_OFFLINE_WEB_GOAL_MENU_PASS\n');
+
+
       if(!projectMenu?.submenu?.items.some(item=>item.label==='管理/撤销只读授权')||
          !projectMenu.submenu.items.some(item=>item.label==='查看本地操作收据'))
         throw Error('WEBFIRST_NATIVE_P3_GRANTS_MENU_MISSING');
@@ -246,7 +308,9 @@ app.whenReady().then(async()=>{
       process.stdout.write('WEB_FIRST_OFFLINE_INPUT_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_VIEW_READY\n');
       setImmediate(()=>app.quit());
-    }catch{
+    }catch(error){
+      const code=error instanceof Error&&/^[A-Z0-9_]+$/.test(error.message)?error.message:'UNKNOWN';
+      process.stderr.write('WEB_FIRST_OFFLINE_ERROR_CODE='+code+'\n');
       process.stderr.write('WEB_FIRST_OFFLINE_INPUT_FAILED\n');
       app.exit(3);
     }

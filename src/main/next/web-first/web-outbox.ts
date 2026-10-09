@@ -85,6 +85,22 @@ export class WebFirstWebOutbox {
       await this.persist(rows);return row;
     });
   }
+  /** Atomically bind a just-created webpage conversation to its first durable
+   * browser send receipt. The pre-send placeholder is NEVER treated as a chat.
+   */
+  async bindNewChatDelivered(id:string,placeholder:string,actualConversationId:string,proof:string){
+    if(!ID.test(placeholder)||!ID.test(actualConversationId)||placeholder===actualConversationId||
+      !proof||proof.length>200)throw Error('OUTBOX_NEW_CHAT_BIND_INVALID');
+    return this.serialized(async()=>{
+      const rows=await this.load(),row=rows.find(x=>x.id===id);
+      if(!row||row.state!=='dispatching'||row.conversationId!==placeholder)
+        throw Error('OUTBOX_NEW_CHAT_STALE_BIND');
+      if(rows.some(x=>x.id!==id&&x.nonce===row.nonce))
+        throw Error('OUTBOX_NEW_CHAT_NONCE_CONFLICT');
+      row.conversationId=actualConversationId;row.state='delivered';row.proof=proof;
+      row.updatedAt=Date.now();await this.persist(rows);return row;
+    });
+  }
   /** A restart can never replay a message accepted by the browser before fsync. */
   async holdUncertain():Promise<number>{
     return this.serialized(async()=>{
