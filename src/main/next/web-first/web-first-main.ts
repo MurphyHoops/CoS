@@ -96,6 +96,11 @@ app.whenReady().then(async()=>{
       const result=await contents.executeJavaScript(`document.querySelector('#native-smoke-input')?.value`);
       contents.debugger.detach();
       if(result!=='COS_OFFLINE_NATIVE_INPUT')throw Error('OFFLINE_NATIVE_INPUT_MISMATCH');
+      if(!host.window.isVisible()){
+        await new Promise(resolve=>setTimeout(resolve,2900));
+      }
+      if(!host.window.isVisible())throw Error('WEBFIRST_OFFLINE_MAIN_WINDOW_NOT_VISIBLE');
+      process.stdout.write('WEB_FIRST_OFFLINE_MAIN_WINDOW_VISIBLE_PASS\n');
       if((await host.nativeProjects()).length!==1)
         throw Error('WEBFIRST_OFFLINE_PROJECT_UI_NOT_AVAILABLE');
       const menus=Menu.getApplicationMenu()?.items??[];

@@ -210,7 +210,22 @@ export function launchNextWebFirstHost(options: {
   owner.on('resize',resize);
   owner.on('enter-full-screen',resize);
   owner.on('leave-full-screen',resize);
-  owner.once('ready-to-show',()=>{resize();if(!owner.isDestroyed())owner.show();});
+  // BrowserWindow has no normal renderer: the real page lives in a
+  // WebContentsView. On macOS ready-to-show is not guaranteed to fire for
+  // this native composition. Do not leave the login/workspace window hidden
+  // while its Core MCP and Tunnel start successfully in the background.
+  let windowRevealed=false;
+  let revealTimer:NodeJS.Timeout|null=null;
+  const revealWindow=()=>{
+    if(owner.isDestroyed())return;
+    resize();
+    if(!windowRevealed){windowRevealed=true;owner.show();}
+    if(revealTimer){clearTimeout(revealTimer);revealTimer=null;}
+  };
+  owner.once('ready-to-show',revealWindow);
+  revealTimer=setTimeout(revealWindow,2500);
+  revealTimer.unref();
+  owner.on('closed',()=>{if(revealTimer)clearTimeout(revealTimer);});
   let nativeQuitting=false;
   owner.on('close',event=>{
     if(nativeQuitting||(!coreTunnel&&!remoteConnectionFlight))return;
@@ -452,11 +467,13 @@ export function launchNextWebFirstHost(options: {
       });
     }
   };
-  async function enableNativeCore():Promise<{endpointUrl:string;port:number}>{
+  async function enableNativeCore(approvedForSameConnect=false):Promise<{endpointUrl:string;port:number}>{
     if(mcpStartFlight)return mcpStartFlight;
     if(mcpService)return {endpointUrl:mcpService.endpointUrl,port:mcpService.port};
     const work=async()=>{
-      if(!offline){
+      // A native approval for the full Core connection also authorizes its
+      // prerequisite local-only MCP listener. Don't ask the same user twice.
+      if(!offline&&!approvedForSameConnect){
         if(owner.isDestroyed())throw Error('WEBFIRST_WINDOW_CLOSED');
         const consent=await dialog.showMessageBox(owner,{
           type:'warning',title:'启用本机 Core MCP 服务',
@@ -500,8 +517,12 @@ export function launchNextWebFirstHost(options: {
     coreTunnel=null;mcpState='LOCAL_ONLY';
     await refreshSidebar();
   }
+  let coreConnectUiPending=false;
   async function connectRemoteCore(recovery=false):Promise<void>{
     if(offline)throw Error('NO_REMOTE_IN_OFFLINE_SMOKE');
+    if(coreConnectUiPending)return;
+    coreConnectUiPending=true;
+    try{
     if(coreTunnel&&!coreTunnel.alive){
       // Drop a dead local handle only if the tunnel-client owner check passes
       // in connectWebFirstImportedCore. An orphan will block the new launch.
@@ -509,13 +530,11 @@ export function launchNextWebFirstHost(options: {
     }
     if(coreTunnel||remoteConnectionFlight)return;
     if(recovery&&!mcpService)return;
-    const local=await enableNativeCore();
-    if(owner.isDestroyed())throw Error('WEBFIRST_WINDOW_CLOSED');
     if(!recovery){
       const consent=await dialog.showMessageBox(owner,{
         type:'warning',title:'连接现有 ChatGPT Core Tunnel',
         message:'从原有 Next 加密配置连接 ChatGPT Core？',
-        detail:'只读复用旧 Next Keychain；不会复制凭证、调用模型或升级项目权限。\n'
+        detail:'本次批准同时启用本机 Core MCP，并只读复用旧 Next Keychain；不会复制凭证、调用模型或升级项目权限。\n'
           +'本次批准后，若 Broker 意外退出，将有限次数自动重连，无需反复弹窗。\n'
           +'你可以随时通过“断开 ChatGPT Core Tunnel”关闭自动重连。',
         buttons:['取消','连接并允许有限自愈'],defaultId:0,cancelId:0,noLink:true
@@ -523,6 +542,10 @@ export function launchNextWebFirstHost(options: {
       if(consent.response!==1)return;
       recoverApproved=true;recoverAttempts=0;recoverDueAt=0;
     }
+    // The one native consent above covers both safe local listener startup
+    // and reusing the existing Core tunnel. Automatic retries use that grant.
+    const local=await enableNativeCore(true);
+    if(owner.isDestroyed())throw Error('WEBFIRST_WINDOW_CLOSED');
     remoteConnectionFlight=(async()=>{
       mcpState='REMOTE_CONNECTING';await refreshSidebar();
       try{
@@ -558,6 +581,7 @@ export function launchNextWebFirstHost(options: {
         buttons:['关闭']
       });
     }finally{remoteConnectionFlight=null;}
+    }finally{coreConnectUiPending=false;}
   }
   async function disableNativeCore():Promise<void>{
     await disconnectRemoteCore();

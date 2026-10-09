@@ -236,3 +236,31 @@ tracked by the parity ledger. Real local MCP integration tests prove approval
 denial, successful exact replacement, stale SHA refusal, duplicate span
 refusal and sensitive/symlink rejection; packaged offline Electron smoke now
 covers search and replacement against disposable fixture content only.
+
+## P3g native Electron main-window visibility hardening
+
+A separate read-only native UI audit after successful Core connectivity
+found no accessible main window associated with the running Web-First owner,
+even though the headless MCP/Broker/Tunnel were responding. The native
+`BrowserWindow` had `show:false` and was only revealed in `ready-to-show`.
+Because the actual ChatGPT site resides in child `WebContentsView`, this
+platform event is not a reliable sole readiness signal. The host now reveals
+the window exactly once either on `ready-to-show` or after a 2.5-second
+fallback timer, while web content continues loading. The fallback does not
+read cookies, modify messages or start a model turn. The bundled offline
+Electron smoke explicitly asserts `host.window.isVisible()` and emits
+`WEB_FIRST_OFFLINE_MAIN_WINDOW_VISIBLE_PASS`. Real macOS foreground and
+logged-in website acceptance must still be checked after version switch.
+
+## P3h consolidated native Core connection approval
+
+The manual `连接现有 ChatGPT Core Tunnel` action previously prompted twice:
+first for the local-only MCP listener and then for the existing OpenAI Core
+Tunnel. This was redundant for one user-requested connect operation and
+could lead to approval fatigue. The same native Core connection confirmation
+now explicitly covers **both** the local MCP listener and the existing
+Tunnel/Keychain broker. Direct `启用本机 Core MCP` remains its own separate
+consent path. No project read, file mutation, shell operation or third-party
+plugin permission is broadened by this change. Reentrant Connect clicks are
+coalesced while the approval is pending; native Disconnect still stops and
+revokes the process-local reconnect grant.
