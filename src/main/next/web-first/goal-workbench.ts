@@ -7,12 +7,14 @@ import type {WebFirstProject} from './project-registry.js';
 import type {DurableTask} from './task-ledger.js';
 import type {TaskPlan,PlanStep} from './plan-ledger.js';
 import {GOAL_WORKBENCH_CSS} from './goal-workbench-style.js';
+import type {LocalCheckJob,LocalCheckKind} from './local-job-queue.js';
 const escape=(s:string)=>s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;',
   '>':'&gt;','"':'&quot;',"'":'&#39;'}[c]??''));
 export const GOAL_FORM_ORIGIN='cos-next-goal://native/';
 export type GoalWorkbenchAction= {kind:'create';projectId:string;goal:string;lines:string}|
   {kind:'update-plan';taskId:string;revision:number;lines:string}|
   {kind:'advance';taskId:string;taskRevision:number;planRevision:number;at:number}|
+  {kind:'local-check';taskId:string;taskRevision:number;planRevision:number;check:LocalCheckKind}|
   {kind:'decision';taskId:string;revision:number;decision:'pause'|'resume'|'cancel'|'complete'}|
   {kind:'refresh'};
 /** No user string is allowed to be treated as a navigable URL. */
@@ -56,6 +58,18 @@ export function parseWorkbenchAction(raw:string):GoalWorkbenchAction{
       !Number.isSafeInteger(planRevision)||planRevision<1||
       !Number.isSafeInteger(at)||at<0||at>=12)throw Error('GOAL_FORM_INVALID');
     return {kind:'advance',taskId,taskRevision,planRevision,at};
+  }
+  if(u.pathname==='/local-check'){
+    noExtra(['task_id','task_revision','plan_revision','check']);
+    const taskId=one('task_id',36),taskRev=one('task_revision',10),planRev=one('plan_revision',10);
+    const check=one('check',24);
+    if(!/^[a-f0-9-]{36}$/i.test(taskId)||!/^[1-9][0-9]*$/.test(taskRev)||
+      !/^(?:0|[1-9][0-9]*)$/.test(planRev)||
+      !['root-check','git-status'].includes(check)||
+      !Number.isSafeInteger(Number(taskRev))||!Number.isSafeInteger(Number(planRev)))
+      throw Error('GOAL_FORM_INVALID');
+    return {kind:'local-check',taskId,taskRevision:Number(taskRev),
+      planRevision:Number(planRev),check:check as LocalCheckKind};
   }
   if(u.pathname==='/decision'){
     noExtra(['task_id','revision','decision']);
@@ -109,7 +123,8 @@ export function goalWorkbenchSummary(tasks:ReadonlyArray<DurableTask>){
     completed:tasks.filter(t=>t.phase==='completed').length};
 }
 export function renderGoalWorkbench(args:{projects:ReadonlyArray<WebFirstProject>;
-  tasks:ReadonlyArray<DurableTask>;plans:ReadonlyArray<TaskPlan>;message:string;
+  tasks:ReadonlyArray<DurableTask>;plans:ReadonlyArray<TaskPlan>;jobs?:ReadonlyArray<LocalCheckJob>;
+  jobError?:boolean;message:string;
   limit?:{model:'clear'|'cooldown'|'review';history:'normal'|'degraded'}|null}):string{
   const {projects,tasks,plans,message}=args;
   const summary=goalWorkbenchSummary(tasks);
@@ -139,6 +154,22 @@ export function renderGoalWorkbench(args:{projects:ReadonlyArray<WebFirstProject
       <input type="hidden" name="at" value="${currentIndex}">
       <button type="submit" class="success" title="仅标记计划进度；不运行命令或模型">✓ 完成当前步骤</button>
     </form>`:'';
+    const recentJob=args.jobs?.filter(j=>j.taskId===t.id).at(-1);
+    const busy=args.jobs?.some(j=>j.taskId===t.id&&['queued','running'].includes(j.state))??false;
+    const jobLabel:Record<LocalCheckJob['state'],string>={queued:'等待本地检查',running:'本地检查执行中',
+      succeeded:'本地检查已完成',failed:'本地检查失败',review:'检查结果待复核'};
+    const jobNote=recentJob?`<p class="goal-note" role="status">最近一次 ${recentJob.kind==='root-check'?'目录完整性':'Git 状态'}检查 · ${jobLabel[recentJob.state]}
+      ${recentJob.changedCount!==null?' · 已跟踪变更 '+recentJob.changedCount+' 项':''}
+      ${recentJob.reason?' · '+escape(recentJob.reason):''}（仅本地检查结果，不代表 Goal 完成）</p>`:'';
+    const checks=editable&&t.phase==='active'&&args.jobError?
+      '<span class="soft">本机检查收据异常；检查已禁用，计划编辑不受影响。</span>':
+      editable&&t.phase==='active'?`<form action="${GOAL_FORM_ORIGIN}local-check" method="GET">
+      <input type="hidden" name="task_id" value="${escape(t.id)}">
+      <input type="hidden" name="task_revision" value="${t.revision}">
+      <input type="hidden" name="plan_revision" value="${revision}">
+      <button class="secondary" name="check" value="root-check" ${busy?'disabled':''}>检查项目目录</button>
+      <button class="secondary" name="check" value="git-status" title="只统计已跟踪文件，不包含未跟踪文件" ${busy?'disabled':''}>检查 Git 状态</button>
+    </form>`:'';
     const actions=editable?`<form class="state-actions" action="${GOAL_FORM_ORIGIN}decision" method="GET">
       <input type="hidden" name="task_id" value="${escape(t.id)}">
       <input type="hidden" name="revision" value="${t.revision}">
@@ -155,6 +186,7 @@ export function renderGoalWorkbench(args:{projects:ReadonlyArray<WebFirstProject
           ${stepsPreview?`<div class="steps-mini">${stepsPreview}</div>`:''}`:'<p class="goal-note">尚未编写计划 · 可在下方展开编辑</p>'}
         ${current?`<p class="next-line"><strong>当前重点</strong> · ${escape(current.step)}</p>`:''}
         ${p?.explanation?`<p class="goal-note">${escape(p.explanation)}</p>`:''}
+        ${jobNote}
         ${t.phase==='recovery-hold'?'<p class="goal-note">重启后需要你确认恢复，系统不会重复执行未知操作。</p>':''}
       </div>
       ${editable?`<details class="edit-panel"><summary>编辑分步计划 · 最多 12 步</summary>
@@ -168,7 +200,7 @@ export function renderGoalWorkbench(args:{projects:ReadonlyArray<WebFirstProject
         </form></div>
       </details>`: ''}
       ${editable?`<div class="goal-actions"><span class="soft">手动更新本机状态 · 不运行模型</span>
-        <div class="state-actions">${advance}${actions}</div></div>`:''}
+        <div class="state-actions">${checks}${advance}${actions}</div></div>`:''}
     </article>`;
   };
   const model=args.limit?.model;
@@ -176,8 +208,9 @@ export function renderGoalWorkbench(args:{projects:ReadonlyArray<WebFirstProject
     model==='review'?'本机冷却期限已到，实际可用额度尚未核实。恢复前需要人工检查。':
     model==='clear'?'本机未设置模型续接暂停；这不代表服务端额度已获验证。':
     '尚未获得可信的模型额度状态，自动执行保持关闭。';
-  const noticeError=/未执行|拒绝|失败|异常/.test(message);
-  const noticeSuccess=!!message&&!noticeError;
+  const visibleMessage=args.jobError?'本机检查收据异常：仅禁用检查操作，Goal 和计划不会被重置。'+message:message;
+  const noticeError=/未执行|拒绝|失败|异常/.test(visibleMessage);
+  const noticeSuccess=!!visibleMessage&&!noticeError;
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; form-action cos-next-goal:; base-uri 'none'; connect-src 'none'; img-src 'none'">
@@ -192,7 +225,7 @@ export function renderGoalWorkbench(args:{projects:ReadonlyArray<WebFirstProject
         <div class="metric wait"><span class="label">等待 / 需处理</span><span class="number">${summary.waiting}</span></div>
         <div class="metric"><span class="label">已完成</span><span class="number">${summary.completed}</span></div>
       </div>
-      ${message?`<div class="notice ${noticeError?'error':noticeSuccess?'success':''}" role="status"><span class="glyph">${noticeError?'!':'✓'}</span><div><strong>${noticeError?'操作未保存':'状态已更新'}</strong><p>${escape(message)}</p></div></div>`:''}
+      ${visibleMessage?`<div class="notice ${noticeError?'error':noticeSuccess?'success':''}" role="status"><span class="glyph">${noticeError?'!':'✓'}</span><div><strong>${noticeError?'操作未保存':'状态已更新'}</strong><p>${escape(visibleMessage)}</p></div></div>`:''}
       <div class="columns"><section class="card" id="create"><div class="card-body">
         <div class="card-heading"><div><div class="card-kicker">01 · NEW GOAL</div><h2 class="card-title">创建一个新目标</h2></div><span class="muted">无需预先配置 MCP 命令</span></div>
         <form action="${GOAL_FORM_ORIGIN}create" method="GET">

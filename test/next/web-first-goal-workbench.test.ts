@@ -33,6 +33,24 @@ describe('JS-free native Goal workbench parser and presentation',()=>{
       expect(()=>parseWorkbenchAction(`cos-next-goal://native/advance?task_id=${goalId}&task_revision=2&plan_revision=3&${suffix}`)).toThrow();
     }
   });
+  it('does not hide existing goals if the separate diagnostic ledger is corrupt',()=>{
+    const html=renderGoalWorkbench({projects:[],tasks:[{id:goalId,
+      projectId:'project-test-12345',projectRoot:'/tmp/example',rootDev:1,rootIno:2,
+      goal:'Preserved Goal',phase:'active',revision:1,createdAt:1,updatedAt:1,
+      waitUntil:null,events:[]}],plans:[],jobs:[],jobError:true,message:''});
+    expect(html).toContain('Preserved Goal');
+    expect(html).toContain('本机检查收据异常');
+    expect(html).toContain('编辑分步计划');
+    expect(html).not.toContain('name="check"');
+  });
+  it('accepts only named read-only native checks with exact revisions',()=>{
+    const u=`cos-next-goal://native/local-check?task_id=${goalId}&task_revision=1&plan_revision=0&check=git-status`;
+    expect(parseWorkbenchAction(u)).toMatchObject({kind:'local-check',check:'git-status',planRevision:0});
+    for(const bad of [u.replace('git-status','exec-command'),u+'&shell=true',
+      u.replace('task_revision=1','task_revision=0'),u.replace('plan_revision=0','plan_revision=-1')]){
+      expect(()=>parseWorkbenchAction(bad)).toThrow();
+    }
+  });
   it('renders plan progress, archive and model limits',()=>{
     const base={id:goalId,projectId:'project-test-12345',projectRoot:'/tmp/example',rootDev:1,rootIno:2,
       goal:'Test durable plan',phase:'active' as const,revision:2,createdAt:1,updatedAt:2,waitUntil:null,events:[]};

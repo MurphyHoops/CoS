@@ -26,6 +26,7 @@ import {WebFirstProjectWriter} from './project-write.js';
 import {WebFirstTaskLedger} from './task-ledger.js';
 import {WebFirstTaskTools} from './task-tools.js';
 import {WebFirstPlanLedger} from './plan-ledger.js';
+import {WebFirstLocalJobQueue} from './local-job-queue.js';
 import {WebFirstPlanTools} from './plan-tools.js';
 import {renderGoalWorkbench,parseWorkbenchAction,parsePlanLines,completePlanStep} from './goal-workbench.js';
 import {conversationFromUrl,VISIBLE_REPLY_SCRIPT,WebReplySettleTracker,WebFirstReplyJournal,type VisibleWebReply} from './web-reply-observer.js';
@@ -193,6 +194,20 @@ export function launchNextWebFirstHost(options: {
 
   const taskLedger=new WebFirstTaskLedger(options.projectStoreDir);
   const planLedger=new WebFirstPlanLedger(options.projectStoreDir,taskLedger);
+  const localJobs=new WebFirstLocalJobQueue(options.projectStoreDir,taskLedger,planLedger,
+    async request=>{
+      if(offline)return true; // Synthetic packaged fixture has no real project.
+      if(owner.isDestroyed())return false;
+      const approved=await dialog.showMessageBox(owner,{
+        type:'question',title:'批准一次本地只读检查',
+        message:request.kind==='root-check'?'检查项目目录是否仍是原目录？':'检查项目的 Git 工作区状态？',
+        detail:'目标：'+request.goal.slice(0,360)+'\n\n'+
+          '仅允许这一次固定的只读检查；不会执行用户提供的任意命令、修改文件、发送网页消息或推进模型。'+
+          '\n检查结果只保留退出状态、变更数量及 SHA-256，不保存文件名或文件内容。',
+        buttons:['取消','仅批准本次检查'],defaultId:0,cancelId:0,noLink:true
+      });
+      return !owner.isDestroyed()&&approved.response===1;
+    });
   const webReplies=new WebFirstReplyJournal(options.projectStoreDir);
   const webOutbox=new WebFirstWebOutbox(options.projectStoreDir);
   const replyTracker=new WebReplySettleTracker();
@@ -952,11 +967,12 @@ export function launchNextWebFirstHost(options: {
     goalUi.webContents.on('will-redirect',event=>event.preventDefault());
     const render=async(message='')=>{
       if(goalUi.isDestroyed())return;
-      const [projectList,taskList,planList,limit]=await Promise.all([
+      const [projectList,taskList,planList,limit,jobState]=await Promise.all([
         projects.list(),taskLedger.list(),planLedger.list(),
-        throttle.status().catch(()=>null)]);
+        throttle.status().catch(()=>null),
+        localJobs.list().then(jobs=>({jobs,error:false})).catch(()=>({jobs:[],error:true}))]);
       if(goalUi.isDestroyed())return;
-      const html=renderGoalWorkbench({projects:projectList,tasks:taskList,plans:planList,message,limit});
+      const html=renderGoalWorkbench({projects:projectList,tasks:taskList,plans:planList,jobs:jobState.jobs,jobError:jobState.error,message,limit});
       await goalUi.webContents.loadURL('data:text/html;charset=utf-8,'+encodeURIComponent(html));
     };
     goalUi.webContents.on('will-navigate',(event,url)=>{
@@ -981,6 +997,20 @@ export function launchNextWebFirstHost(options: {
               nonce:randomUUID(),explanation:'由原生 Goal 工作台创建',steps});
             await render('目标已保存到本机。创建目标不会启动自动模型循环。');
             void refreshSidebar();return;
+          }
+          if(command.kind==='local-check'){
+            const job=await localJobs.enqueue({taskId:command.taskId,
+              taskRevision:command.taskRevision,planRevision:command.planRevision,
+              kind:command.check,nonce:randomUUID()});
+            await render('本地检查已批准并记录。只运行固定的只读检查，不调用模型。');
+            // Work is owned by the native process and persists if the workbench
+            // closes. Missing exit evidence becomes REVIEW on next app start.
+            void localJobs.run(job.id).then(()=>{
+              if(!goalUi.isDestroyed())void render('本地检查结束；请查看任务卡片的检查收据。').catch(()=>undefined);
+            }).catch(()=>{
+              if(!goalUi.isDestroyed())void render('检查收据需要复核；未自动重试。').catch(()=>undefined);
+            });
+            return;
           }
           if(command.kind==='advance'){
             const task=await taskLedger.get(command.taskId);
@@ -1011,6 +1041,7 @@ export function launchNextWebFirstHost(options: {
             if(sure.response!==1||goalUi.isDestroyed())return;
           }
           await taskLedger.nativeDecision(task.id,task.revision,command.decision);
+          if(command.decision==='pause'||command.decision==='cancel')localJobs.stopTask(task.id);
           await render('任务状态已持久化。');void refreshSidebar();
         }catch(err){
           const reason=err instanceof Error&&/^[A-Z_]+$/.test(err.message)?err.message:'GOAL_ACTION_REJECTED';
@@ -1025,7 +1056,7 @@ export function launchNextWebFirstHost(options: {
         message:'本机目标或计划记录不可安全读取。未覆盖现有数据。',buttons:['关闭']});
     }
   };
-  owner.on('closed',()=>{if(goalWindow&&!goalWindow.isDestroyed())goalWindow.close();});
+  owner.on('closed',()=>{localJobs.stopActive();if(goalWindow&&!goalWindow.isDestroyed())goalWindow.close();});
   const manageDurableTasks=async()=>{
     if(owner.isDestroyed())return;
     try{
@@ -1310,6 +1341,42 @@ export function launchNextWebFirstHost(options: {
       finally{if(attachedAgain&&wc.debugger.isAttached())wc.debugger.detach();}
       if(!advanced)found=false;
       else process.stdout.write('WEB_FIRST_OFFLINE_GOAL_STEP_ADVANCE_PASS\n');
+    }
+    if(found){
+      // P3.4 native fixture: click actual no-JavaScript diagnostic approval form
+      // and verify the persisted local completion receipt, not a model claim.
+      let checked=false,attachedCheck=false;
+      try{
+        await new Promise(resolve=>setTimeout(resolve,250));
+        wc.debugger.attach('1.3');attachedCheck=true;
+        const root=(await wc.debugger.sendCommand('DOM.getDocument',{depth:-1})) as {
+          root:{nodeId:number}};
+        const target=(await wc.debugger.sendCommand('DOM.querySelector',{
+          nodeId:root.root.nodeId,selector:'form[action$="local-check"] button[value="root-check"]'})) as {nodeId:number};
+        if(!target.nodeId)throw Error('LOCAL_JOB_BUTTON_MISSING');
+        await wc.debugger.sendCommand('DOM.scrollIntoViewIfNeeded',{nodeId:target.nodeId});
+        const bounds=(await wc.debugger.sendCommand('DOM.getBoxModel',{nodeId:target.nodeId})) as {
+          model:{content:number[]}};
+        const pts=bounds.model.content;
+        const x=((pts[0]??0)+(pts[2]??0)+(pts[4]??0)+(pts[6]??0))/4;
+        const y=((pts[1]??0)+(pts[3]??0)+(pts[5]??0)+(pts[7]??0))/4;
+        await wc.debugger.sendCommand('Input.dispatchMouseEvent',{
+          type:'mousePressed',x,y,button:'left',clickCount:1});
+        await wc.debugger.sendCommand('Input.dispatchMouseEvent',{
+          type:'mouseReleased',x,y,button:'left',clickCount:1});
+        for(let i=0;i<24;i++){
+          await new Promise(resolve=>setTimeout(resolve,125));
+          const job=(await localJobs.list()).find(j=>j.kind==='root-check'&&j.state==='succeeded');
+          if(job){
+            const task=await taskLedger.get(job.taskId);
+            if(task.goal==='OFFLINE_NATIVE_GOAL_FORM_PASS'&&task.phase==='active'&&
+              job.outputDigest&&job.exitCode===0){checked=true;break;}
+          }
+        }
+      }catch{process.stderr.write('WEB_FIRST_OFFLINE_LOCAL_JOB_NATIVE_INPUT_FAILED\n');}
+      finally{if(attachedCheck&&wc.debugger.isAttached())wc.debugger.detach();}
+      if(!checked)found=false;
+      else process.stdout.write('WEB_FIRST_OFFLINE_LOCAL_JOB_APPROVED_EXECUTED_PASS\n');
     }
     if(!window.isDestroyed())window.close();
     return found;

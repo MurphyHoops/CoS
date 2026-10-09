@@ -47,3 +47,9 @@ Open the new 「目标」 menu or press ⌘⇧G to open the Goal workbench. The 
 In an ACTIVE Goal with an explicit `[>]` step, click 「✓ 完成当前步骤」 to mark it `[x]` and bring the next pending `[ ]` step into progress. This only changes the versioned native plan snapshot after exact task/plan revision checks. It does not run the plan, send a browser turn or complete the parent Goal. To change other steps, expand plan editing.
 
 The native top toolbar and project sidebar now use one visual language; the ChatGPT web partition is untouched. See `P3_UI_PRODUCT_AND_LOCAL_EXECUTION_PLAN.md` for the P3.4 durable queue and recovery gates.
+
+## P3.4-A: authorized local checks from Goal workbench
+
+An ACTIVE Goal now shows **检查项目目录** and **检查 Git 状态**. These initiate a separate, explicitly confirmed native-only diagnostic operation, not an automatic model-generated action. Only the fixed project inode check or bounded Git status command is permitted. Each operation writes a durable local job receipt, exposed as the latest check status on the Goal card. Git counts tracked-file status entries only, not untracked files. No source names or stdout are written to the receipt.
+
+Under ChatGPT model cooldown, approved local checks may still complete without additional inference. On restart, interrupted or undispatched jobs go to **待复核**, not a silent replay. Pausing/cancelling the Goal stops its running local check. If the separate diagnostic ledger is corrupt, the check buttons are unavailable but the Goal and plan editor remain usable. This is **not** arbitrary `exec_command`, a full Goal/Loop engine, or entitlement to send another ChatGPT prompt. See `P34_NATIVE_LOCAL_JOBS_FIRST_SLICE.md` for the audited boundary.

@@ -3,6 +3,8 @@ import {app,Menu} from 'electron';
 import {mkdtempSync,mkdirSync,rmSync} from 'node:fs';
 import {WebFirstProjectRegistry} from './project-registry.js';
 import {WebFirstTaskLedger} from './task-ledger.js';
+import {WebFirstPlanLedger} from './plan-ledger.js';
+import {WebFirstLocalJobQueue} from './local-job-queue.js';
 import {WebFirstReplyJournal} from './web-reply-observer.js';
 import {WebFirstWebOutbox} from './web-outbox.js';
 import {WebFirstRateLimitSupervisor} from './rate-limit-supervisor.js';
@@ -67,6 +69,15 @@ app.whenReady().then(async()=>{
   }catch{
     if(offlineSmoke)throw Error('WEBFIRST_TASK_RECOVERY_LEDGER_FAILED');
   }
+  // Native diagnostics likewise cannot silently retry a possibly interrupted
+  // child. Reconcile receipts before the UI is exposed, never auto-run queued.
+  try{
+    const taskStore=new WebFirstTaskLedger(profile);
+    const planStore=new WebFirstPlanLedger(profile,taskStore);
+    const jobStore=new WebFirstLocalJobQueue(profile,taskStore,planStore,async()=>false);
+    const held=await jobStore.holdInterrupted();
+    if(offlineSmoke)process.stdout.write('WEB_FIRST_OFFLINE_LOCAL_JOBS_HELD='+held+'\n');
+  }catch{if(offlineSmoke)throw Error('WEBFIRST_LOCAL_JOB_RECOVERY_FAILED');}
   // If an earlier process died around a browser send, never re-submit it.
   try{
     const uncertain=await new WebFirstWebOutbox(profile).holdUncertain();
