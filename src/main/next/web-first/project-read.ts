@@ -2,8 +2,9 @@
 import path from 'node:path';
 import { promises as fs, constants } from 'node:fs';
 import type { WebFirstProjectRegistry, WebFirstProject } from './project-registry.js';
+import {isSensitiveProjectPath} from './read-grants.js';
 
-export type ReadAction='project_list'|'project_ls'|'project_read';
+export type ReadAction='project_list'|'project_ls'|'project_read'|'project_find';
 export type NativeReadApproval=(description:{
   readonly action:ReadAction;
   readonly projectName?:string;
@@ -67,6 +68,77 @@ export class WebFirstReadAuthority {
     const entries=shown.map(d=>({name:d.name,
       type:d.isSymbolicLink()?'other':d.isDirectory()?'directory':d.isFile()?'file':'other'}));
     return {projectId,relativePath,entries,truncated:items.length>MAX_LIST};
+  }
+  /** Bounded literal filename/text search under one user-approved directory. */
+  async find(projectId:string,relativePath:string,query:string){
+    if(typeof query!=='string'||query.trim().length<2||query.length>100||query.includes('\0'))
+      throw Error('FIND_QUERY_INVALID');
+    const project=await this.project(projectId);
+    const before=await this.target(project.root,relativePath,'directory');
+    if(!await this.approve({action:'project_find',projectName:project.name,projectId:project.id,
+      projectRoot:project.root,target:before.canonical}))throw Error('NATIVE_APPROVAL_DENIED');
+    const after=await this.target(project.root,relativePath,'directory');
+    if(before.canonical!==after.canonical||before.stat.dev!==after.stat.dev||
+      before.stat.ino!==after.stat.ino)throw Error('DIRECTORY_CHANGED_DURING_APPROVAL');
+    const needle=query.toLocaleLowerCase();
+    const results:{path:string;line:number;snippet:string;kind:'file'|'content'}[]=[];
+    const stack:[string,number][]=[[before.canonical,0]];
+    let scanned=0;
+    const deadline=Date.now()+3000;
+    const visited=new Set<string>();
+    while(stack.length&&scanned<360&&results.length<24&&Date.now()<deadline){
+      const [folder,depth]=stack.pop()!;
+      if(visited.has(folder))continue;visited.add(folder);
+      const status=await fs.lstat(folder);
+      if(!status.isDirectory()||status.isSymbolicLink())continue;
+      if(isSensitiveProjectPath(project.root,folder))continue;
+      if(await fs.realpath(folder)!==folder)throw Error('FIND_DIRECTORY_CHANGED');
+      const children=await fs.readdir(folder,{withFileTypes:true});
+      const second=await fs.lstat(folder);
+      if(second.dev!==status.dev||second.ino!==status.ino||
+        second.isSymbolicLink()||await fs.realpath(folder)!==folder)
+        throw Error('FIND_DIRECTORY_CHANGED');
+      for(const item of children){
+        if(scanned>=360||results.length>=24||Date.now()>=deadline)break;
+        const filename=item.name;
+        if(filename.startsWith('.')||filename==='node_modules'||filename==='dist'||
+          filename==='build'||filename==='coverage')continue;
+        const candidate=path.join(folder,filename),relative=path.relative(project.root,candidate);
+        if(isSensitiveProjectPath(project.root,candidate)||item.isSymbolicLink())continue;
+        scanned++;
+        if(item.isDirectory()){
+          if(depth<5)stack.push([candidate,depth+1]);
+          continue;
+        }
+        if(!item.isFile())continue;
+        const display=relative.split(path.sep).join('/');
+        if(filename.toLocaleLowerCase().includes(needle)){
+          results.push({path:display,line:0,snippet:'',kind:'file'});
+          if(results.length>=24)break;
+        }
+        const metadata=await fs.lstat(candidate);
+        if(!metadata.isFile()||metadata.isSymbolicLink()||metadata.size>32*1024)continue;
+        const file=await fs.open(candidate,constants.O_RDONLY|constants.O_NOFOLLOW);
+        try{
+          const actual=await file.stat();
+          if(!actual.isFile()||actual.size>32*1024||
+            actual.dev!==metadata.dev||actual.ino!==metadata.ino)continue;
+          const data=await file.readFile();
+          if(data.includes(0))continue;
+          let text:string;
+          try{text=new TextDecoder('utf-8',{fatal:true}).decode(data);}catch{continue;}
+          const lines=text.split('\n');
+          for(let idx=0;idx<lines.length&&results.length<24;idx++){
+            const line=lines[idx]!;
+            if(line.toLocaleLowerCase().includes(needle)){
+              results.push({path:display,line:idx+1,snippet:line.slice(0,180),kind:'content'});
+            }
+          }
+        }finally{await file.close();}
+      }
+    }
+    return {projectId,relativePath,query,results,scanned,
+      truncated:!!stack.length||scanned>=360||results.length>=24||Date.now()>=deadline};
   }
   async readFile(projectId:string,relativePath:string){
     const project=await this.project(projectId);

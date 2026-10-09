@@ -6,13 +6,15 @@ import {createWebFirstCoreMcp} from './project-mcp.js';
 import type {WebFirstReadAuthority} from './project-read.js';
 import type {WebFirstOperationJournal} from './operation-journal.js';
 import type {WebFirstTaskTools} from './task-tools.js';
+import type {WebFirstProjectWriter} from './project-write.js';
 const MAX_REQUEST=64*1024;
 function reject(res:http.ServerResponse,status:number,code:string){
   res.writeHead(status,{'content-type':'application/json','cache-control':'no-store'});
   res.end(JSON.stringify({error:code}));
 }
-export async function createWebFirstCoreLoopback(authority:WebFirstReadAuthority,journal?:WebFirstOperationJournal,tasks?:WebFirstTaskTools){
-  const core=createWebFirstCoreMcp(authority,journal,tasks);
+export async function createWebFirstCoreLoopback(authority:WebFirstReadAuthority,journal?:WebFirstOperationJournal,
+  tasks?:WebFirstTaskTools,writes?:WebFirstProjectWriter){
+  const core=createWebFirstCoreMcp(authority,journal,tasks,writes);
   const secret=randomBytes(32).toString('base64url');
   const route='/web-first/'+secret+'/mcp';
   const metadata='/.well-known/oauth-protected-resource'+route;

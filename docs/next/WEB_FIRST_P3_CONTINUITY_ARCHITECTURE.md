@@ -195,3 +195,44 @@ OpenAI Broker crash/restore with platform tool receipts must still be tested
 separately before claiming field-level auto-recovery validation. The running
 older app is intentionally not hot-replaced while its web draft/session may
 be in use. This fix is in the next independently packaged preview build.
+
+## P3e scoped project text search
+
+`project_find(project_id, relative_path, query)` is a new bounded, native-
+approved literal search under a registered root. It lists filename matches
+and bounded UTF-8 line snippets; it does not execute shell/regex or expose
+user project paths. Hidden folders, `.env*`, credentials/private keys,
+`node_modules`, linked paths and files larger than 32 KiB are skipped. Search
+is bounded by depth 5, 360 scanned entries, 24 results and a 3-second
+budget, with directory identity checks. It uses the existing per-project read
+authorization (one approval or scoped persistent grant). A dedicated MCP test
+proves sensitive files and symlink escapes are not returned. This is **not**
+a full Classic `find` compatibility replacement; that original schema and
+advanced search features remain tracked in the migration matrix.
+
+ChatGPT's published tool snapshot must be refreshed to advertise this new
+tool, independently of the native Core Tunnel connection. The running P3
+instance is not hot-patched; the next preview package contains this change.
+
+## P3f per-file bounded editing tool
+
+`project_replace(project_id,relative_path,expected_sha256,old_text,new_text)`
+provides a non-automatic, **single-file exact text substitution** under a
+registered project. It only edits existing regular UTF-8 files of at most
+32 KiB; old and replacement text inputs are limited to 4,000 characters.
+The caller must provide the correct SHA-256 of the current full file and the
+old span must occur **exactly once**. The target is revalidated after a
+mandatory, default-deny macOS native write-approval dialog that shows the
+requested path and before/after snippet. Filesystem writes are staged in the
+same directory with O_EXCL, fsync'd and atomically renamed; the original
+mode is preserved. Symlinks, directory escapes, hard links, sensitive paths
+and changed source content are rejected. Only the SHA and byte count return
+over MCP; project body content is not written into the operation receipt.
+
+Permanent **read** grants do not grant any write authority. This does not
+expose terminal commands, arbitrary patch application, file deletion, folder
+creation or Git push. The original Classic `apply_patch` remains unmigrated,
+tracked by the parity ledger. Real local MCP integration tests prove approval
+denial, successful exact replacement, stale SHA refusal, duplicate span
+refusal and sensitive/symlink rejection; packaged offline Electron smoke now
+covers search and replacement against disposable fixture content only.

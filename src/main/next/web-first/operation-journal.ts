@@ -2,7 +2,7 @@
 import {promises as fs,constants} from 'node:fs';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
-export type ProjectOperation='project_list'|'project_ls'|'project_read';
+export type ProjectOperation='project_list'|'project_ls'|'project_read'|'project_find'|'project_replace';
 export type OperationStage='STARTED'|'SUCCEEDED'|'REJECTED';
 export interface OperationReceipt {id:string;at:number;action:ProjectOperation;projectId:string|null;stage:OperationStage;}
 const LOG='web-first-operations.jsonl';
@@ -55,7 +55,7 @@ export class WebFirstOperationJournal {
       if(!data||typeof data!=='object'||Array.isArray(data))throw Error('JOURNAL_RECORD_INVALID');
       const row=data as Partial<OperationReceipt>;
       if(typeof row.id!=='string'||!/^[-a-f0-9]{36}$/i.test(row.id)||
-        !Number.isSafeInteger(row.at)||!['project_list','project_ls','project_read'].includes(String(row.action))||
+        !Number.isSafeInteger(row.at)||!['project_list','project_ls','project_read','project_find','project_replace'].includes(String(row.action))||
         !['STARTED','SUCCEEDED','REJECTED'].includes(String(row.stage))||
         (row.projectId!==null&&typeof row.projectId!=='string'))throw Error('JOURNAL_RECORD_INVALID');
       return row as OperationReceipt;

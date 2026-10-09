@@ -18,6 +18,7 @@ import {renderProjectSidebar} from './project-sidebar.js';
 import {WebFirstReadAuthority, type ReadAction, type NativeReadApproval} from './project-read.js';
 import {WebFirstReadGrants,isSensitiveProjectPath} from './read-grants.js';
 import {WebFirstOperationJournal} from './operation-journal.js';
+import {WebFirstProjectWriter} from './project-write.js';
 import {WebFirstTaskLedger} from './task-ledger.js';
 import {WebFirstTaskTools} from './task-tools.js';
 import {conversationFromUrl,VISIBLE_REPLY_SCRIPT,WebReplySettleTracker,WebFirstReplyJournal,type VisibleWebReply} from './web-reply-observer.js';
@@ -100,6 +101,20 @@ export function launchNextWebFirstHost(options: {
   const projects=new WebFirstProjectRegistry(options.projectStoreDir);
   const grants=new WebFirstReadGrants(options.projectStoreDir);
   const journal=new WebFirstOperationJournal(options.projectStoreDir);
+  const writeAuthority=new WebFirstProjectWriter(projects,async changes=>{
+    if(offline)return true;
+    if(owner.isDestroyed())return false;
+    const decision=await dialog.showMessageBox(owner,{
+      type:'warning',title:'CoS Next · 单次代码修改批准',
+      message:'允许修改项目 '+changes.projectName+' 内的一个文件吗？',
+      detail:'文件：'+changes.relativePath+'\n'
+        +'原始片段：\n'+changes.before+'\n\n替换为：\n'+changes.after+'\n\n'
+        +'仅此一次批准，不继承永久只读授权；不会执行终端或提交 Git。',
+      buttons:['拒绝','仅批准本次修改'],defaultId:0,cancelId:0,noLink:true
+    });
+    return !owner.isDestroyed()&&decision.response===1;
+  });
+
   const taskLedger=new WebFirstTaskLedger(options.projectStoreDir);
   const webReplies=new WebFirstReplyJournal(options.projectStoreDir);
   const webOutbox=new WebFirstWebOutbox(options.projectStoreDir);
@@ -383,7 +398,8 @@ export function launchNextWebFirstHost(options: {
         const label:Record<ReadAction,string>={
           project_list:'查看项目名称与 ID',
           project_ls:'列举项目目录中的文件名',
-          project_read:'读取项目内文件正文（上限 32 KiB）'
+          project_read:'读取项目内文件正文（上限 32 KiB）',
+          project_find:'搜索指定项目目录中的普通文本和文件名（排除隐私文件）'
         };
         const buttons=sensitive?['拒绝','仅允许这一次']:
           ['拒绝','仅允许这一次','本次运行允许','始终允许（该范围只读）'];
@@ -443,17 +459,17 @@ export function launchNextWebFirstHost(options: {
       if(!offline){
         if(owner.isDestroyed())throw Error('WEBFIRST_WINDOW_CLOSED');
         const consent=await dialog.showMessageBox(owner,{
-          type:'warning',title:'启用本机只读 MCP 服务',
-          message:'仅在此 Mac 启动一个本地只读 MCP 服务？',
+          type:'warning',title:'启用本机 Core MCP 服务',
+          message:'仅在此 Mac 启动一个受限 Core MCP 服务？',
           detail:'此步骤不会连接 ChatGPT 插件，也不会自动授权任何项目。\n'
-            +'项目列表、目录和文件读取仍需每次由你在 macOS 原生弹窗批准。\n'
-            +'禁止写入、终端执行和自动任务。',
+            +'普通只读操作可按项目记住授权；每次代码修改都须另行批准。\n'
+            +'仅有上限的单次文本替换可获批准；不允许任意终端命令或未授权的自动任务。',
           buttons:['取消','启用本地服务'],defaultId:0,cancelId:0,noLink:true
         });
         if(consent.response!==1)throw Error('WEBFIRST_CORE_NOT_APPROVED');
       }
       const authority=new WebFirstReadAuthority(projects,approveScopedRead);
-      const created=await createWebFirstCoreLoopback(authority,journal,taskTools);
+      const created=await createWebFirstCoreLoopback(authority,journal,taskTools,writeAuthority);
       if(owner.isDestroyed()){
         await created.close();throw Error('WEBFIRST_WINDOW_CLOSED');
       }
@@ -755,7 +771,7 @@ export function launchNextWebFirstHost(options: {
       {label:'连接现有 ChatGPT Core Tunnel（需批准）',click:()=>{void connectRemoteCore();}},
       {label:'断开 ChatGPT Core Tunnel',click:()=>{void disconnectRemoteCore().catch(()=>undefined);}},
       {type:'separator'},
-      {label:'启用本机只读 MCP（需批准）',click:()=>{
+      {label:'启用本机 Core MCP（需批准）',click:()=>{
         void enableNativeCore().catch(()=>undefined);
       }},
       {label:'关闭本机 MCP',click:()=>{void disableNativeCore().catch(()=>undefined);}},

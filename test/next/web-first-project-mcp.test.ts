@@ -6,13 +6,15 @@ import {WebFirstProjectRegistry} from '../../src/main/next/web-first/project-reg
 import {WebFirstReadAuthority,type ReadAction} from '../../src/main/next/web-first/project-read.js';
 import {WebFirstTaskLedger} from '../../src/main/next/web-first/task-ledger.js';
 import {WebFirstTaskTools} from '../../src/main/next/web-first/task-tools.js';
+import {WebFirstProjectWriter} from '../../src/main/next/web-first/project-write.js';
+import {createHash} from 'node:crypto';
 import {createWebFirstCoreLoopback} from '../../src/main/next/web-first/core-loopback.js';
 import {readWebFirstLocalToolList,EXPECTED_READ_ONLY_CORE_TOOLS} from '../../src/main/next/web-first/core-catalogue.js';
 import {WebFirstReadGrants} from '../../src/main/next/web-first/read-grants.js';
 import {WebFirstOperationJournal} from '../../src/main/next/web-first/operation-journal.js';
 const paths:string[]=[];
 afterEach(async()=>{for(const name of paths.splice(0))await rm(name,{recursive:true,force:true});});
-async function prepare(allow:ReadAction[]=[],allowTask=false){
+async function prepare(allow:ReadAction[]=[],allowTask=false,allowWrite=false){
   const temp=await mkdtemp(path.join(os.tmpdir(),'cos-web-first-mcp-'));paths.push(temp);
   await mkdir(path.join(temp,'profile'));await mkdir(path.join(temp,'project'));
   await writeFile(path.join(temp,'project','hello.txt'),'CONTENTS FROM DISPOSABLE FIXTURE');
@@ -22,8 +24,10 @@ async function prepare(allow:ReadAction[]=[],allowTask=false){
   const approvals:ReadAction[]=[];
   const authority=new WebFirstReadAuthority(store,async desc=>{approvals.push(desc.action);return allow.includes(desc.action);});
   const tasks=new WebFirstTaskTools(new WebFirstTaskLedger(path.join(temp,'profile')),store,async()=>allowTask);
-  const service=await createWebFirstCoreLoopback(authority,undefined,tasks);
-  return {temp,service,p,approvals};
+  const journal=new WebFirstOperationJournal(path.join(temp,'profile'));
+  const write=new WebFirstProjectWriter(store,async()=>allowWrite);
+  const service=await createWebFirstCoreLoopback(authority,journal,tasks,write);
+  return {temp,service,p,approvals,journal};
 }
 async function rpc(url:string,method:string,name?:string,args?:Record<string,unknown>,meta:Record<string,unknown>={}){
   const payload={jsonrpc:'2.0',id:5,method,params:{...(name?{name,arguments:args??{}}:{}),
@@ -52,14 +56,15 @@ describe('Web-First read-only MCP over a real owner-controlled loopback socket',
       const tools=r.data.result.tools;
       expect(r.status).toBe(200);
       expect(tools.map((x:{name:string})=>x.name).sort()).toEqual([
-        'identity_diagnostics','project_list','project_ls','project_read','runtime_health',
+        'identity_diagnostics','project_find','project_list','project_ls','project_read','project_replace','runtime_health',
         'task_begin','task_checkpoint','task_finish_request','task_status','task_wait']);
       expect(tools.find((x:{name:string})=>x.name==='project_read').annotations.readOnlyHint).toBe(true);
+      expect(tools.find((x:{name:string})=>x.name==='project_replace').annotations.readOnlyHint).toBe(false);
       expect(tools.find((x:{name:string})=>x.name==='task_checkpoint').annotations.readOnlyHint).toBe(false);
       const health=await rpc(service.endpointUrl,'tools/call','runtime_health');
       expect(health.data.result.structuredContent).toMatchObject({
         mcp:'LOCAL_ONLY',identity_verified:false,chatgpt_tool_registry:'NOT_VERIFIED',
-        server_toolset:'web-first-project-workflow-p3-v1'
+        server_toolset:'web-first-project-workflow-p3.2-v1'
       });
       expect(health.data.result.structuredContent.server_tools.sort()).toEqual([...EXPECTED_READ_ONLY_CORE_TOOLS]);
     }finally{await service.close();}
@@ -92,6 +97,91 @@ describe('Web-First read-only MCP over a real owner-controlled loopback socket',
       const finished=await rpc(service.endpointUrl,'tools/call','task_finish_request',{
         task_id:a.task_id,revision:3,nonce:'mcp-test-finish-001',note:'Claimed done'});
       expect(finished.data.result.isError).toBe(true);
+    }finally{await service.close();}
+  });
+  it('rejects unapproved project search and safely skips secrets, symlink escape and hidden directories',async()=>{
+    const {service,p,temp}=await prepare(['project_find']);
+    try{
+      await mkdir(path.join(temp,'project','src'));
+      await writeFile(path.join(temp,'project','src','feature.ts'),'// UNIQUE_SEARCH_CANARY_42\n');
+      await writeFile(path.join(temp,'project','.env.local'),'UNIQUE_SEARCH_CANARY_42 SECRET_LEAK');
+      await writeFile(path.join(temp,'project','private.key'),'UNIQUE_SEARCH_CANARY_42 KEY_LEAK');
+      await symlink(path.join(temp,'outside-secret.txt'),path.join(temp,'project','escape.txt'));
+      const result=await rpc(service.endpointUrl,'tools/call','project_find',{
+        project_id:p.id,relative_path:'.',query:'UNIQUE_SEARCH_CANARY_42'});
+      expect(result.status).toBe(200);
+      const found=result.data.result.structuredContent.result;
+      expect(found.results).toEqual([{path:'src/feature.ts',line:1,
+        snippet:'// UNIQUE_SEARCH_CANARY_42',kind:'content'}]);
+      expect(JSON.stringify(result.data)).not.toContain('SECRET_LEAK');
+      expect(JSON.stringify(result.data)).not.toContain('KEY_LEAK');
+      expect(JSON.stringify(result.data)).not.toContain('NEVER_READ_OUTSIDE');
+      const invalid=await rpc(service.endpointUrl,'tools/call','project_find',{
+        project_id:p.id,relative_path:'../',query:'UNIQUE_SEARCH_CANARY_42'});
+      expect(invalid.data.result.isError).toBe(true);
+    }finally{await service.close();}
+    const denied=await prepare();
+    try{
+      const attempted=await rpc(denied.service.endpointUrl,'tools/call','project_find',{
+        project_id:denied.p.id,relative_path:'.',query:'DISPOSABLE'});
+      expect(attempted.data.result.isError).toBe(true);
+      expect(JSON.stringify(attempted.data)).toContain('NATIVE_APPROVAL_DENIED');
+    }finally{await denied.service.close();}
+  });
+  it('requires per-write native approval and exact SHA-256 before replacing one unique existing text span',async()=>{
+    const hash=(content:string)=>createHash('sha256').update(content).digest('hex');
+    const denied=await prepare([],false,false);
+    try{
+      const attempt=await rpc(denied.service.endpointUrl,'tools/call','project_replace',{
+        project_id:denied.p.id,relative_path:'hello.txt',expected_sha256:hash('CONTENTS FROM DISPOSABLE FIXTURE'),
+        old_text:'DISPOSABLE',new_text:'REPLACEMENT'});
+      expect(attempt.data.result.isError).toBe(true);
+      expect(JSON.stringify(attempt.data)).toContain('NATIVE_WRITE_APPROVAL_DENIED');
+      expect(await import('node:fs/promises').then(fs=>fs.readFile(path.join(denied.temp,'project','hello.txt'),'utf8')))
+        .toBe('CONTENTS FROM DISPOSABLE FIXTURE');
+    }finally{await denied.service.close();}
+    const {service,p,temp,journal}=await prepare([],false,true);
+    try{
+      const source='CONTENTS FROM DISPOSABLE FIXTURE';
+      const correct={project_id:p.id,relative_path:'hello.txt',expected_sha256:hash(source),
+        old_text:'DISPOSABLE',new_text:'CONTROLLED'};
+      const stale=await rpc(service.endpointUrl,'tools/call','project_replace',{
+        ...correct,expected_sha256:'0'.repeat(64)});
+      expect(stale.data.result.isError).toBe(true);
+      const ok=await rpc(service.endpointUrl,'tools/call','project_replace',correct);
+      expect(ok.data.result.structuredContent.result.newSha256).toBe(hash('CONTENTS FROM CONTROLLED FIXTURE'));
+      const original=await import('node:fs/promises').then(fs=>fs.readFile(path.join(temp,'project','hello.txt'),'utf8'));
+      expect(original).toBe('CONTENTS FROM CONTROLLED FIXTURE');
+      const retry=await rpc(service.endpointUrl,'tools/call','project_replace',correct);
+      expect(retry.data.result.isError).toBe(true);
+      const events=await journal.last(8);
+      expect(events.filter(e=>e.action==='project_replace'&&e.stage==='SUCCEEDED')).toHaveLength(1);
+      expect(JSON.stringify(events)).not.toContain('CONTROLLED');
+    }finally{await service.close();}
+  });
+  it('blocks sensitive file writes, symlinks, non-unique replacements and unsafe relative paths',async()=>{
+    const {service,p,temp}=await prepare([],false,true);
+    const hash=(c:string)=>createHash('sha256').update(c).digest('hex');
+    try{
+      const root=path.join(temp,'project');
+      await writeFile(path.join(root,'.env.local'),'SECRET_TOKEN=123');
+      await writeFile(path.join(root,'client.key'),'PRIVATE_KEY_TOKEN');
+      await writeFile(path.join(root,'duplicate.txt'),'REPEAT REPEAT');
+      await symlink(path.join(temp,'outside-secret.txt'),path.join(root,'escape.txt'));
+      for(const relative_path of ['.env.local','client.key','escape.txt','../outside-secret.txt','\\server','bad\\name']){
+        const result=await rpc(service.endpointUrl,'tools/call','project_replace',{
+          project_id:p.id,relative_path,expected_sha256:hash('SECRET_TOKEN=123'),
+          old_text:'TOKEN',new_text:'STOLEN'});
+        expect(result.data.result.isError).toBe(true);
+      }
+      const duplicate=await rpc(service.endpointUrl,'tools/call','project_replace',{
+        project_id:p.id,relative_path:'duplicate.txt',expected_sha256:hash('REPEAT REPEAT'),
+        old_text:'REPEAT',new_text:'OK'});
+      expect(duplicate.data.result.isError).toBe(true);
+      expect(await import('node:fs/promises').then(fs=>fs.readFile(path.join(root,'duplicate.txt'),'utf8')))
+        .toBe('REPEAT REPEAT');
+      expect(await import('node:fs/promises').then(fs=>fs.readFile(path.join(root,'.env.local'),'utf8')))
+        .toBe('SECRET_TOKEN=123');
     }finally{await service.close();}
   });
   it('refuses project reads and forged host metadata without actual native approval',async()=>{

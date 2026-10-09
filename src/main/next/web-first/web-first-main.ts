@@ -6,7 +6,7 @@ import {WebFirstTaskLedger} from './task-ledger.js';
 import {WebFirstReplyJournal} from './web-reply-observer.js';
 import {WebFirstWebOutbox} from './web-outbox.js';
 import {sendNativeWebFirstMessage} from './native-web-input.js';
-import {randomUUID} from 'node:crypto';
+import {randomUUID,createHash} from 'node:crypto';
 import {WebFirstReadGrants} from './read-grants.js';
 import {WebFirstOperationJournal} from './operation-journal.js';
 import {inspectExistingCredentialProfiles} from './credential-diagnostics.js';
@@ -130,6 +130,24 @@ app.whenReady().then(async()=>{
         const parsed=JSON.parse(event) as {result?:{structuredContent?:{result?:unknown}}};
         return parsed.result?.structuredContent?.result as {task_id:string;phase:string;revision:number};
       };
+      const sample='WEBFIRST_LOCAL_MCP_READ_OK';
+      const projectId=(await host.nativeProjects())[0]?.id;
+      const found=await taskCall('project_find',{
+        project_id:projectId,relative_path:'.',query:sample},24) as unknown as {
+        results:Array<{path:string;line:number;kind:string}>};
+      if(!found.results?.some(item=>item.path==='fixture.txt'&&item.line===1&&item.kind==='content'))
+        throw Error('WEBFIRST_OFFLINE_PROJECT_SEARCH_FAILED');
+      process.stdout.write('WEB_FIRST_OFFLINE_PROJECT_FIND_PASS\n');
+      const digest=createHash('sha256').update(sample).digest('hex');
+      const changed=await taskCall('project_replace',{
+        project_id:projectId,relative_path:'fixture.txt',expected_sha256:digest,
+        old_text:sample,new_text:'WEBFIRST_LOCAL_MCP_REPLACED_OK'},25) as unknown as {newSha256:string};
+      const fixture=await import('node:fs/promises').then(fs=>
+        fs.readFile(path.join(profile,'offline-project','fixture.txt'),'utf8'));
+      if(fixture!=='WEBFIRST_LOCAL_MCP_REPLACED_OK'||changed.newSha256!==
+        createHash('sha256').update(fixture).digest('hex'))
+        throw Error('WEBFIRST_OFFLINE_PROJECT_REPLACE_FAILED');
+      process.stdout.write('WEB_FIRST_OFFLINE_PROJECT_REPLACE_PASS\n');
       const task=await taskCall('task_begin',{project_id:(await host.nativeProjects())[0]?.id,goal:'Offline task fixture only'},21);
       if(task.phase!=='active'||task.revision!==1)throw Error('WEBFIRST_OFFLINE_TASK_CREATE_FAILED');
       const saved=await taskCall('task_checkpoint',{task_id:task.task_id,revision:1,
