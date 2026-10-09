@@ -322,3 +322,46 @@ checks. Full regular and MCP shutdown tests pass. This verifies the native
 failure UI, but **not** real account-page restoration: perform a controlled
 restart with the existing login partition and collect only opt-in sanitized
 page/network diagnostics before declaring the user-facing blank screen fixed.
+
+## P3k — model-use limits and persistent offline waiting
+
+**User intent:** The Classic app exposed editable plans, Goal and a running
+Long-Run/Loop executor; the Web-First preview currently exposes durable
+`task_begin`, `task_checkpoint`, `task_wait`, `task_status`,
+`task_finish_request`, and a native operator decision menu. This is *not yet*
+Classic Goal/Loop feature parity. An observed limit must not delete the task,
+repeat an uncertain write, or trigger unlimited web messages.
+
+Native `WebFirstRateLimitSupervisor` persists a strict 0600 JSON status:
+- A **conversation-list HTTP 429** means history loading is degraded, **not**
+  necessarily that generation capacity is depleted. It is recorded with a
+  bounded cooldown separately and must not pause non-model Core tools.
+- A **different ChatGPT backend API 429** triggers a conservative model-request
+  cooldown with exponential backoff (starting at two minutes, capped at 30).
+  Because the API route may not prove exactly which model was rate-limited,
+  cooldown expiry means **operator review**, not permission to auto-send.
+- A **visible model usage-limit banner** might not produce a 429 accessible to
+  Electron. The user can explicitly select `本地项目 → 限流暂停与恢复（保留任务）`
+  to persist a 30-minute model hold. After due time, the operator may confirm
+  official site quota recovery. Confirming does not send or queue a prompt.
+- The existing one-shot web continuation refuses to submit before and after
+  its native prompt-confirmation dialog if any model-request hold exists;
+  an unsafe/missing ledger never grants model-send permission by default.
+- Local project reads, previously authorized non-model file operations,
+  durable task checkpoints and external build/CI monitoring are independent
+  of this model cooldown. They may progress with their **existing** native
+  permissions but cannot invent new LLM decisions during provider downtime.
+- On restart, both the task ledger and the cooldown status survive. No
+  automated prompt replays, account rotations, CAPTCHAs or hidden retries.
+
+The 30-minute manual hold and algorithmic backoff are **local safety
+estimates**, not statements of the provider's actual quota reset time.
+Provider `Retry-After` / official reset indicators are preferable if available
+through approved surfaces; do not try to defeat server rate enforcement.
+
+The next Goal/Loop parity milestone is a visual plan board linked to exact
+project/task ID, native executable operation queue, explicit pause/stop and
+hard time/turn budgets; only after ChatGPT conversation ownership and provider
+completion receipts are verifiable should a bounded automatic response loop
+be enabled. Moving the same request to another connected provider requires
+an independent, explicit user grant and is not the default workaround.

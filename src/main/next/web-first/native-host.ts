@@ -11,8 +11,9 @@ import {
   CHATGPT_START_URL, WEB_FIRST_PARTITION, isAllowedWebFirstNavigation,
   classifyWebFirstNavigation
 } from './host-policy.js';
-import {newWebHealthTracker,safeApiRouteClass,type WebHealthSnapshot} from './web-health.js';
+import {newWebHealthTracker,safeApiRouteClass,classifyRequest,type WebHealthSnapshot} from './web-health.js';
 import {WebFirstHealthLedger,type NativeHealthKind,type NativeHealthRoute} from './health-ledger.js';
+import {WebFirstRateLimitSupervisor} from './rate-limit-supervisor.js';
 import {PageRecoveryGate,type SafePageProbe} from './page-recovery.js';
 import {allowedOAuthStoragePermission,allowedOAuthPopup} from './login-permissions.js';
 import {WebFirstProjectRegistry, type WebFirstProject} from './project-registry.js';
@@ -63,6 +64,7 @@ export function launchNextWebFirstHost(options: {
   const offline = options.offlineSmoke === true;
   const health=newWebHealthTracker();
   const healthLedger=new WebFirstHealthLedger(options.projectStoreDir);
+  const throttle=new WebFirstRateLimitSupervisor(options.projectStoreDir);
   const healthReceipt=(kind:NativeHealthKind,route:NativeHealthRoute,
     status:number|null=null,code:number|null=null)=>{
     if(offline)return;
@@ -93,10 +95,19 @@ export function launchNextWebFirstHost(options: {
       pageRecovery.httpStatus(details.statusCode);
       if(details.statusCode>=400)healthReceipt('main-frame-http-error',
         'chatgpt-main',details.statusCode);
-    }else if(details.statusCode===429&&safeApiRouteClass(details.url)==='conversation-list'){
-      // Route classification is an ephemeral yes/no test only. Neither the URL,
-      // query string nor conversation ID is persisted.
-      healthReceipt('api-rate-limited','conversation-list',429);
+    }else if(details.statusCode===429){
+      const route=safeApiRouteClass(details.url);
+      if(route==='conversation-list'){
+        // A history-list 429 is not proof of model inference exhaustion.
+        healthReceipt('api-rate-limited','conversation-list',429);
+        void throttle.history429().catch(()=>undefined);
+      }else if(classifyRequest(details.url)==='chatgpt-api'&&
+        route!=='auth'&&route!=='profile'){
+        // Unknown ChatGPT API limit: don't infer a particular model quota.
+        // Hold optional native follow-ups pending cooldown and human review.
+        healthReceipt('api-rate-limited','other-api',429);
+        void throttle.backend429().catch(()=>undefined);
+      }
     }
   });
   webSession.webRequest.onErrorOccurred(details=>{if(details.webContentsId)health.failed(details.url,details.error);});
@@ -715,6 +726,9 @@ export function launchNextWebFirstHost(options: {
     if(!conversationId){await dialog.showMessageBox(owner,{type:'warning',
       message:'请先进入 ChatGPT 的具体对话，才可发送任务续接消息。',buttons:['关闭']});return;}
     try{
+      // Never submit a new website model turn during provider backoff. A
+      // timed-out cooldown still requires explicit human confirmation.
+      await throttle.requireManualModelAvailable();
       const tasks=(await taskLedger.list()).filter(t=>t.phase==='active').slice(-4).reverse();
       if(!tasks.length){await dialog.showMessageBox(owner,{type:'info',
         message:'当前没有已经启动并授权的活动任务。请先通过 Core task_begin 创建任务。',
@@ -743,6 +757,9 @@ export function launchNextWebFirstHost(options: {
       });
       if(confirmed.response!==1||owner.isDestroyed()||
         conversationFromUrl(view.webContents.getURL())!==conversationId)return;
+      // Revalidate after the native approval: a 429 may have arrived while
+      // the user was reading the dialog.
+      await throttle.requireManualModelAvailable();
       webDispatchInProgress=true;
       const queued=await webOutbox.enqueue({taskId:task.id,conversationId,text:prompt,nonce:randomUUID()});
       await webOutbox.transition(queued.id,'queued','dispatching');
@@ -875,6 +892,11 @@ export function launchNextWebFirstHost(options: {
       latestReply:continuationReply,replySettled:continuationReply!==null,
       replyObservedAt:continuationReplyAt});
     if(outboxReadFailed){result.manualNextTurnReady=false;result.reason='OUTBOX_AMBIGUOUS';}
+    try{
+      if((await throttle.status()).model!=='clear'){
+        result.manualNextTurnReady=false;
+      }
+    }catch{result.manualNextTurnReady=false;}
     await dialog.showMessageBox(owner,{type:'info',
       title:'P3 连续工作准备度 · 安全核对',
       message:result.manualNextTurnReady?'可申请一次人工批准的网页续接':'当前不应继续发送网页消息',
@@ -969,6 +991,44 @@ export function launchNextWebFirstHost(options: {
       buttons:['关闭']
     });
   };
+  const manageRateLimit=async()=>{
+    if(owner.isDestroyed())return;
+    try{
+      const state=await throttle.status();
+      const due=state.modelHoldUntil?new Date(state.modelHoldUntil).toLocaleString():'无';
+      const response=await dialog.showMessageBox(owner,{
+        type:'question',title:'CoS Next · 限流与持续工作恢复',
+        message:state.model==='cooldown'?'模型请求冷却中':
+          state.model==='review'?'冷却时间已到，等待你确认恢复':'模型续接未被本机限流门禁暂停',
+        detail:'模型限流状态：'+state.model+'\n建议检查时间：'+due+'\n'
+          +'历史列表：'+state.history+'（历史 429 不等于模型额度耗尽）\n\n'
+          +'冷却期间，持久任务、已获授权的本机非模型工作与故障收据可继续；'
+          +'不会自动重试模型消息、调用 Codex CLI 或绕过服务端额度。',
+        buttons:['关闭','模型限流：暂停 30 分钟','我已确认模型额度恢复'],
+        defaultId:0,cancelId:0,noLink:true
+      });
+      if(response.response===1){
+        await throttle.pauseForModelLimit(30);
+      }else if(response.response===2){
+        const latest=await throttle.status();
+        if(latest.model==='cooldown'){
+          await dialog.showMessageBox(owner,{type:'warning',
+            message:'仍在模型冷却期。CoS 不会提前重试被限流的网页请求。',buttons:['关闭']});
+          return;
+        }
+        const accepted=await dialog.showMessageBox(owner,{
+          type:'warning',title:'确认恢复模型请求',
+          message:'你已经在 ChatGPT 官方网页确认额度恢复了吗？',
+          detail:'仅清除本机冷却标记。不会自动开始 Loop、恢复等待任务或发送任何消息。',
+          buttons:['取消','确认解除本机模型冷却'],defaultId:0,cancelId:0,noLink:true
+        });
+        if(accepted.response===1)await throttle.confirmRecovery();
+      }
+    }catch{
+      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{type:'error',
+        message:'限流状态无法安全读取或变更；已经拒绝网页自动续接。',buttons:['关闭']});
+    }
+  };
   const showLocalProjectStatus=async()=>{
     let list:ReadonlyArray<WebFirstProject>;
     try{list=await projects.list();}
@@ -1007,6 +1067,7 @@ export function launchNextWebFirstHost(options: {
       {label:'在当前 ChatGPT 网页续接任务一次（需确认）',click:()=>{void continueTaskOneNativeTurn();}},
       {label:'开始/停止当前对话连续工作观察（不自动发送）',click:()=>{void armContinuityObservation();}},
       {label:'检查连续工作安全门禁',click:()=>{void inspectContinuity();}},
+      {label:'限流暂停与恢复（保留任务）',click:()=>{void manageRateLimit();}},
       {label:'开始/停止当前 ChatGPT 回复记录',click:()=>{void toggleReplyCapture();}},
       {label:'查看已接收的 ChatGPT 最新回复',click:()=>{void inspectCapturedReplies();}},
       {type:'separator'},

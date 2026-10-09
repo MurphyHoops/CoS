@@ -5,6 +5,7 @@ import {WebFirstProjectRegistry} from './project-registry.js';
 import {WebFirstTaskLedger} from './task-ledger.js';
 import {WebFirstReplyJournal} from './web-reply-observer.js';
 import {WebFirstWebOutbox} from './web-outbox.js';
+import {WebFirstRateLimitSupervisor} from './rate-limit-supervisor.js';
 import {sendNativeWebFirstMessage} from './native-web-input.js';
 import {randomUUID,createHash} from 'node:crypto';
 import {WebFirstReadGrants} from './read-grants.js';
@@ -185,6 +186,23 @@ app.whenReady().then(async()=>{
       if(savedOutbox?.state!=='delivered'||savedOutbox.proof!==sent.proof)
         throw Error('WEBFIRST_OFFLINE_BROWSER_SEND_RECEIPT_NOT_DURABLE');
       process.stdout.write('WEB_FIRST_OFFLINE_BROWSER_CONTINUATION_PASS\n');
+      const limiter=new WebFirstRateLimitSupervisor(profile);
+      const modelStatusBefore=await limiter.history429();
+      if(modelStatusBefore.model!=='clear'||modelStatusBefore.history!=='degraded')
+        throw Error('WEBFIRST_OFFLINE_HISTORY_429_FALSE_MODEL_LIMIT');
+      const manualLimit=await limiter.pauseForModelLimit(30);
+      if(manualLimit.model!=='cooldown')throw Error('WEBFIRST_OFFLINE_MODEL_LIMIT_NOT_HELD');
+      try{await limiter.requireManualModelAvailable();
+        throw Error('WEBFIRST_OFFLINE_MODEL_LIMIT_DID_NOT_BLOCK_SEND');
+      }catch(error){
+        if(error instanceof Error&&error.message!=='RATE_LIMIT_MODEL_HOLD')throw error;
+      }
+      const restartedLimiter=new WebFirstRateLimitSupervisor(profile);
+      if((await restartedLimiter.status()).model!=='cooldown')
+        throw Error('WEBFIRST_OFFLINE_MODEL_LIMIT_NOT_DURABLE');
+      const cleared=await restartedLimiter.confirmRecovery(Date.now()+31*60_000);
+      if(cleared.model!=='clear')throw Error('WEBFIRST_OFFLINE_MODEL_LIMIT_NOT_CLEARED');
+      process.stdout.write('WEB_FIRST_OFFLINE_MODEL_COOLDOWN_PERSIST_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_ASSISTANT_RECEIVE_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_DURABLE_TASK_RPC_PASS\n');
       await host.disableNativeCore();
