@@ -234,6 +234,10 @@ app.whenReady().then(async()=>{
       if(receipts.length<2||receipts.at(-2)?.stage!=='STARTED'||receipts.at(-1)?.stage!=='SUCCEEDED')
         throw Error('WEBFIRST_OFFLINE_OPERATION_RECEIPT_MISSING');
       process.stdout.write('WEB_FIRST_OFFLINE_RECEIPT_PASS\n');
+      if(!menus.some(m=>m.label==='ChatGPT 网页'&&m.submenu?.items.some(x=>
+        x.accelerator==='CmdOrCtrl+W'&&x.label==='安全关闭主窗口（停止 Core）')))
+        throw Error('WEBFIRST_SAFE_WINDOW_CLOSE_MENU_MISSING');
+      process.stdout.write('WEB_FIRST_OFFLINE_SAFE_CLOSE_MENU_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_PROJECT_MENU_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_PROJECT_UI_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_INPUT_PASS\n');

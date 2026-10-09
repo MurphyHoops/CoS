@@ -1367,6 +1367,9 @@ export function launchNextWebFirstHost(options: {
       }}
     ]},
     {label:'ChatGPT 网页',submenu:[
+      {label:'安全关闭主窗口（停止 Core）',accelerator:'CmdOrCtrl+W',
+        click:()=>{if(!owner.isDestroyed())owner.close();}},
+      {type:'separator'},
       {label:'检查网页健康状态',click:()=>{void showDiagnostics();}},
       {label:'重新加载网页',accelerator:'CmdOrCtrl+R',click:()=>{
         hideRecoveryOverlay();pageRecovery.navigate(Date.now());view.webContents.reload();
