@@ -162,3 +162,36 @@ and provider changes. Old Classic multi-agent, exec/patch, project runtime,
 session wait and goal-loop backends remain in their original modules and the
 compatibility matrix; they have not yet been fully migrated into this new
 Web-First server. Keep the independent Core/Plugins/Desktop tool boundaries.
+
+## P3d — dead Core Broker handle and bounded native reconnect
+
+A later read-only live audit of the **previous running P3 preview** found its
+Electron UI process alive but no active `tunnel-client` and a ChatGPT Core
+`Tunnel-client has not been seen for 300 seconds` response. This does **not**
+prove an invalid Keychain credential or an OpenAI authentication failure. It
+shows the live Core delivery path was offline. The older native host retained
+`coreTunnel` even when its broker child had exited, so subsequent menu
+Connect calls could return early with an unusable handle, and Close could
+fail on an unprovable stop receipt.
+
+The repaired transport now exposes a truthful child-process `alive` flag. A
+disappeared broker is reconciled before reconnect/disconnect. If an orphaned
+`tunnel-client` or another Core owner is present, recovery fails **HOLD**;
+never start a duplicate owner. If the broker is provably absent, the stale
+handle can be retired without falsely claiming `stopWithProof` succeeded.
+
+After one native approval to connect, the current app process also has a
+bounded background recovery policy: no repeated approval dialogs, maximum
+four attempts per incident, exponential retry backoff capped at 90 seconds,
+reset only after five minutes of healthy connection. A live offline poll with
+an existing broker **does not** trigger a second process: let the tunnel's
+own network retry recover. Manual Disconnect or window Close cancels the
+self-heal grant. It never launches a model inference or sends ChatGPT prompts.
+
+Pure recovery decision tests cover revoked consent, broker already alive,
+orphan owner, retry due time and exhaustion. Native bundled offline smoke
+continues to pass all P3 tools, input and reply receipts. A real long-duration
+OpenAI Broker crash/restore with platform tool receipts must still be tested
+separately before claiming field-level auto-recovery validation. The running
+older app is intentionally not hot-replaced while its web draft/session may
+be in use. This fix is in the next independently packaged preview build.

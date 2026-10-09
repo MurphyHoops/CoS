@@ -17,6 +17,13 @@ export function webFirstBundledTunnelBinary(resourcesPath:string|undefined=proce
   return path.join(resourcesPath,'tunnel','tunnel-client');
 }
 export type CoreTunnelState='CONNECTING'|'CONNECTED'|'OFFLINE'|'HOLD';
+export function coreRecoveryDecision(args:{requested:boolean;brokerAlive:boolean;
+  ownerPresent:boolean;attempts:number;dueAt:number;now:number}):'idle'|'retry'|'hold'{
+  if(!args.requested||args.brokerAlive)return 'idle';
+  if(args.ownerPresent||args.attempts>=4)return 'hold';
+  return args.now>=args.dueAt?'retry':'idle';
+}
+
 export type WebFirstTunnelProfile={configFile:string;sourceUserData:string;binary:string};
 export function importedProfile(appData:string):WebFirstTunnelProfile{
   if(!path.isAbsolute(appData))throw Error('WEBFIRST_APPDATA_INVALID');
@@ -48,7 +55,8 @@ export async function connectWebFirstImportedCore(args:{
   appData:string;
   localUrl:string;
   onChange:(state:CoreTunnelState)=>void;
-}):Promise<{get state():CoreTunnelState;connected:Promise<boolean>;stopWithProof:()=>Promise<boolean>}>{
+}):Promise<{get state():CoreTunnelState;get alive():boolean;
+  connected:Promise<boolean>;stopWithProof:()=>Promise<boolean>}>{
   if(await existingTunnelOwnerPresent())throw Error('EXISTING_CORE_OWNER_PRESENT');
   if(!args.localUrl.startsWith('http://127.0.0.1:'))throw Error('LOCAL_URL_INVALID');
   const source=importedProfile(args.appData);
@@ -91,7 +99,7 @@ export async function connectWebFirstImportedCore(args:{
   const timeout=setTimeout(()=>{update('HOLD');ready(false);},95_000);
   timeout.unref();
   let stopFlight:Promise<boolean>|null=null;
-  return {get state(){return state;},connected,
+  return {get state(){return state;},get alive(){return child.exitCode===null&&child.signalCode===null;},connected,
     stopWithProof:()=>stopFlight??=(async()=>{
       clearTimeout(timeout);
       ready(false);

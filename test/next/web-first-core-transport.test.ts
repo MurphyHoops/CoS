@@ -1,8 +1,18 @@
 import {describe,it,expect} from 'vitest';
 import {parseBrokerSignal} from '../../src/main/next/web-first/core-broker.js';
 import path from 'node:path';
-import {importedProfile,validateImportedTunnelConfiguration,webFirstBundledTunnelBinary} from '../../src/main/next/web-first/core-transport.js';
+import {importedProfile,validateImportedTunnelConfiguration,webFirstBundledTunnelBinary,coreRecoveryDecision} from '../../src/main/next/web-first/core-transport.js';
 describe('Web-First existing Core adoption preflight only (no network / credential)',()=>{
+  it('does not auto-retry on healthy owner, orphan or revoked approval; caps attempts',()=>{
+    const basic={requested:true,brokerAlive:false,ownerPresent:false,attempts:0,dueAt:100,now:100};
+    expect(coreRecoveryDecision(basic)).toBe('retry');
+    expect(coreRecoveryDecision({...basic,now:99})).toBe('idle');
+    expect(coreRecoveryDecision({...basic,requested:false})).toBe('idle');
+    expect(coreRecoveryDecision({...basic,brokerAlive:true})).toBe('idle');
+    expect(coreRecoveryDecision({...basic,ownerPresent:true})).toBe('hold');
+    expect(coreRecoveryDecision({...basic,attempts:4})).toBe('hold');
+  });
+
   it('accepts only exact control-plane broker signals, not untrusted log text',()=>{
     expect(parseBrokerSignal('WEBFIRST_CORE_BROKER_READY')).toBe('READY');
     expect(parseBrokerSignal('WEBFIRST_CORE_BROKER_CONNECTED')).toBe('CONNECTED');

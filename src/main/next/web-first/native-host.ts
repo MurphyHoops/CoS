@@ -26,7 +26,7 @@ import {sendNativeWebFirstMessage} from './native-web-input.js';
 import {randomUUID} from 'node:crypto';
 import {createWebFirstCoreLoopback} from './core-loopback.js';
 import {readWebFirstLocalToolList,EXPECTED_READ_ONLY_CORE_TOOLS} from './core-catalogue.js';
-import {connectWebFirstImportedCore,type CoreTunnelState} from './core-transport.js';
+import {connectWebFirstImportedCore,existingTunnelOwnerPresent,coreRecoveryDecision,type CoreTunnelState} from './core-transport.js';
 
 export interface NativeWebHostStatus {
   state: 'starting' | 'loaded' | 'load-failed';
@@ -159,6 +159,12 @@ export function launchNextWebFirstHost(options: {
   let mcpState:'UNCONNECTED'|'LOCAL_ONLY'|'REMOTE_CONNECTING'|'REMOTE_CONNECTED'|'HOLD'='UNCONNECTED';
   let coreTunnel:Awaited<ReturnType<typeof connectWebFirstImportedCore>>|null=null;
   let remoteConnectionFlight:Promise<void>|null=null;
+  let recoverApproved=false;
+  let recoverAttempts=0;
+  let recoverDueAt=0;
+  let lastConnectedAt=0;
+  let recovering=false;
+
   let sidebarVisible=true;
   let closingForTunnelStop=false;
   let cachedProjects:ReadonlyArray<WebFirstProject>=[];
@@ -459,29 +465,48 @@ export function launchNextWebFirstHost(options: {
     return mcpStartFlight;
   }
   async function disconnectRemoteCore():Promise<void>{
+    recoverApproved=false;
     if(remoteConnectionFlight)await remoteConnectionFlight.catch(()=>undefined);
     if(!coreTunnel)return;
     const target=coreTunnel;
+    // A disappeared broker is not a still-running owned connection. Before
+    // releasing the stale handle, prove no orphaned tunnel client exists.
+    if(!target.alive){
+      if(await existingTunnelOwnerPresent()){
+        mcpState='HOLD';await refreshSidebar();
+        throw Error('CORE_TUNNEL_ORPHAN_OWNER_UNVERIFIED');
+      }
+      coreTunnel=null;mcpState='LOCAL_ONLY';await refreshSidebar();return;
+    }
     const proven=await target.stopWithProof();
     if(!proven){mcpState='HOLD';await refreshSidebar();
       throw Error('CORE_TUNNEL_SHUTDOWN_UNVERIFIED');}
     coreTunnel=null;mcpState='LOCAL_ONLY';
     await refreshSidebar();
   }
-  async function connectRemoteCore():Promise<void>{
+  async function connectRemoteCore(recovery=false):Promise<void>{
     if(offline)throw Error('NO_REMOTE_IN_OFFLINE_SMOKE');
+    if(coreTunnel&&!coreTunnel.alive){
+      // Drop a dead local handle only if the tunnel-client owner check passes
+      // in connectWebFirstImportedCore. An orphan will block the new launch.
+      coreTunnel=null;
+    }
     if(coreTunnel||remoteConnectionFlight)return;
+    if(recovery&&!mcpService)return;
     const local=await enableNativeCore();
     if(owner.isDestroyed())throw Error('WEBFIRST_WINDOW_CLOSED');
-    const consent=await dialog.showMessageBox(owner,{
-      type:'warning',title:'连接现有 ChatGPT Core Tunnel',
-      message:'从原有 Next 加密配置连接 ChatGPT Core？',
-      detail:'这只复用现有 Next 的 Tunnel 登记与系统 Keychain，不复制凭证、不调用模型。\n'
-        +'文件仍然每次单独请求 macOS 批准。\n'
-        +'远端 ChatGPT 工具注册和会话身份必须另行验收；连接不等于授权。',
-      buttons:['取消','连接 Core'],defaultId:0,cancelId:0,noLink:true
-    });
-    if(consent.response!==1)return;
+    if(!recovery){
+      const consent=await dialog.showMessageBox(owner,{
+        type:'warning',title:'连接现有 ChatGPT Core Tunnel',
+        message:'从原有 Next 加密配置连接 ChatGPT Core？',
+        detail:'只读复用旧 Next Keychain；不会复制凭证、调用模型或升级项目权限。\n'
+          +'本次批准后，若 Broker 意外退出，将有限次数自动重连，无需反复弹窗。\n'
+          +'你可以随时通过“断开 ChatGPT Core Tunnel”关闭自动重连。',
+        buttons:['取消','连接并允许有限自愈'],defaultId:0,cancelId:0,noLink:true
+      });
+      if(consent.response!==1)return;
+      recoverApproved=true;recoverAttempts=0;recoverDueAt=0;
+    }
     remoteConnectionFlight=(async()=>{
       mcpState='REMOTE_CONNECTING';await refreshSidebar();
       try{
@@ -500,14 +525,16 @@ export function launchNextWebFirstHost(options: {
           coreTunnel=null;mcpState='HOLD';await refreshSidebar();
           throw Error('CORE_TUNNEL_NOT_READY');
         }
-        mcpState='REMOTE_CONNECTED';await refreshSidebar();
+        mcpState='REMOTE_CONNECTED';lastConnectedAt=Date.now();
+        if(!recovery){recoverAttempts=0;recoverDueAt=0;}
+        await refreshSidebar();
       }catch(error){
         mcpState='HOLD';await refreshSidebar();throw error;
       }
     })();
     try{await remoteConnectionFlight;}
     catch(error){
-      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{
+      if(!recovery&&!owner.isDestroyed())await dialog.showMessageBox(owner,{
         type:'warning',title:'Core 连接尚未通过验收',
         message:'无法确认当前 Core Tunnel 完成了真实握手。',
         detail:'既有凭证和 Classic 配置未被复制或清空。\n原因：'+
@@ -656,6 +683,36 @@ export function launchNextWebFirstHost(options: {
         message:'任务状态或检查点验证失败。已拒绝改变任务，原记录保持不变。',buttons:['关闭']});
     }
   };
+  // Native recovery timer never sends ChatGPT messages and never copies a
+  // Keychain secret. Tunnel-owner conflict is a hard HOLD, not a retry loop.
+  const recoveryTimer=setInterval(()=>{
+    if(offline||recovering||!recoverApproved||!mcpService||owner.isDestroyed()||
+      remoteConnectionFlight)return;
+    if(coreTunnel?.alive){
+      if(mcpState==='REMOTE_CONNECTED'&&Date.now()-lastConnectedAt>5*60_000)
+        recoverAttempts=0;
+      return;
+    }
+    recovering=true;
+    void (async()=>{
+      try{
+        const conflict=await existingTunnelOwnerPresent();
+        const choice=coreRecoveryDecision({requested:recoverApproved,
+          brokerAlive:!!coreTunnel?.alive,ownerPresent:conflict,
+          attempts:recoverAttempts,dueAt:recoverDueAt,now:Date.now()});
+        if(choice==='hold'){
+          recoverApproved=false;mcpState='HOLD';await refreshSidebar();return;
+        }
+        if(choice!=='retry')return;
+        recoverAttempts++;
+        recoverDueAt=Date.now()+Math.min(90_000,5000*2**(recoverAttempts-1));
+        await connectRemoteCore(true);
+      }catch{mcpState='HOLD';await refreshSidebar();}
+      finally{recovering=false;}
+    })();
+  },5000);
+  recoveryTimer.unref();
+  owner.on('closed',()=>clearInterval(recoveryTimer));
   const showCoreCatalogue=async()=>{
     if(owner.isDestroyed())return;
     const local=mcpService;
