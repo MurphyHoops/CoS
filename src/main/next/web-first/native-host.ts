@@ -100,6 +100,7 @@ export function launchNextWebFirstHost(options: {
   let coreTunnel:Awaited<ReturnType<typeof connectWebFirstImportedCore>>|null=null;
   let remoteConnectionFlight:Promise<void>|null=null;
   let sidebarVisible=true;
+  let closingForTunnelStop=false;
   let cachedProjects:ReadonlyArray<WebFirstProject>=[];
   const refreshSidebar=async()=>{
     let state:typeof mcpState=mcpState;
@@ -111,7 +112,7 @@ export function launchNextWebFirstHost(options: {
       const info=await grants.inspect();
       grantSummary={permanent:info.persistent.length,session:info.session.length,error:false};
     }catch{grantSummary.error=true;}
-    if(sidebar.webContents.isDestroyed())return;
+    if(closingForTunnelStop||owner.isDestroyed()||sidebar.webContents.isDestroyed())return;
     await sidebar.webContents.loadURL('data:text/html;charset=utf-8,'+
       encodeURIComponent(renderProjectSidebar(cachedProjects,state,registryError,grantSummary)));
   };
@@ -133,11 +134,23 @@ export function launchNextWebFirstHost(options: {
   owner.on('close',event=>{
     if(nativeQuitting||(!coreTunnel&&!remoteConnectionFlight))return;
     event.preventDefault();
+    if(closingForTunnelStop)return;
+    closingForTunnelStop=true;
     void (async()=>{
       try{
         await disconnectRemoteCore();
         if(!owner.isDestroyed()){nativeQuitting=true;owner.close();}
-      }catch{/* Retain window and tunnel ownership on uncertain shutdown. */}
+      }catch{
+        // Keep the window and native authority alive when tunnel shutdown
+        // cannot be proved. Never make a sidecar reload gate the shutdown.
+        closingForTunnelStop=false;
+        if(!owner.isDestroyed())void dialog.showMessageBox(owner,{
+          type:'warning',title:'CoS Next · 安全退出受阻',
+          message:'Core Tunnel 尚未确认完整退出，窗口已保留。',
+          detail:'请先从「本地项目」菜单断开 Core；在退出收据明确之前不要运行第二个连接。',
+          buttons:['关闭']
+        });
+      }
     })();
   });
   owner.on('closed',()=>{
