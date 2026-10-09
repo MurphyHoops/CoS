@@ -13,6 +13,8 @@ import {
 } from './host-policy.js';
 import {newWebHealthTracker, type WebHealthSnapshot} from './web-health.js';
 import {allowedOAuthStoragePermission,allowedOAuthPopup} from './login-permissions.js';
+import {WebFirstProjectRegistry, type WebFirstProject} from './project-registry.js';
+import {renderProjectSidebar} from './project-sidebar.js';
 
 export interface NativeWebHostStatus {
   state: 'starting' | 'loaded' | 'load-failed';
@@ -25,14 +27,17 @@ export interface NativeWebHost {
   status: () => Readonly<NativeWebHostStatus>;
   reload: () => void;
   diagnostics: () => Promise<WebHealthSnapshot>;
+  nativeProjects: () => Promise<ReadonlyArray<WebFirstProject>>;
 }
 export function launchNextWebFirstHost(options: {
   /** Only a fixture launch may use data URLs; the production path is fixed. */
   offlineSmoke?: boolean;
+  /** Entirely native and isolated from the ChatGPT partition. */
+  projectStoreDir:string;
   onOfflineLoaded?: (contents:WebContents) => void;
   /** HTTPS P1 smoke emits status categories only; never page content/cookies. */
   onNavigationOutcome?: (state: Readonly<NativeWebHostStatus>) => void;
-} = {}): NativeWebHost {
+}): NativeWebHost {
   const offline = options.offlineSmoke === true;
   const health=newWebHealthTracker();
   const webSession = session.fromPartition(WEB_FIRST_PARTITION);
@@ -64,14 +69,38 @@ export function launchNextWebFirstHost(options: {
     state:'starting',location: offline ? 'offline-test':'chatgpt',
     lastErrorCode:null,blockedNavigations:0
   };
+  // The project sidecar runs in a completely separate renderer WITHOUT preload,
+  // JavaScript, network access, native IPC or access to the ChatGPT partition.
+  const sidebar = new WebContentsView({webPreferences:{
+    nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true,
+    webviewTag:false,javascript:false
+  }});
+  sidebar.webContents.setWindowOpenHandler(()=>({action:'deny'}));
+  sidebar.webContents.on('will-navigate',event=>event.preventDefault());
+  sidebar.webContents.on('will-attach-webview',event=>event.preventDefault());
+  owner.contentView.addChildView(sidebar);
   owner.contentView.addChildView(view);
+  const projects=new WebFirstProjectRegistry(options.projectStoreDir);
+  let sidebarVisible=true;
+  let cachedProjects:ReadonlyArray<WebFirstProject>=[];
+  const refreshSidebar=async()=>{
+    let state:'UNCONNECTED'|'HOLD'='UNCONNECTED';
+    try{cachedProjects=await projects.list();}
+    catch{state='HOLD';cachedProjects=[];}
+    if(sidebar.webContents.isDestroyed())return;
+    await sidebar.webContents.loadURL('data:text/html;charset=utf-8,'+
+      encodeURIComponent(renderProjectSidebar(cachedProjects,state)));
+  };
   const headerHeight = 48;
+  const sidebarWidth=268;
   const resize = () => {
     if (owner.isDestroyed()) return;
     const size = owner.getContentSize();
-    const w=size[0]??1, h=size[1]??1;
-    view.setBounds({x:0,y:headerHeight,width:w,height:Math.max(1,h-headerHeight)});
+    const w=size[0]??1, h=size[1]??1, x=sidebarVisible?sidebarWidth:0;
+    sidebar.setBounds({x:0,y:headerHeight,width:sidebarVisible?sidebarWidth:0,height:Math.max(1,h-headerHeight)});
+    view.setBounds({x,y:headerHeight,width:Math.max(1,w-x),height:Math.max(1,h-headerHeight)});
   };
+  void refreshSidebar();
   owner.on('resize',resize);
   owner.on('enter-full-screen',resize);
   owner.on('leave-full-screen',resize);
@@ -80,6 +109,7 @@ export function launchNextWebFirstHost(options: {
     // BaseWindow-based children must be explicitly closed; do not leave a web
     // renderer process keeping an authenticated session alive after its owner.
     if(!view.webContents.isDestroyed())view.webContents.close();
+    if(!sidebar.webContents.isDestroyed())sidebar.webContents.close();
   });
   const toolbar = '<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'">'+
     '<style>body{margin:0;background:#121820;color:#f1f5f9;font:13px system-ui;padding:14px 18px}strong{color:#9ad3ff}small{margin-left:12px;color:#b5bbc6}</style>'+
@@ -173,8 +203,55 @@ export function launchNextWebFirstHost(options: {
       buttons:['关闭']
     });
   };
+  const addProjectFromNativePicker=async()=>{
+    const chosen=await dialog.showOpenDialog(owner,{
+      title:'CoS Next — 选择本地项目目录',properties:['openDirectory']
+    });
+    if(chosen.canceled||!chosen.filePaths[0]||owner.isDestroyed())return;
+    // Selecting a folder does not grant an MCP capability or execute a command.
+    const response=await dialog.showMessageBox(owner,{
+      type:'question',title:'确认仅在本地登记项目',
+      message:'保存此项目目录为本地书签？',detail:chosen.filePaths[0]+
+        '\n\n不会自动读取文件、上传项目、运行命令或授权 ChatGPT/AI。',
+      buttons:['取消','仅登记'],defaultId:0,cancelId:0,noLink:true
+    });
+    if(response.response!==1||owner.isDestroyed())return;
+    try{
+      await projects.register(chosen.filePaths[0]);
+      await refreshSidebar();
+    }catch{
+      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{
+        type:'error',title:'项目登记失败',message:'无法安全保存项目登记。既有登记文件未被重置。',
+        buttons:['关闭']
+      });
+    }
+  };
+  const showLocalProjectStatus=async()=>{
+    let list:ReadonlyArray<WebFirstProject>;
+    try{list=await projects.list();}
+    catch{
+      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{type:'warning',
+        message:'本地项目登记需要检查；已暂停添加和加载。',buttons:['关闭']});
+      return;
+    }
+    if(!owner.isDestroyed())await dialog.showMessageBox(owner,{
+      title:'CoS Next 本地项目与 MCP',
+      message:list.length+' 个已登记项目 · Core MCP 未连接/未授权',
+      detail:'选择项目目录不会授予 ChatGPT 对文件和终端的访问。\n'
+       +'必须通过另行验证的 Core 插件身份、权限和工具发布门禁后才能操作本地项目。',
+      buttons:['关闭']
+    });
+  };
   const menus: MenuItemConstructorOptions[] = [
     {label:'CoS Next',submenu:[{role:'quit'}]},
+    {label:'本地项目',submenu:[
+      {label:'添加项目目录（仅本地登记）',click:()=>{void addProjectFromNativePicker();}},
+      {label:'查看登记与 Core MCP 状态',click:()=>{void showLocalProjectStatus();}},
+      {type:'separator'},
+      {label:'显示/隐藏项目侧栏',accelerator:'CmdOrCtrl+Shift+P',click:()=>{
+        sidebarVisible=!sidebarVisible;resize();
+      }}
+    ]},
     {label:'ChatGPT 网页',submenu:[
       {label:'检查网页健康状态',click:()=>{void showDiagnostics();}},
       {label:'重新加载网页',accelerator:'CmdOrCtrl+R',click:()=>view.webContents.reload()},
@@ -189,5 +266,6 @@ export function launchNextWebFirstHost(options: {
     // 'did-fail-load' owns the error code; never log full URL or auth redirect.
     if(status.state!=='load-failed')status.state='load-failed';
   });
-  return {window:owner,status:()=>({...status}),reload:()=>view.webContents.reload(),diagnostics};
+  return {window:owner,status:()=>({...status}),reload:()=>view.webContents.reload(),diagnostics,
+    nativeProjects:()=>projects.list()};
 }

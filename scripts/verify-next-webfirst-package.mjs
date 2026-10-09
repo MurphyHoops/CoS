@@ -18,7 +18,7 @@ if(!files.includes('/out-webfirst/main/web-first-main.js'))throw Error('MISSING_
 const forbidden=['/out-next/','/extension/','/tunnel/','/out-webfirst/preload/','/out-webfirst/renderer/'];
 for(const item of forbidden)if(files.some(f=>f.includes(item)))throw Error('LEGACY_DEPENDENCY_BUNDLED_'+item);
 const main=asar.extractFile(archive,'out-webfirst/main/web-first-main.js').toString('utf8');
-for(const marker of ['WebContentsView','chatgpt.com','cos-next-web-first-chatgpt']){
+for(const marker of ['WebContentsView','chatgpt.com','cos-next-web-first-chatgpt','web-first-projects.json','添加项目目录']){
   if(!main.includes(marker))throw Error('WEB_FIRST_RUNTIME_MARKER_MISSING');
 }
 for(const marker of ['tunnel-client','codex-cli','COS_NEXT_CLASSIC_WORKFLOW','CHROME_EXTENSION']){

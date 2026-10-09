@@ -1,6 +1,7 @@
 /** Standalone opt-in P1 preview. Does not import Classic Bridge, Chrome, Codex or inference. */
-import {app} from 'electron';
+import {app,Menu} from 'electron';
 import {mkdtempSync,mkdirSync,rmSync} from 'node:fs';
+import {WebFirstProjectRegistry} from './project-registry.js';
 import os from 'node:os';
 import path from 'node:path';
 import {launchNextWebFirstHost} from './native-host.js';
@@ -14,13 +15,25 @@ app.setPath('userData',profile);
 app.setName('CoS Next Web-First Preview');
 if(!app.requestSingleInstanceLock())app.quit();
 let quitting=false;
-app.whenReady().then(()=>{
+app.whenReady().then(async()=>{
   if(quitting)return;
+  if(offlineSmoke && smokeRoot){
+    // Native packaged regression: a synthetic project is registered only in
+    // the disposable smoke root and never granted any MCP authority.
+    const syntheticProject=path.join(smokeRoot,'offline-project');
+    mkdirSync(syntheticProject,{mode:0o700});
+    const store=new WebFirstProjectRegistry(profile);
+    const project=await store.register(syntheticProject);
+    const restored=await new WebFirstProjectRegistry(profile).list();
+    if(restored.length!==1 || restored[0]?.id!==project.id)
+      throw new Error('WEBFIRST_OFFLINE_PROJECT_RESTORE_FAILED');
+    process.stdout.write('WEB_FIRST_OFFLINE_PROJECT_RESTORED\n');
+  }
   let httpsReported=false;
   const smokeTimeout=httpsSmoke?setTimeout(()=>{
     process.stdout.write('WEB_FIRST_HTTPS_TIMEOUT\n'); app.quit();
   },25000):null;
-  const host=launchNextWebFirstHost({offlineSmoke,onNavigationOutcome:state=>{
+  const host=launchNextWebFirstHost({offlineSmoke,projectStoreDir:profile,onNavigationOutcome:state=>{
     if(!httpsSmoke||httpsReported)return;
     httpsReported=true;
     if(smokeTimeout)clearTimeout(smokeTimeout);
@@ -41,6 +54,15 @@ app.whenReady().then(()=>{
       const result=await contents.executeJavaScript(`document.querySelector('#native-smoke-input')?.value`);
       contents.debugger.detach();
       if(result!=='COS_OFFLINE_NATIVE_INPUT')throw Error('OFFLINE_NATIVE_INPUT_MISMATCH');
+      if((await host.nativeProjects()).length!==1)
+        throw Error('WEBFIRST_OFFLINE_PROJECT_UI_NOT_AVAILABLE');
+      const menus=Menu.getApplicationMenu()?.items??[];
+      const projectMenu=menus.find(item=>item.label==='本地项目');
+      if(!projectMenu?.submenu || projectMenu.submenu.items.length<3 ||
+         !projectMenu.submenu.items.some(item=>item.label.startsWith('添加项目目录')))
+        throw Error('WEBFIRST_NATIVE_PROJECT_MENU_MISSING');
+      process.stdout.write('WEB_FIRST_OFFLINE_PROJECT_MENU_PASS\n');
+      process.stdout.write('WEB_FIRST_OFFLINE_PROJECT_UI_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_INPUT_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_VIEW_READY\n');
       setImmediate(()=>app.quit());
