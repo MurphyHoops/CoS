@@ -129,3 +129,75 @@ Open the new Web-First P2b preview (only after the previous preview exits):
   certified by synthetic tests. Actual Core adoption remains native user
   opt-in and must pass a recent OpenAI poll plus a real `project_list` request.
 - No Github push, no secret values logged, and no user-project data used in QA.
+
+
+## P2b.1 — Keychain identity migration without copying encrypted secrets
+
+A real user attempt initially showed `EXISTING_NEXT_KEYCHAIN_UNAVAILABLE` and a
+misleading `本地登记错误` in the sidebar. Read-only diagnosis established:
+
+- Legacy CoS and old Next both still have `secrets.bin`, each mode 0600.
+- `safeStorage.isAsyncEncryptionAvailable()` was true but the **Web-First**
+  Electron identity failed to decrypt either encrypted store.
+- The macOS Keychain contains separate services for `Chat On Steroids Next`
+  and `CoS Next Web-First Preview`.
+- A read-only, no-plaintext diagnostic with the SAME packaged Web-First app,
+  but the **original Next product name set before app.whenReady**, decrypted
+  both existing encrypted stores successfully and verified the preexisting
+  OpenAI key. Neither store was rewritten, moved or logged.
+
+Fix: `core-broker.ts` is a short-lived, separately launched **Electron** child
+with legacy `Chat On Steroids Next` Keychain name, its **own disposable profile**
+and stdin ownership tie to the Web-First host. `core-transport.ts` launches it
+only after the native user consent. The broker itself decrypts the legacy key
+via `peekSecretWithoutRotation` and starts the bundled Tunnel, then emits
+ONLY `READY`, `CONNECTED`, `OFFLINE`, `FAILED`, `STOPPED_PROVEN` or
+`STOPPED_UNVERIFIED` over stdout. **The decrypted key never crosses the IPC
+or subprocess boundary, and is never copied to a new profile.** The original
+Web-First ChatGPT login profile keeps its separate Keychain identity.
+
+`project-sidebar.ts` now distinguishes `Core Tunnel 连接受阻 · 项目登记仍正常`
+from a genuinely invalid project ledger. P2b's native project registry remains
+unchanged, and previous user-selected roots are preserved.
+
+### Real-network broker validation (explicit user-requested repair)
+
+A packaged **ARM64** Web-First Broker was launched against an isolated,
+**deny-all** local MCP fixture. It decrypted existing stored OpenAI credentials,
+started `tunnel-client`, completed a real OpenAI control-plane poll, and
+closed with verified owner shutdown: `READY → CONNECTED → STOPPED_PROVEN`.
+No model message, Codex call, real user project read, credential transfer,
+Chrome interaction or project mutation occurred. The real-network test is
+opt-in-only: `COS_NEXT_REAL_TUNNEL_TEST=1` and exact `COS_NEXT_WEBFIRST_LIVE_APP`
+are required; the default CI suite skips it. The test cleans up its mock
+project, local server and owned client.
+
+**Still HOLD:** whether the ChatGPT platform Core plugin has refreshed its
+`tools/list` schema and can route `project_list` into this server. A control-
+plane success does not prove platform tool publication or conversation identity.
+
+
+### Keychain Broker hotfix, final gates
+
+- `Web-First Preview` with its own Keychain name could not decrypt the user's
+  two original 0600 stores. The same Electron bundle launched with **legacy
+  Next name before ready** decrypted both, and detected preexisting OpenAI
+  credentials without revealing values. Both encrypted blobs remained untouched.
+- Separate native Broker conserves the existing ChatGPT partition, owns the
+  tunnel client's life via stdin + `stopWithProof`, and returns only fixed
+  state words. User-readable status disambiguates Core `HOLD` from an invalid
+  project registry.
+- Explicit opt-in **real OpenAI control-plane** test with a deny-all temporary
+  local project fixture: `READY`, `CONNECTED`, `STOPPED_PROVEN` all observed.
+  No model messages or real user file reads; no orphan test tunnel was kept.
+- TypeScript and 20 focused Web-First tests passed (one real-network test
+  skipped by default).
+- `npm run verify:ci` after this change: 5,066 regular tests passed, 131 skipped
+  (includes the optional real-network test), plus 2 MCP shutdown tests passed.
+- New ARM64 bundle passed package inspection and real offline Electron MCP
+  smoke. Running Web-First retained existing authenticated ChatGPT browser
+  partition and post-login navigation state.
+- **Platform ChatGPT Core dispatch remains HOLD** until the user permits the
+  native Core connection from the current live app and the platform reports
+  a durable post-request poll and successful `project_list` tool call. One-shot
+  broker network test is not proof of this final delivery gate.

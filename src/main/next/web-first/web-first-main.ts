@@ -2,21 +2,31 @@
 import {app,Menu} from 'electron';
 import {mkdtempSync,mkdirSync,rmSync} from 'node:fs';
 import {WebFirstProjectRegistry} from './project-registry.js';
+import {inspectExistingCredentialProfiles} from './credential-diagnostics.js';
+import {runWebFirstCoreBroker} from './core-broker.js';
 import os from 'node:os';
 import path from 'node:path';
 import {launchNextWebFirstHost} from './native-host.js';
 const offlineSmoke=process.env.COS_NEXT_WEBFIRST_OFFLINE_SMOKE==='1';
 const httpsSmoke=process.env.COS_NEXT_WEBFIRST_HTTPS_SMOKE==='1';
+const alternateKeychainProbe=process.env.COS_NEXT_WEBFIRST_PROBE_NEXT_KEYCHAIN==='1';
+const coreBroker=process.env.COS_NEXT_WEBFIRST_CORE_BROKER==='1';
 // P1 uses an isolated app profile; never inherits old CoS/Next userData or cookies.
-const smokeRoot=(offlineSmoke||httpsSmoke)?mkdtempSync(path.join(os.tmpdir(),'cos-next-webfirst-p1-')):null;
+const smokeRoot=(offlineSmoke||httpsSmoke||coreBroker)?mkdtempSync(path.join(os.tmpdir(),'cos-next-webfirst-p1-')):null;
 const profile=smokeRoot ?? path.join(app.getPath('appData'),'chat-on-steroids-next-webfirst-preview');
 mkdirSync(profile,{recursive:true,mode:0o700});
 app.setPath('userData',profile);
-app.setName('CoS Next Web-First Preview');
-if(!app.requestSingleInstanceLock())app.quit();
+app.setName(alternateKeychainProbe||coreBroker?'Chat On Steroids Next':'CoS Next Web-First Preview');
+if(!coreBroker&&!app.requestSingleInstanceLock())app.quit();
 let quitting=false;
 app.whenReady().then(async()=>{
   if(quitting)return;
+  if(coreBroker){await runWebFirstCoreBroker(app.getPath('appData'));return;}
+  if(process.env.COS_NEXT_WEBFIRST_KEYCHAIN_PROBE==='1'||alternateKeychainProbe){
+    const result=await inspectExistingCredentialProfiles(app.getPath('appData'));
+    process.stdout.write('WEBFIRST_KEYCHAIN_PRECHECK='+JSON.stringify(result)+'\n');
+    app.quit();return;
+  }
   if(offlineSmoke && smokeRoot){
     // Native packaged regression: a synthetic project is registered only in
     // the disposable smoke root and never granted any MCP authority.
@@ -104,3 +114,4 @@ app.whenReady().then(async()=>{
 }).catch(()=>{process.stderr.write('WEB_FIRST_STARTUP_FAILED\n');app.exit(1);});
 app.on('before-quit',()=>{quitting=true;});
 app.on('will-quit',()=>{if(smokeRoot)rmSync(smokeRoot,{recursive:true,force:true});});
+if(smokeRoot)process.once('exit',()=>{try{rmSync(smokeRoot,{recursive:true,force:true});}catch{/* OS temp cleanup best effort */}});

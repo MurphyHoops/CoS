@@ -97,11 +97,12 @@ export function launchNextWebFirstHost(options: {
   let cachedProjects:ReadonlyArray<WebFirstProject>=[];
   const refreshSidebar=async()=>{
     let state:typeof mcpState=mcpState;
+    let registryError=false;
     try{cachedProjects=await projects.list();}
-    catch{state='HOLD';cachedProjects=[];}
+    catch{registryError=true;cachedProjects=[];}
     if(sidebar.webContents.isDestroyed())return;
     await sidebar.webContents.loadURL('data:text/html;charset=utf-8,'+
-      encodeURIComponent(renderProjectSidebar(cachedProjects,state)));
+      encodeURIComponent(renderProjectSidebar(cachedProjects,state,registryError)));
   };
   const headerHeight = 48;
   const sidebarWidth=268;
