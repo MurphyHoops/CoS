@@ -9,7 +9,7 @@ import {promises as fs,constants} from 'node:fs';
 import path from 'node:path';
 import type {WebFirstTaskLedger} from './task-ledger.js';
 import type {WebFirstPlanLedger} from './plan-ledger.js';
-export type LocalCheckKind='root-check'|'git-status';
+export type LocalCheckKind='root-check'|'git-status'|'git-head'|'git-tracked';
 export type LocalJobState='queued'|'running'|'succeeded'|'failed'|'review';
 export interface LocalCheckJob {
   id:string;taskId:string;projectId:string;kind:LocalCheckKind;
@@ -21,7 +21,8 @@ export interface LocalCheckJob {
 const FILE='web-first-local-jobs.json',MAX=160*1024,COUNT=64;
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const HEX=/^[a-f0-9]{64}$/i;
-const KINDS:LocalCheckKind[]=['root-check','git-status'];
+const KINDS:LocalCheckKind[]=['root-check','git-status','git-head','git-tracked'];
+const LANES:readonly LocalCheckKind[]=['root-check','git-status','git-head','git-tracked'];
 const STATES:LocalJobState[]=['queued','running','succeeded','failed','review'];
 function validJob(value:unknown):asserts value is LocalCheckJob{
   if(!value||typeof value!=='object'||Array.isArray(value))throw Error('LOCAL_JOB_RECORD_INVALID');
@@ -53,7 +54,7 @@ export class WebFirstLocalJobQueue {
   private readonly cancelling=new Map<string,{taskId:string;cancel:()=>void}>();
   constructor(private readonly profile:string,private readonly tasks:WebFirstTaskLedger,
     private readonly plans:WebFirstPlanLedger,
-    private readonly approve:(request:{kind:LocalCheckKind;goal:string;projectId:string})=>Promise<boolean>){
+    private readonly approve:(request:{kind:LocalCheckKind|'worker-team';goal:string;projectId:string;size?:number})=>Promise<boolean>){
     if(!path.isAbsolute(profile))throw Error('LOCAL_JOB_PROFILE_INVALID');
   }
   private file(){return path.join(this.profile,FILE);}
@@ -161,6 +162,64 @@ export class WebFirstLocalJobQueue {
       snap.jobs.push(job);await this.write(snap);return {...job};
     });
   }
+  /** One bounded native grant for a fixed, non-mutating team of 2–4 slots.
+   * Every slot has its own durable identity and exit receipt. The team cannot
+   * inherit a model credential or claim completion of the parent Goal.
+   */
+  async enqueueTeam(args:{taskId:string;taskRevision:number;planRevision:number;size:2|3|4;
+    nonce:string}):Promise<ReadonlyArray<LocalCheckJob>>{
+    if(!UUID.test(args.nonce)||![2,3,4].includes(args.size)||
+      !Number.isSafeInteger(args.taskRevision)||args.taskRevision<1||
+      !Number.isSafeInteger(args.planRevision)||args.planRevision<0)
+      throw Error('LOCAL_WORKER_TEAM_INVALID');
+    return this.locked(async()=>{
+      const ledger=await this.read();
+      // A repeated native click cannot silently mint another accepted team.
+      if(ledger.jobs.some(j=>j.nonce===args.nonce))throw Error('LOCAL_WORKER_TEAM_NONCE_REUSED');
+      if(ledger.jobs.length+args.size>COUNT)throw Error('LOCAL_JOB_QUEUE_FULL');
+      const task=await this.tasks.get(args.taskId),plan=await this.plans.status(args.taskId);
+      if(task.phase!=='active'||task.revision!==args.taskRevision||
+        (plan?.revision??0)!==args.planRevision)throw Error('LOCAL_JOB_TASK_STALE_OR_INACTIVE');
+      if(ledger.jobs.some(j=>j.taskId===task.id&&['queued','running'].includes(j.state)))
+        throw Error('LOCAL_JOB_TASK_BUSY');
+      const real=await fs.realpath(task.projectRoot),st=await fs.lstat(task.projectRoot);
+      if(real!==task.projectRoot||!st.isDirectory()||st.isSymbolicLink()||
+        st.dev!==task.rootDev||st.ino!==task.rootIno)throw Error('LOCAL_JOB_PROJECT_CHANGED');
+      if(!await this.approve({kind:'worker-team',goal:task.goal,
+        projectId:task.projectId,size:args.size}))throw Error('LOCAL_JOB_APPROVAL_DENIED');
+      const after=await this.tasks.get(task.id),freshPlan=await this.plans.status(task.id);
+      const changed=await fs.lstat(task.projectRoot),canonical=await fs.realpath(task.projectRoot);
+      if(after.revision!==args.taskRevision||after.phase!=='active'||
+        (freshPlan?.revision??0)!==args.planRevision||
+        changed.ino!==st.ino||changed.dev!==st.dev||!changed.isDirectory()||
+        changed.isSymbolicLink()||canonical!==task.projectRoot)
+        throw Error('LOCAL_JOB_TASK_STALE_OR_INACTIVE');
+      const now=Date.now();
+      const jobs=LANES.slice(0,args.size).map((kind,index):LocalCheckJob=>({
+        id:randomUUID(),taskId:task.id,projectId:task.projectId,
+        kind,taskRevision:args.taskRevision,planRevision:args.planRevision,
+        nonce:index===0?args.nonce:randomUUID(),projectDev:st.dev,
+        projectIno:st.ino,approvedAt:now,state:'queued',createdAt:now,
+        startedAt:null,finishedAt:null,exitCode:null,changedCount:null,
+        outputDigest:null,reason:null
+      }));
+      ledger.jobs.push(...jobs);await this.write(ledger);
+      return jobs;
+    });
+  }
+  /** Starts each independently fenced slot without serializing the child work. */
+  async runTeam(ids:ReadonlyArray<string>):Promise<ReadonlyArray<LocalCheckJob>>{
+    if(ids.length<2||ids.length>4||new Set(ids).size!==ids.length||
+      ids.some(id=>!UUID.test(id)))throw Error('LOCAL_WORKER_TEAM_INVALID');
+    const initial=await this.read();
+    const children=ids.map(id=>initial.jobs.find(j=>j.id===id));
+    if(children.some(j=>!j||j.state!=='queued')||
+      new Set(children.map(j=>j?.taskId)).size!==1||
+      new Set(children.map(j=>j?.approvedAt)).size!==1||
+      new Set(children.map(j=>j?.kind)).size!==ids.length)
+      throw Error('LOCAL_WORKER_TEAM_MISMATCH');
+    return Promise.all(ids.map(id=>this.run(id)));
+  }
   /** Native user-approved diagnostic only. Queued items require explicit run. */
   async run(id:string):Promise<LocalCheckJob>{
     const started=await this.locked(async():Promise<{job:LocalCheckJob;root:string}|null>=>{
@@ -191,7 +250,7 @@ export class WebFirstLocalJobQueue {
         outputDigest:createHash('sha256').update(JSON.stringify({kind:'root-check',
           taskId:started.job.taskId,dev:started.job.projectDev,ino:started.job.projectIno})).digest('hex'),
         reason:null as string|null}:
-      await this.gitStatus(started.root,id,started.job.taskId);
+      await this.gitStatus(started.root,id,started.job.taskId,started.job.kind);
     return this.locked(async()=>{
       const snap=await this.read(),job=snap.jobs.find(x=>x.id===id);
       if(!job)throw Error('LOCAL_JOB_NOT_FOUND');
@@ -205,13 +264,18 @@ export class WebFirstLocalJobQueue {
     });
   }
   /** Only preselected Git status, never an interpolated shell / arbitrary command. */
-  private async gitStatus(root:string,id:string,taskId:string):Promise<{
+  private async gitStatus(root:string,id:string,taskId:string,kind:LocalCheckKind):Promise<{
     exitCode:number|null;changedCount:number|null;outputDigest:string|null;reason:string|null}>{
     return new Promise(resolve=>{
       let settled=false,cut=false,timedOut=false,cancelled=false;
       let data='',bytes=0;const hash=createHash('sha256');
-      const child=spawn('/usr/bin/git',['--no-optional-locks','-c','core.fsmonitor=false',
-        '-c','core.hooksPath=/dev/null','status','--porcelain=v1','--untracked-files=no','--no-renames'],{
+      const prefix=['--no-optional-locks','-c','core.fsmonitor=false','-c','core.hooksPath=/dev/null'];
+      const exact=kind==='git-status'?['status','--porcelain=v1','--untracked-files=no','--no-renames']:
+        kind==='git-head'?['rev-parse','--verify','HEAD']:
+        kind==='git-tracked'?['ls-files','-z']:null;
+      if(!exact){resolve({exitCode:null,changedCount:null,outputDigest:null,
+        reason:'LOCAL_JOB_KIND_INVALID'});return;}
+      const child=spawn('/usr/bin/git',[...prefix,...exact],{
         cwd:root,shell:false,detached:process.platform!=='win32',windowsHide:true,
         env:{PATH:'/usr/bin:/bin',HOME:'/nonexistent',GIT_OPTIONAL_LOCKS:'0',
           GIT_CONFIG_NOSYSTEM:'1',GIT_TERMINAL_PROMPT:'0'},stdio:['ignore','pipe','pipe']
@@ -236,8 +300,11 @@ export class WebFirstLocalJobQueue {
         this.cancelling.delete(id);
         const reason=cut?'LOCAL_JOB_OUTPUT_LIMIT':timedOut?'LOCAL_JOB_TIMEOUT':
           cancelled?'LOCAL_JOB_OPERATOR_STOPPED':code===0?null:'LOCAL_JOB_GIT_FAILED';
-        resolve({exitCode:cut||timedOut||cancelled?null:code,changedCount:cut||timedOut||cancelled||code!==0?
-          null:data.split('\n').filter(Boolean).length,outputDigest:cut?null:hash.digest('hex'),reason});
+        const count=kind==='git-status'?data.split('\n').filter(Boolean).length:
+          kind==='git-tracked'?data.split('\0').filter(Boolean).length:null;
+        resolve({exitCode:cut||timedOut||cancelled?null:code,
+          changedCount:cut||timedOut||cancelled||code!==0?null:count,
+          outputDigest:cut?null:hash.digest('hex'),reason});
       };
       child.once('error',()=>finish(null));child.once('close',code=>finish(code));
     });

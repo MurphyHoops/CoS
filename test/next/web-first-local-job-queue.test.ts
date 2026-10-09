@@ -90,6 +90,50 @@ describe('P3.4-A native-approved durable local diagnostic queue',()=>{
     const storage=await readFile(path.join(x.profile,'web-first-local-jobs.json'),'utf8');
     expect(storage).not.toContain('README.md');expect(storage).not.toContain('private project content');
   });
+  it('runs four separate persisted native Worker slots without changing Goal phase',async()=>{
+    const x=await make();
+    execFileSync('/usr/bin/git',['init','-q'],{cwd:x.root});
+    await writeFile(path.join(x.root,'README.md'),'synthetic fixture');
+    execFileSync('/usr/bin/git',['add','README.md'],{cwd:x.root});
+    execFileSync('/usr/bin/git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid',
+      'commit','-qm','fixture'],{cwd:x.root});
+    const workers=await x.jobs.enqueueTeam({...x.args,size:4});
+    expect(workers.map(w=>w.kind)).toEqual(['root-check','git-status','git-head','git-tracked']);
+    expect(new Set(workers.map(w=>w.id)).size).toBe(4);
+    expect(workers.every(w=>w.state==='queued')).toBe(true);
+    expect(x.approve).toHaveBeenCalledWith(expect.objectContaining({kind:'worker-team',size:4}));
+    const completed=await x.jobs.runTeam(workers.map(w=>w.id));
+    expect(completed.every(w=>w.state==='succeeded'&&w.outputDigest?.length===64)).toBe(true);
+    expect(completed.find(w=>w.kind==='git-tracked')?.changedCount).toBe(1);
+    expect(completed.find(w=>w.kind==='git-status')?.changedCount).toBe(0);
+    expect((await x.tasks.get(x.task.id)).phase).toBe('active');
+    const restored=await new WebFirstLocalJobQueue(x.profile,x.tasks,x.plans,x.approve).list();
+    expect(restored).toHaveLength(4);expect(restored.every(w=>w.state==='succeeded')).toBe(true);
+    const disk=await readFile(path.join(x.profile,'web-first-local-jobs.json'),'utf8');
+    expect(disk).not.toContain('README.md');expect(disk).not.toContain('synthetic fixture');
+  });
+  it('denies team without native authorization, rejects invalid team sizes and duplicate dispatch',async()=>{
+    const denied=await make(false);
+    await expect(denied.jobs.enqueueTeam({...denied.args,size:2})).rejects.toThrow('LOCAL_JOB_APPROVAL_DENIED');
+    expect(await denied.jobs.list()).toHaveLength(0);
+    const x=await make();
+    await expect(x.jobs.enqueueTeam({...x.args,size:5 as 4})).rejects.toThrow('LOCAL_WORKER_TEAM_INVALID');
+    const team=await x.jobs.enqueueTeam({...x.args,size:2});
+    await expect(x.jobs.enqueueTeam({...x.args,size:2})).rejects.toThrow('LOCAL_WORKER_TEAM_NONCE_REUSED');
+    await expect(x.jobs.enqueueTeam({...x.args,nonce:randomUUID(),size:2})).rejects.toThrow('LOCAL_JOB_TASK_BUSY');
+    const first=await x.jobs.runTeam(team.map(w=>w.id));
+    expect(first[0]?.state).toBe('succeeded');
+    expect(first[1]?.state).toBe('failed'); // synthetic directory is not a Git repository
+    await expect(x.jobs.runTeam(team.map(w=>w.id))).rejects.toThrow('LOCAL_WORKER_TEAM_MISMATCH');
+  });
+  it('holds a multi-Worker team after crash rather than replaying either slot',async()=>{
+    const x=await make();const workers=await x.jobs.enqueueTeam({...x.args,size:3});
+    const revived=new WebFirstLocalJobQueue(x.profile,x.tasks,x.plans,x.approve);
+    expect(await revived.holdInterrupted()).toBe(3);
+    expect(await revived.holdInterrupted()).toBe(0);
+    expect((await revived.list()).map(w=>w.reason)).toEqual(Array(3).fill('LOCAL_JOB_NOT_DISPATCHED_REVIEW'));
+    await expect(revived.runTeam(workers.map(w=>w.id))).rejects.toThrow('LOCAL_WORKER_TEAM_MISMATCH');
+  });
   it('fails closed if project root changed, ledger is world-readable or symlinked',async()=>{
     const x=await make();await x.jobs.enqueue(x.args);
     await rename(x.root,x.root+'-saved');await mkdir(x.root);

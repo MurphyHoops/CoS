@@ -52,3 +52,7 @@ The user should be able to operate Next as a normal native application: (1) find
 ## P3.4-A initial execution ledger (2026-10-09)
 
 The first real, native-approved local job queue is implemented at `src/main/next/web-first/local-job-queue.ts` and exposed in ACTIVE Goal cards as explicit read-only project and Git status checks. This does not grant general command execution: operations are fixed, bounded and fsynced, native approval precedes dispatch, and model-limited periods do not prevent the independently authorized local work. Queued/running jobs become review-needed at restart, never replayed. Pausing a Goal cancels its active child. See `P34_NATIVE_LOCAL_JOBS_FIRST_SLICE.md` for exact authority gates, durable schema, native acceptance markers and remaining production holds.
+
+## P3.4-B local Worker restoration
+
+Added 2–4 parallel native diagnostic slots and up to 4 durable AI Worker **role assignments** (planning/building/testing/auditing) per Goal, including individual removal and stale-context review. Each diagnostic slot has an independent receipt; role assignments cannot start model inference until identity, quota, delivery and worktree gates are implemented and tested. Details: `P34B_MULTIWORKER_NATIVE_FIRST.md`. Autonomous multi-Agent dispatch **HOLD**; P3.4-B native acceptance passed in an isolated packaged Electron fixture.

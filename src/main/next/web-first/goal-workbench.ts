@@ -8,6 +8,7 @@ import type {DurableTask} from './task-ledger.js';
 import type {TaskPlan,PlanStep} from './plan-ledger.js';
 import {GOAL_WORKBENCH_CSS} from './goal-workbench-style.js';
 import type {LocalCheckJob,LocalCheckKind} from './local-job-queue.js';
+import type {AiWorkerAssignment} from './agent-roster.js';
 const escape=(s:string)=>s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;',
   '>':'&gt;','"':'&quot;',"'":'&#39;'}[c]??''));
 export const GOAL_FORM_ORIGIN='cos-next-goal://native/';
@@ -15,6 +16,9 @@ export type GoalWorkbenchAction= {kind:'create';projectId:string;goal:string;lin
   {kind:'update-plan';taskId:string;revision:number;lines:string}|
   {kind:'advance';taskId:string;taskRevision:number;planRevision:number;at:number}|
   {kind:'local-check';taskId:string;taskRevision:number;planRevision:number;check:LocalCheckKind}|
+  {kind:'worker-team';taskId:string;taskRevision:number;planRevision:number;slots:2|3|4}|
+  {kind:'ai-workers';taskId:string;taskRevision:number;planRevision:number;count:1|2|3|4}|
+  {kind:'ai-worker-remove';taskId:string;taskRevision:number;workerId:string}|
   {kind:'decision';taskId:string;revision:number;decision:'pause'|'resume'|'cancel'|'complete'}|
   {kind:'refresh'};
 /** No user string is allowed to be treated as a navigable URL. */
@@ -71,6 +75,36 @@ export function parseWorkbenchAction(raw:string):GoalWorkbenchAction{
     return {kind:'local-check',taskId,taskRevision:Number(taskRev),
       planRevision:Number(planRev),check:check as LocalCheckKind};
   }
+  if(u.pathname==='/worker-team'){
+    noExtra(['task_id','task_revision','plan_revision','slots']);
+    const taskId=one('task_id',36),taskRev=one('task_revision',10);
+    const planRev=one('plan_revision',10),slots=one('slots',1);
+    if(!/^[a-f0-9-]{36}$/i.test(taskId)||!/^[1-9][0-9]*$/.test(taskRev)||
+      !/^(?:0|[1-9][0-9]*)$/.test(planRev)||!['2','3','4'].includes(slots)||
+      !Number.isSafeInteger(Number(taskRev))||!Number.isSafeInteger(Number(planRev)))
+      throw Error('GOAL_FORM_INVALID');
+    return {kind:'worker-team',taskId,taskRevision:Number(taskRev),
+      planRevision:Number(planRev),slots:Number(slots) as 2|3|4};
+  }
+  if(u.pathname==='/ai-workers'){
+    noExtra(['task_id','task_revision','plan_revision','count']);
+    const taskId=one('task_id',36),rev=one('task_revision',10);
+    const plan=one('plan_revision',10),count=one('count',1);
+    if(!/^[a-f0-9-]{36}$/i.test(taskId)||!/^[1-9][0-9]*$/.test(rev)||
+      !/^(?:0|[1-9][0-9]*)$/.test(plan)||!['1','2','3','4'].includes(count)||
+      !Number.isSafeInteger(Number(rev))||!Number.isSafeInteger(Number(plan)))
+      throw Error('GOAL_FORM_INVALID');
+    return {kind:'ai-workers',taskId,taskRevision:Number(rev),
+      planRevision:Number(plan),count:Number(count) as 1|2|3|4};
+  }
+  if(u.pathname==='/ai-worker-remove'){
+    noExtra(['task_id','task_revision','worker_id']);
+    const taskId=one('task_id',36),rev=one('task_revision',10),workerId=one('worker_id',36);
+    if(!/^[a-f0-9-]{36}$/i.test(taskId)||!/^[a-f0-9-]{36}$/i.test(workerId)||
+      !/^[1-9][0-9]*$/.test(rev)||!Number.isSafeInteger(Number(rev)))
+      throw Error('GOAL_FORM_INVALID');
+    return {kind:'ai-worker-remove',taskId,taskRevision:Number(rev),workerId};
+  }
   if(u.pathname==='/decision'){
     noExtra(['task_id','revision','decision']);
     const taskId=one('task_id',36),revision=Number(one('revision',10)),decision=one('decision',16);
@@ -124,7 +158,7 @@ export function goalWorkbenchSummary(tasks:ReadonlyArray<DurableTask>){
 }
 export function renderGoalWorkbench(args:{projects:ReadonlyArray<WebFirstProject>;
   tasks:ReadonlyArray<DurableTask>;plans:ReadonlyArray<TaskPlan>;jobs?:ReadonlyArray<LocalCheckJob>;
-  jobError?:boolean;message:string;
+  jobError?:boolean;aiWorkers?:ReadonlyArray<AiWorkerAssignment>;aiWorkerError?:boolean;message:string;
   limit?:{model:'clear'|'cooldown'|'review';history:'normal'|'degraded'}|null}):string{
   const {projects,tasks,plans,message}=args;
   const summary=goalWorkbenchSummary(tasks);
@@ -161,6 +195,23 @@ export function renderGoalWorkbench(args:{projects:ReadonlyArray<WebFirstProject
     const jobNote=recentJob?`<p class="goal-note" role="status">最近一次 ${recentJob.kind==='root-check'?'目录完整性':'Git 状态'}检查 · ${jobLabel[recentJob.state]}
       ${recentJob.changedCount!==null?' · 已跟踪变更 '+recentJob.changedCount+' 项':''}
       ${recentJob.reason?' · '+escape(recentJob.reason):''}（仅本地检查结果，不代表 Goal 完成）</p>`:'';
+    const activeLocalJobs=(args.jobs??[]).filter(j=>j.taskId===t.id).slice(-4);
+    const lanes=activeLocalJobs.length>=2?`<div class="steps-mini" aria-label="最近本地 Worker 槽位">
+      ${activeLocalJobs.map((j,i)=>`<div class="step-line ${j.state==='succeeded'?'done':j.state==='running'?'current':''}">
+        <span class="step-symbol">${j.state==='succeeded'?'✓':j.state==='review'?'!':i+1}</span>
+        <span>本地槽位 ${i+1} · ${j.kind==='root-check'?'目录校验':j.kind==='git-status'?'Git 状态':
+          j.kind==='git-head'?'Git HEAD':'已跟踪文件统计'} · ${jobLabel[j.state]}</span>
+      </div>`).join('')}</div>`:'';
+    const team=editable&&t.phase==='active'&&!args.jobError?`<form action="${GOAL_FORM_ORIGIN}worker-team" method="GET">
+      <input type="hidden" name="task_id" value="${escape(t.id)}">
+      <input type="hidden" name="task_revision" value="${t.revision}">
+      <input type="hidden" name="plan_revision" value="${revision}">
+      <label class="soft" for="slots-${escape(t.id)}">本地 Worker 并行数（不是 AI Agent）</label>
+      <select id="slots-${escape(t.id)}" name="slots" ${busy?'disabled':''}>
+        <option value="2">2 个 Worker</option><option value="3">3 个 Worker</option>
+        <option value="4">4 个 Worker</option>
+      </select><button class="secondary" type="submit" ${busy?'disabled':''}>启动只读 Worker 预检</button>
+    </form>`:'';
     const checks=editable&&t.phase==='active'&&args.jobError?
       '<span class="soft">本机检查收据异常；检查已禁用，计划编辑不受影响。</span>':
       editable&&t.phase==='active'?`<form action="${GOAL_FORM_ORIGIN}local-check" method="GET">
@@ -169,6 +220,31 @@ export function renderGoalWorkbench(args:{projects:ReadonlyArray<WebFirstProject
       <input type="hidden" name="plan_revision" value="${revision}">
       <button class="secondary" name="check" value="root-check" ${busy?'disabled':''}>检查项目目录</button>
       <button class="secondary" name="check" value="git-status" title="只统计已跟踪文件，不包含未跟踪文件" ${busy?'disabled':''}>检查 Git 状态</button>
+    </form>`:'';
+    const agents=(args.aiWorkers??[]).filter(w=>w.taskId===t.id&&w.state!=='cancelled');
+    const aiLabels:Record<AiWorkerAssignment['role'],string>={
+      planner:'规划 Worker',builder:'开发 Worker',tester:'验证 Worker',auditor:'审计 Worker'};
+    const aiActive=agents.filter(w=>w.state==='waiting-auth'&&
+      w.taskRevision===t.revision&&w.planRevision===revision);
+    const agentDescription=agents.length?`<div class="steps-mini" aria-label="AI Agent Worker 分工">
+      ${agents.map(w=>`<div class="step-line"><span class="step-symbol">${w.state==='review'?'!':'◇'}</span>
+        <span>${aiLabels[w.role]} · ${w.state==='waiting-auth'?'等待可信会话授权':'计划变更，待复核'}</span>
+        <form action="${GOAL_FORM_ORIGIN}ai-worker-remove" method="GET">
+          <input type="hidden" name="task_id" value="${escape(t.id)}">
+          <input type="hidden" name="task_revision" value="${t.revision}">
+          <input type="hidden" name="worker_id" value="${escape(w.id)}">
+          <button class="secondary" type="submit" title="仅移除此分工，不会发出 ChatGPT 消息">移除</button>
+        </form></div>`).join('')}</div>`:
+      '<p class="goal-note">尚未配置 AI Agent Worker。分工登记不会启动 ChatGPT 模型。</p>';
+    const capacity=4-aiActive.length;
+    const aiForm=editable&&t.phase==='active'&&!args.aiWorkerError&&capacity>0?`<form action="${GOAL_FORM_ORIGIN}ai-workers" method="GET">
+      <input type="hidden" name="task_id" value="${escape(t.id)}">
+      <input type="hidden" name="task_revision" value="${t.revision}">
+      <input type="hidden" name="plan_revision" value="${revision}">
+      <label class="soft" for="ai-count-${escape(t.id)}">配置 AI Worker 角色（只登记，不发送消息）</label>
+      <select id="ai-count-${escape(t.id)}" name="count">
+        ${Array.from({length:capacity},(_,i)=>`<option value="${i+1}">增加 ${i+1} 个 AI Worker</option>`).join('')}
+      </select><button class="secondary" type="submit">＋ 添加 AI Worker 分工</button>
     </form>`:'';
     const actions=editable?`<form class="state-actions" action="${GOAL_FORM_ORIGIN}decision" method="GET">
       <input type="hidden" name="task_id" value="${escape(t.id)}">
@@ -186,7 +262,9 @@ export function renderGoalWorkbench(args:{projects:ReadonlyArray<WebFirstProject
           ${stepsPreview?`<div class="steps-mini">${stepsPreview}</div>`:''}`:'<p class="goal-note">尚未编写计划 · 可在下方展开编辑</p>'}
         ${current?`<p class="next-line"><strong>当前重点</strong> · ${escape(current.step)}</p>`:''}
         ${p?.explanation?`<p class="goal-note">${escape(p.explanation)}</p>`:''}
-        ${jobNote}
+        ${jobNote}${lanes}
+        ${args.aiWorkerError?'<p class="goal-note">AI Worker 登记账本异常；Goal 保留且不会启动模型。</p>':
+          `<p class="goal-note">AI Worker ${aiActive.length} / 4 · 待复核 ${agents.length-aiActive.length}（模型执行尚未连接）</p>${agentDescription}`}
         ${t.phase==='recovery-hold'?'<p class="goal-note">重启后需要你确认恢复，系统不会重复执行未知操作。</p>':''}
       </div>
       ${editable?`<details class="edit-panel"><summary>编辑分步计划 · 最多 12 步</summary>
@@ -200,7 +278,7 @@ export function renderGoalWorkbench(args:{projects:ReadonlyArray<WebFirstProject
         </form></div>
       </details>`: ''}
       ${editable?`<div class="goal-actions"><span class="soft">手动更新本机状态 · 不运行模型</span>
-        <div class="state-actions">${checks}${advance}${actions}</div></div>`:''}
+        <div class="state-actions">${aiForm}${team}${checks}${advance}${actions}</div></div>`:''}
     </article>`;
   };
   const model=args.limit?.model;

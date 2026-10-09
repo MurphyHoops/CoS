@@ -27,6 +27,7 @@ import {WebFirstTaskLedger} from './task-ledger.js';
 import {WebFirstTaskTools} from './task-tools.js';
 import {WebFirstPlanLedger} from './plan-ledger.js';
 import {WebFirstLocalJobQueue} from './local-job-queue.js';
+import {WebFirstAgentRoster} from './agent-roster.js';
 import {WebFirstPlanTools} from './plan-tools.js';
 import {renderGoalWorkbench,parseWorkbenchAction,parsePlanLines,completePlanStep} from './goal-workbench.js';
 import {conversationFromUrl,VISIBLE_REPLY_SCRIPT,WebReplySettleTracker,WebFirstReplyJournal,type VisibleWebReply} from './web-reply-observer.js';
@@ -194,15 +195,17 @@ export function launchNextWebFirstHost(options: {
 
   const taskLedger=new WebFirstTaskLedger(options.projectStoreDir);
   const planLedger=new WebFirstPlanLedger(options.projectStoreDir,taskLedger);
+  const aiWorkers=new WebFirstAgentRoster(options.projectStoreDir,taskLedger,planLedger);
   const localJobs=new WebFirstLocalJobQueue(options.projectStoreDir,taskLedger,planLedger,
     async request=>{
       if(offline)return true; // Synthetic packaged fixture has no real project.
       if(owner.isDestroyed())return false;
       const approved=await dialog.showMessageBox(owner,{
         type:'question',title:'批准一次本地只读检查',
-        message:request.kind==='root-check'?'检查项目目录是否仍是原目录？':'检查项目的 Git 工作区状态？',
+        message:request.kind==='worker-team'?`启动 ${request.size??0} 个本地只读 Worker 槽位？`:
+          request.kind==='root-check'?'检查项目目录是否仍是原目录？':'检查项目的 Git 工作区状态？',
         detail:'目标：'+request.goal.slice(0,360)+'\n\n'+
-          '仅允许这一次固定的只读检查；不会执行用户提供的任意命令、修改文件、发送网页消息或推进模型。'+
+          '仅允许本次列出的固定只读检查；多个本地 Worker 不等于 ChatGPT AI Agent。不会运行任意命令、修改文件或发送模型消息。'+
           '\n检查结果只保留退出状态、变更数量及 SHA-256，不保存文件名或文件内容。',
         buttons:['取消','仅批准本次检查'],defaultId:0,cancelId:0,noLink:true
       });
@@ -967,12 +970,14 @@ export function launchNextWebFirstHost(options: {
     goalUi.webContents.on('will-redirect',event=>event.preventDefault());
     const render=async(message='')=>{
       if(goalUi.isDestroyed())return;
-      const [projectList,taskList,planList,limit,jobState]=await Promise.all([
+      const [projectList,taskList,planList,limit,jobState,agentState]=await Promise.all([
         projects.list(),taskLedger.list(),planLedger.list(),
         throttle.status().catch(()=>null),
-        localJobs.list().then(jobs=>({jobs,error:false})).catch(()=>({jobs:[],error:true}))]);
+        localJobs.list().then(jobs=>({jobs,error:false})).catch(()=>({jobs:[],error:true})),
+        aiWorkers.list().then(workers=>({workers,error:false})).catch(()=>({workers:[],error:true}))]);
       if(goalUi.isDestroyed())return;
-      const html=renderGoalWorkbench({projects:projectList,tasks:taskList,plans:planList,jobs:jobState.jobs,jobError:jobState.error,message,limit});
+      const html=renderGoalWorkbench({projects:projectList,tasks:taskList,plans:planList,jobs:jobState.jobs,jobError:jobState.error,
+        aiWorkers:agentState.workers,aiWorkerError:agentState.error,message,limit});
       await goalUi.webContents.loadURL('data:text/html;charset=utf-8,'+encodeURIComponent(html));
     };
     goalUi.webContents.on('will-navigate',(event,url)=>{
@@ -997,6 +1002,28 @@ export function launchNextWebFirstHost(options: {
               nonce:randomUUID(),explanation:'由原生 Goal 工作台创建',steps});
             await render('目标已保存到本机。创建目标不会启动自动模型循环。');
             void refreshSidebar();return;
+          }
+          if(command.kind==='ai-worker-remove'){
+            await aiWorkers.removeOne(command.workerId,command.taskId,command.taskRevision);
+            await render('已移除选中的 AI Worker 分工；未调用 ChatGPT。');return;
+          }
+          if(command.kind==='ai-workers'){
+            const agents=await aiWorkers.add(command.taskId,command.taskRevision,
+              command.planRevision,command.count);
+            await render(`已登记 ${agents.length} 个 AI Worker 分工；目前等待可信会话授权，未启动模型。`);
+            return;
+          }
+          if(command.kind==='worker-team'){
+            const jobs=await localJobs.enqueueTeam({taskId:command.taskId,
+              taskRevision:command.taskRevision,planRevision:command.planRevision,
+              size:command.slots,nonce:randomUUID()});
+            await render(`已批准 ${jobs.length} 个本地只读 Worker；执行记录均已持久化。`);
+            void localJobs.runTeam(jobs.map(j=>j.id)).then(()=>{
+              if(!goalUi.isDestroyed())void render('Worker 预检已结束；请核对各槽位的结果收据。').catch(()=>undefined);
+            }).catch(()=>{
+              if(!goalUi.isDestroyed())void render('部分 Worker 的执行结果需要复核，未自动重试。').catch(()=>undefined);
+            });
+            return;
           }
           if(command.kind==='local-check'){
             const job=await localJobs.enqueue({taskId:command.taskId,
@@ -1041,7 +1068,10 @@ export function launchNextWebFirstHost(options: {
             if(sure.response!==1||goalUi.isDestroyed())return;
           }
           await taskLedger.nativeDecision(task.id,task.revision,command.decision);
-          if(command.decision==='pause'||command.decision==='cancel')localJobs.stopTask(task.id);
+          if(command.decision==='pause'||command.decision==='cancel'){
+            localJobs.stopTask(task.id);
+            await aiWorkers.cancelForTask(task.id);
+          }
           await render('任务状态已持久化。');void refreshSidebar();
         }catch(err){
           const reason=err instanceof Error&&/^[A-Z_]+$/.test(err.message)?err.message:'GOAL_ACTION_REJECTED';
@@ -1377,6 +1407,107 @@ export function launchNextWebFirstHost(options: {
       finally{if(attachedCheck&&wc.debugger.isAttached())wc.debugger.detach();}
       if(!checked)found=false;
       else process.stdout.write('WEB_FIRST_OFFLINE_LOCAL_JOB_APPROVED_EXECUTED_PASS\n');
+    }
+    if(found){
+      let teamOK=false,attachedTeam=false;
+      try{
+        await new Promise(resolve=>setTimeout(resolve,240));
+        wc.debugger.attach('1.3');attachedTeam=true;
+        const root=(await wc.debugger.sendCommand('DOM.getDocument',{depth:-1})) as {
+          root:{nodeId:number}};
+        const selected=(await wc.debugger.sendCommand('DOM.querySelector',{
+          nodeId:root.root.nodeId,selector:'form[action$="worker-team"] button[type="submit"]'})) as {nodeId:number};
+        if(!selected.nodeId)throw Error('OFFLINE_WORKER_TEAM_BUTTON_MISSING');
+        await wc.debugger.sendCommand('DOM.scrollIntoViewIfNeeded',{nodeId:selected.nodeId});
+        const box=(await wc.debugger.sendCommand('DOM.getBoxModel',{nodeId:selected.nodeId})) as {
+          model:{content:number[]}};
+        const vertices=box.model.content;
+        const x=((vertices[0]??0)+(vertices[2]??0)+(vertices[4]??0)+(vertices[6]??0))/4;
+        const y=((vertices[1]??0)+(vertices[3]??0)+(vertices[5]??0)+(vertices[7]??0))/4;
+        await wc.debugger.sendCommand('Input.dispatchMouseEvent',{
+          type:'mousePressed',x,y,button:'left',clickCount:1});
+        await wc.debugger.sendCommand('Input.dispatchMouseEvent',{
+          type:'mouseReleased',x,y,button:'left',clickCount:1});
+        for(let i=0;i<30;i++){
+          await new Promise(resolve=>setTimeout(resolve,120));
+          const task=(await taskLedger.list()).find(t=>t.goal==='OFFLINE_NATIVE_GOAL_FORM_PASS');
+          if(!task)continue;
+          const jobs=(await localJobs.list()).filter(j=>j.taskId===task.id);
+          const last=jobs.slice(-2);
+          if(jobs.length===3&&last[0]?.kind==='root-check'&&last[1]?.kind==='git-status'&&
+            last[0].state==='succeeded'&&last[1].state==='failed'&&
+            last[0].approvedAt===last[1].approvedAt&&task.phase==='active'){
+            teamOK=true;break;
+          }
+        }
+      }catch{process.stderr.write('WEB_FIRST_OFFLINE_WORKER_TEAM_NATIVE_INPUT_FAILED\n');}
+      finally{if(attachedTeam&&wc.debugger.isAttached())wc.debugger.detach();}
+      if(!teamOK)found=false;
+      else process.stdout.write('WEB_FIRST_OFFLINE_TWO_WORKER_TEAM_PASS\n');
+    }
+    if(found){
+      let assigned=false,attachedAgent=false;
+      try{
+        await new Promise(resolve=>setTimeout(resolve,250));
+        wc.debugger.attach('1.3');attachedAgent=true;
+        const root=(await wc.debugger.sendCommand('DOM.getDocument',{depth:-1})) as {
+          root:{nodeId:number}};
+        const target=(await wc.debugger.sendCommand('DOM.querySelector',{
+          nodeId:root.root.nodeId,selector:'form[action$="ai-workers"] button[type="submit"]'})) as {nodeId:number};
+        if(!target.nodeId)throw Error('OFFLINE_AI_WORKER_BUTTON_MISSING');
+        await wc.debugger.sendCommand('DOM.scrollIntoViewIfNeeded',{nodeId:target.nodeId});
+        const box=(await wc.debugger.sendCommand('DOM.getBoxModel',{nodeId:target.nodeId})) as {
+          model:{content:number[]}};
+        const values=box.model.content;
+        const x=((values[0]??0)+(values[2]??0)+(values[4]??0)+(values[6]??0))/4;
+        const y=((values[1]??0)+(values[3]??0)+(values[5]??0)+(values[7]??0))/4;
+        await wc.debugger.sendCommand('Input.dispatchMouseEvent',{
+          type:'mousePressed',x,y,button:'left',clickCount:1});
+        await wc.debugger.sendCommand('Input.dispatchMouseEvent',{
+          type:'mouseReleased',x,y,button:'left',clickCount:1});
+        for(let i=0;i<24;i++){
+          await new Promise(resolve=>setTimeout(resolve,120));
+          const saved=(await taskLedger.list()).find(t=>t.goal==='OFFLINE_NATIVE_GOAL_FORM_PASS');
+          const workers=(await aiWorkers.list()).filter(w=>w.taskId===saved?.id);
+          if(workers.length===1&&workers[0]?.role==='planner'&&
+            workers[0].state==='waiting-auth'&&workers[0].reason==='AUTH_REQUIRED'&&
+            saved?.phase==='active'){assigned=true;break;}
+        }
+      }catch{process.stderr.write('WEB_FIRST_OFFLINE_AI_WORKER_NATIVE_INPUT_FAILED\n');}
+      finally{if(attachedAgent&&wc.debugger.isAttached())wc.debugger.detach();}
+      if(!assigned)found=false;
+      else process.stdout.write('WEB_FIRST_OFFLINE_AI_WORKER_ASSIGNMENT_PASS\n');
+    }
+    if(found){
+      let removed=false,attachedRemove=false;
+      try{
+        await new Promise(resolve=>setTimeout(resolve,230));
+        wc.debugger.attach('1.3');attachedRemove=true;
+        const doc=(await wc.debugger.sendCommand('DOM.getDocument',{depth:-1})) as {
+          root:{nodeId:number}};
+        const node=(await wc.debugger.sendCommand('DOM.querySelector',{
+          nodeId:doc.root.nodeId,selector:'form[action$="ai-worker-remove"] button[type="submit"]'})) as {nodeId:number};
+        if(!node.nodeId)throw Error('OFFLINE_AI_WORKER_REMOVE_MISSING');
+        await wc.debugger.sendCommand('DOM.scrollIntoViewIfNeeded',{nodeId:node.nodeId});
+        const box=(await wc.debugger.sendCommand('DOM.getBoxModel',{nodeId:node.nodeId})) as {
+          model:{content:number[]}};
+        const points=box.model.content;
+        const x=((points[0]??0)+(points[2]??0)+(points[4]??0)+(points[6]??0))/4;
+        const y=((points[1]??0)+(points[3]??0)+(points[5]??0)+(points[7]??0))/4;
+        await wc.debugger.sendCommand('Input.dispatchMouseEvent',{
+          type:'mousePressed',x,y,button:'left',clickCount:1});
+        await wc.debugger.sendCommand('Input.dispatchMouseEvent',{
+          type:'mouseReleased',x,y,button:'left',clickCount:1});
+        for(let i=0;i<22;i++){
+          await new Promise(resolve=>setTimeout(resolve,120));
+          const workers=await aiWorkers.list();
+          if(workers.length===1&&workers[0]?.state==='cancelled'&&
+            workers[0].reason==='OPERATOR_STOPPED'){removed=true;break;}
+        }
+      }catch{process.stderr.write('WEB_FIRST_OFFLINE_AI_WORKER_REMOVE_NATIVE_FAILED\n');}
+      finally{if(attachedRemove&&wc.debugger.isAttached())wc.debugger.detach();}
+      if(!removed)found=false;
+      else process.stdout.write('WEB_FIRST_OFFLINE_AI_WORKER_REMOVE_PASS\n');
     }
     if(!window.isDestroyed())window.close();
     return found;

@@ -43,6 +43,23 @@ describe('JS-free native Goal workbench parser and presentation',()=>{
     expect(html).toContain('编辑分步计划');
     expect(html).not.toContain('name="check"');
   });
+  it('restricts AI Worker registration and removal to exact native forms',()=>{
+    const url=`cos-next-goal://native/ai-workers?task_id=${goalId}&task_revision=1&plan_revision=0&count=`;
+    for(const count of [1,2,3,4])expect(parseWorkbenchAction(url+count)).toMatchObject({kind:'ai-workers',count});
+    for(const value of ['0','5','999','4&script=true'])expect(()=>parseWorkbenchAction(url+value)).toThrow();
+    const worker='aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const removal=`cos-next-goal://native/ai-worker-remove?task_id=${goalId}&task_revision=1&worker_id=${worker}`;
+    expect(parseWorkbenchAction(removal)).toMatchObject({kind:'ai-worker-remove',workerId:worker});
+    expect(()=>parseWorkbenchAction(removal+'&action=send')).toThrow();
+  });
+  it('exposes only 2–4 local diagnostic Worker slots with immutable task fences',()=>{
+    const base=`cos-next-goal://native/worker-team?task_id=${goalId}&task_revision=2&plan_revision=0&slots=`;
+    for(const count of [2,3,4])expect(parseWorkbenchAction(base+count)).toEqual({
+      kind:'worker-team',taskId:goalId,taskRevision:2,planRevision:0,slots:count});
+    for(const invalid of ['0','1','5','999','2&exec=true','']){
+      expect(()=>parseWorkbenchAction(base+invalid)).toThrow();
+    }
+  });
   it('accepts only named read-only native checks with exact revisions',()=>{
     const u=`cos-next-goal://native/local-check?task_id=${goalId}&task_revision=1&plan_revision=0&check=git-status`;
     expect(parseWorkbenchAction(u)).toMatchObject({kind:'local-check',check:'git-status',planRevision:0});
