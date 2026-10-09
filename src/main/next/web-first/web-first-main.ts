@@ -105,6 +105,9 @@ app.whenReady().then(async()=>{
         throw Error('WEBFIRST_OFFLINE_RECOVERY_OVERLAY_FAILED');
       process.stdout.write('WEB_FIRST_OFFLINE_RECOVERY_OVERLAY_PASS\n');
       process.stdout.write('WEB_FIRST_OFFLINE_MAIN_WINDOW_VISIBLE_PASS\n');
+      if(!decodeURIComponent(host.window.webContents.getURL()).includes('⌘ ⇧ G'))
+        throw Error('WEBFIRST_NATIVE_TOPBAR_NOT_RENDERED');
+      process.stdout.write('WEB_FIRST_OFFLINE_NATIVE_TOPBAR_PASS\n');
       if(!await host.testGoalWorkbenchOffline?.())
         throw Error('WEBFIRST_OFFLINE_NATIVE_GOAL_FORM_FAILED');
       process.stdout.write('WEB_FIRST_OFFLINE_NATIVE_GOAL_FORM_PASS\n');

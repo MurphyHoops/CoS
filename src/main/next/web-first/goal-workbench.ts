@@ -6,11 +6,13 @@
 import type {WebFirstProject} from './project-registry.js';
 import type {DurableTask} from './task-ledger.js';
 import type {TaskPlan,PlanStep} from './plan-ledger.js';
+import {GOAL_WORKBENCH_CSS} from './goal-workbench-style.js';
 const escape=(s:string)=>s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;',
   '>':'&gt;','"':'&quot;',"'":'&#39;'}[c]??''));
 export const GOAL_FORM_ORIGIN='cos-next-goal://native/';
 export type GoalWorkbenchAction= {kind:'create';projectId:string;goal:string;lines:string}|
   {kind:'update-plan';taskId:string;revision:number;lines:string}|
+  {kind:'advance';taskId:string;taskRevision:number;planRevision:number;at:number}|
   {kind:'decision';taskId:string;revision:number;decision:'pause'|'resume'|'cancel'|'complete'}|
   {kind:'refresh'};
 /** No user string is allowed to be treated as a navigable URL. */
@@ -40,6 +42,21 @@ export function parseWorkbenchAction(raw:string):GoalWorkbenchAction{
       throw Error('GOAL_FORM_INVALID');
     return {kind:'update-plan',taskId,revision,lines:one('steps',12000)};
   }
+  if(u.pathname==='/advance'){
+    noExtra(['task_id','task_revision','plan_revision','at']);
+    const taskId=one('task_id',36);
+    const taskRevisionRaw=one('task_revision',10);
+    const planRevisionRaw=one('plan_revision',10);
+    const atRaw=one('at',2);
+    if(!/^[1-9][0-9]*$/.test(taskRevisionRaw)||!/^[1-9][0-9]*$/.test(planRevisionRaw)||
+      !/^(?:[0-9]|1[01])$/.test(atRaw))throw Error('GOAL_FORM_INVALID');
+    const taskRevision=Number(taskRevisionRaw),planRevision=Number(planRevisionRaw),at=Number(atRaw);
+    if(!/^[a-f0-9-]{36}$/i.test(taskId)||
+      !Number.isSafeInteger(taskRevision)||taskRevision<1||
+      !Number.isSafeInteger(planRevision)||planRevision<1||
+      !Number.isSafeInteger(at)||at<0||at>=12)throw Error('GOAL_FORM_INVALID');
+    return {kind:'advance',taskId,taskRevision,planRevision,at};
+  }
   if(u.pathname==='/decision'){
     noExtra(['task_id','revision','decision']);
     const taskId=one('task_id',36),revision=Number(one('revision',10)),decision=one('decision',16);
@@ -66,66 +83,145 @@ export function parsePlanLines(raw:string):PlanStep[]{
   if(inProgress>1)throw Error('PLAN_CONFLICT_OR_TOO_LONG');
   return result;
 }
+/** Explicit user assertion about a plan step. Never advances the task phase or runs a model. */
+export function completePlanStep(steps:ReadonlyArray<PlanStep>,at:number):PlanStep[]{
+  if(!Number.isInteger(at)||at<0||at>=steps.length||steps[at]?.status!=='in_progress')
+    throw Error('PLAN_ADVANCE_INVALID');
+  const next=steps.map(step=>({...step}));
+  next[at]!.status='completed';
+  const following=next.findIndex((step,i)=>i>at&&step.status==='pending');
+  if(following!==-1)next[following]!.status='in_progress';
+  return next;
+}
 type mappedStatus=PlanStep['status'];
 export function formatPlanLines(steps:ReadonlyArray<PlanStep>){
   return steps.map(x=>`[${x.status==='in_progress'?'>':x.status==='completed'?'x':' '}] ${x.step}`+
     (x.details?' :: '+x.details:'')).join('\n');
 }
+const labels:Record<DurableTask['phase'],string>={
+  active:'进行中',waiting:'等待中',paused:'已暂停','recovery-hold':'需恢复确认',
+  review:'待验收',completed:'已完成',cancelled:'已取消'
+};
+/** View projection only; never claim that a persisted plan authorizes execution. */
+export function goalWorkbenchSummary(tasks:ReadonlyArray<DurableTask>){
+  return {total:tasks.length,active:tasks.filter(t=>t.phase==='active').length,
+    waiting:tasks.filter(t=>['waiting','paused','recovery-hold','review'].includes(t.phase)).length,
+    completed:tasks.filter(t=>t.phase==='completed').length};
+}
 export function renderGoalWorkbench(args:{projects:ReadonlyArray<WebFirstProject>;
   tasks:ReadonlyArray<DurableTask>;plans:ReadonlyArray<TaskPlan>;message:string;
   limit?:{model:'clear'|'cooldown'|'review';history:'normal'|'degraded'}|null}):string{
   const {projects,tasks,plans,message}=args;
-  const entries=tasks.slice().reverse().map(t=>{
+  const summary=goalWorkbenchSummary(tasks);
+  const projectNames=new Map(projects.map(p=>[p.id,p.name]));
+  const order:Record<DurableTask['phase'],number>={
+    active:0,'recovery-hold':1,review:2,waiting:3,paused:4,completed:5,cancelled:6
+  };
+  const sorted=tasks.slice().sort((a,b)=>order[a.phase]-order[b.phase]||b.updatedAt-a.updatedAt);
+  const live=sorted.filter(t=>!['completed','cancelled'].includes(t.phase));
+  const archived=sorted.filter(t=>['completed','cancelled'].includes(t.phase));
+  const entry=(t:DurableTask)=>{
     const p=plans.find(x=>x.taskId===t.id),revision=p?.revision??0;
     const editable=t.phase!=='completed'&&t.phase!=='cancelled';
-    const buttons=editable?`<form action="${GOAL_FORM_ORIGIN}decision" method="GET">
+    const completed=p?.steps.filter(x=>x.status==='completed').length??0;
+    const total=p?.steps.length??0;
+    const percentage=total?Math.round(completed*100/total):0;
+    const currentIndex=p?.steps.findIndex(x=>x.status==='in_progress')??-1;
+    const current=p?.steps.find(x=>x.status==='in_progress')??p?.steps.find(x=>x.status==='pending');
+    const stepsPreview=(p?.steps??[]).slice(0,3).map(st=>{
+      const status=st.status==='completed'?'done':st.status==='in_progress'?'current':'';
+      return `<div class="step-line ${status}"><span class="step-symbol">${st.status==='completed'?'✓':st.status==='in_progress'?'●':'·'}</span><span>${escape(st.step)}</span></div>`;
+    }).join('');
+    const advance=editable&&t.phase==='active'&&currentIndex>=0&&p?`<form action="${GOAL_FORM_ORIGIN}advance" method="GET">
+      <input type="hidden" name="task_id" value="${escape(t.id)}">
+      <input type="hidden" name="task_revision" value="${t.revision}">
+      <input type="hidden" name="plan_revision" value="${p.revision}">
+      <input type="hidden" name="at" value="${currentIndex}">
+      <button type="submit" class="success" title="仅标记计划进度；不运行命令或模型">✓ 完成当前步骤</button>
+    </form>`:'';
+    const actions=editable?`<form class="state-actions" action="${GOAL_FORM_ORIGIN}decision" method="GET">
       <input type="hidden" name="task_id" value="${escape(t.id)}">
       <input type="hidden" name="revision" value="${t.revision}">
-      ${t.phase==='active'?'<button name="decision" value="pause">暂停目标</button>':''}
-      ${['paused','waiting','recovery-hold','review'].includes(t.phase)?'<button name="decision" value="resume">恢复目标</button>':''}
-      ${t.phase==='review'?'<button name="decision" value="complete">确认完成</button>':''}
+      ${t.phase==='active'?'<button class="secondary" name="decision" value="pause">暂停目标</button>':''}
+      ${['paused','waiting','recovery-hold','review'].includes(t.phase)?'<button class="secondary" name="decision" value="resume">确认恢复</button>':''}
+      ${t.phase==='review'?'<button class="success" name="decision" value="complete">确认验收完成</button>':''}
       <button class="danger" name="decision" value="cancel">取消目标</button>
     </form>`:'';
-    return `<section><header><strong>${escape(t.goal)}</strong><span>${escape(t.phase)} · 任务版本 ${t.revision}</span></header>
-      <p class="small">任务 ${escape(t.id)} · 项目 ${escape(t.projectId)}</p>
-      ${p?.explanation?`<p class="small">${escape(p.explanation)}</p>`:''}
-      <form action="${GOAL_FORM_ORIGIN}plan" method="GET">
-       <input type="hidden" name="task_id" value="${escape(t.id)}">
-       <input type="hidden" name="revision" value="${revision}">
-       <label>分步计划（每行一步，[ ] 待办、[&gt;] 进行中、[x] 已完成；:: 后写细节）</label>
-       <textarea name="steps" rows="${Math.max(3,Math.min(12,(p?.steps.length??0)+2))}" maxlength="12000" ${editable?'':'disabled'}>${escape(formatPlanLines(p?.steps??[]))}</textarea>
-       ${editable?`<button type="submit">保存计划 · rev ${revision}</button>`:''}
-      </form>${buttons}</section>`;
-  }).join('');
-  return `<!doctype html><html lang="zh"><head><meta charset="utf-8">
+    return `<article class="goal" data-phase="${escape(t.phase)}" aria-label="${escape(t.goal)}">
+      <div class="goal-body">
+        <div class="goal-title-row"><h3 class="goal-title">${escape(t.goal)}</h3><span class="phase ${escape(t.phase)}">${labels[t.phase]}</span></div>
+        <div class="goal-meta">${escape(projectNames.get(t.projectId)??'项目已移除')} · 任务 <code title="${escape(t.id)}">${escape(t.id.slice(0,8))}</code> · 修订 ${t.revision}</div>
+        ${total?`<div class="goal-summary"><span class="goal-progress-label">计划进度 · ${completed} / ${total} 步</span><span class="goal-progress-label">${percentage}%</span></div><div class="progress" role="progressbar" aria-label="已完成计划步骤" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percentage}"><div class="bar" style="width:${percentage}%"></div></div>
+          ${stepsPreview?`<div class="steps-mini">${stepsPreview}</div>`:''}`:'<p class="goal-note">尚未编写计划 · 可在下方展开编辑</p>'}
+        ${current?`<p class="next-line"><strong>当前重点</strong> · ${escape(current.step)}</p>`:''}
+        ${p?.explanation?`<p class="goal-note">${escape(p.explanation)}</p>`:''}
+        ${t.phase==='recovery-hold'?'<p class="goal-note">重启后需要你确认恢复，系统不会重复执行未知操作。</p>':''}
+      </div>
+      ${editable?`<details class="edit-panel"><summary>编辑分步计划 · 最多 12 步</summary>
+        <div class="edit-content"><form action="${GOAL_FORM_ORIGIN}plan" method="GET">
+          <input type="hidden" name="task_id" value="${escape(t.id)}">
+          <input type="hidden" name="revision" value="${revision}">
+          <label for="plan-${escape(t.id)}">步骤与状态</label>
+          <textarea id="plan-${escape(t.id)}" name="steps" rows="${Math.max(4,Math.min(12,total+2))}" maxlength="12000" spellcheck="false" placeholder="[>] 当前正在做什么&#10;[ ] 下一步准备做什么">${escape(formatPlanLines(p?.steps??[]))}</textarea>
+          <p class="helper">[ ] 待办 · [&gt;] 进行中 · [x] 完成 · 用 :: 添加说明。最多一个进行中步骤。</p>
+          <div class="toolbar"><button class="primary" type="submit">保存计划</button><span class="soft">计划版本 ${revision} · 保存不等于执行</span></div>
+        </form></div>
+      </details>`: ''}
+      ${editable?`<div class="goal-actions"><span class="soft">手动更新本机状态 · 不运行模型</span>
+        <div class="state-actions">${advance}${actions}</div></div>`:''}
+    </article>`;
+  };
+  const model=args.limit?.model;
+  const modelText=model==='cooldown'?'检测到模型冷却。你仍可安全编辑目标、计划和检查点。':
+    model==='review'?'本机冷却期限已到，实际可用额度尚未核实。恢复前需要人工检查。':
+    model==='clear'?'本机未设置模型续接暂停；这不代表服务端额度已获验证。':
+    '尚未获得可信的模型额度状态，自动执行保持关闭。';
+  const noticeError=/未执行|拒绝|失败|异常/.test(message);
+  const noticeSuccess=!!message&&!noticeError;
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; form-action cos-next-goal:; base-uri 'none'; connect-src 'none'; img-src 'none'">
-    <title>CoS Next · Goal 工作台</title><style>
-      body{font-family:system-ui,-apple-system,sans-serif;background:#111c29;color:#e9f0f8;margin:0;padding:22px;line-height:1.55}
-      h1{font-size:21px;margin:0 0 4px}h2{font-size:16px;margin:16px 0}p{margin:7px 0}
-      section{background:#1b2a3d;border:1px solid #31445b;border-radius:12px;padding:15px;margin:13px 0}
-      label{display:block;margin:10px 0 5px;font-weight:600;font-size:13px}
-      textarea,select{box-sizing:border-box;width:100%;padding:10px;border-radius:7px;border:1px solid #64748b;background:#f8fafc;color:#14202e;font:14px system-ui}
-      button{cursor:pointer;margin:10px 6px 0 0;padding:9px 13px;border:0;border-radius:7px;color:white;background:#1769df;font-weight:600}
-      button.danger{background:#8e3b46}button:disabled{opacity:.4}
-      header{display:flex;gap:12px;justify-content:space-between;flex-wrap:wrap}header span,.small{color:#b1c3d8;font-size:12px}
-      .notice{border-left:4px solid #efb663;padding:10px;background:#22334b;border-radius:5px;margin-top:15px}
-      a{color:#98c6ff;text-decoration:underline}
-    </style></head><body><h1>CoS Next · Goal / 计划工作台</h1>
-    <p class="small">目标与计划存储在本机。计划不会自动执行；暂停与重启后不会重复发送网页消息。</p>
-    <div class="notice">${escape(message||'创建一次 Goal，后续在此更新计划、暂停或恢复。限流不会删除任务。')}</div>
-    <section><h2>模型与网络限流</h2><p>${args.limit?.model==='cooldown'? '模型冷却中 · 本机计划可继续维护':
-      args.limit?.model==='review'?'冷却期限已到 · 需核对模型额度并人工确认':
-      args.limit?.model==='clear'?'本机模型续接门禁未暂停（不代表云端额度已确认）':
-      '限流状态不可用 · 不允许据此自动续接'}
-      <span class="small"> · 历史列表 ${args.limit?.history==='degraded'?'加载限流':'状态正常或未知'}</span></p>
-      <p class="small">持续自动 Loop 尚未开放。限流等待期间，目标、计划、检查点仍保留。</p>
-    </section>
-    <section><h2>创建新 Goal</h2><form action="${GOAL_FORM_ORIGIN}create" method="GET">
-      <label>本地项目</label><select name="project_id">${projects.map(p=>
-        `<option value="${escape(p.id)}">${escape(p.name)}</option>`).join('')}</select>
-      <label>目标（具体、可验证）</label><textarea name="goal" maxlength="2000" rows="3" required></textarea>
-      <label>步骤（可先不填）</label><textarea name="steps" maxlength="12000" rows="4" placeholder="[>] 检查当前项目状态\n[ ] 修复主要问题\n[ ] 本地验证后提交"></textarea>
-      <button type="submit" ${projects.length?'':'disabled'}>创建 Goal 并保存初始计划</button>
-    </form></section><h2>已有目标 · ${tasks.length}</h2>${entries||'<p>尚无目标。创建后会出现在这里。</p>'}
-    <p class="small">本工作台使用独立、禁用 JavaScript 的原生窗口；不会通过 ChatGPT 网页提交计划。</p></body></html>`;
+    <title>CoS Next · Goal 工作台</title><style>${GOAL_WORKBENCH_CSS}</style></head><body><main>
+      <header class="top"><div><div class="eyebrow">WORKSPACE / GOALS</div><h1>目标与计划工作台</h1>
+        <p class="muted">从目标到分步计划，状态在本机持久保存。按需编辑、暂停或恢复，不会自动消耗模型额度。</p></div>
+        <div class="top-right"><span class="cap">本机持久化</span><a class="text-link" href="${GOAL_FORM_ORIGIN}refresh">刷新状态 ↻</a></div>
+      </header>
+      <div class="metrics" aria-label="目标概览">
+        <div class="metric"><span class="label">全部目标</span><span class="number">${summary.total}</span></div>
+        <div class="metric active"><span class="label">进行中</span><span class="number">${summary.active}</span></div>
+        <div class="metric wait"><span class="label">等待 / 需处理</span><span class="number">${summary.waiting}</span></div>
+        <div class="metric"><span class="label">已完成</span><span class="number">${summary.completed}</span></div>
+      </div>
+      ${message?`<div class="notice ${noticeError?'error':noticeSuccess?'success':''}" role="status"><span class="glyph">${noticeError?'!':'✓'}</span><div><strong>${noticeError?'操作未保存':'状态已更新'}</strong><p>${escape(message)}</p></div></div>`:''}
+      <div class="columns"><section class="card" id="create"><div class="card-body">
+        <div class="card-heading"><div><div class="card-kicker">01 · NEW GOAL</div><h2 class="card-title">创建一个新目标</h2></div><span class="muted">无需预先配置 MCP 命令</span></div>
+        <form action="${GOAL_FORM_ORIGIN}create" method="GET">
+          <div class="field"><label for="new-project">选择项目</label><select id="new-project" name="project_id" required ${projects.length?'':'disabled'}>
+            ${projects.map(p=>`<option value="${escape(p.id)}">${escape(p.name)}</option>`).join('')}
+          </select>${!projects.length?'<div class="no-projects">尚无本地项目，请从主窗口顶部「本地项目 → 添加项目目录」登记后再创建。</div>':''}</div>
+          <div class="field"><label for="new-goal">你希望完成什么？</label><textarea id="new-goal" name="goal" maxlength="2000" rows="3" required placeholder="例如：修复项目的核心问题，完成本地测试并形成验收报告"></textarea><p class="helper">建议描述目标、验收标准和不允许修改的范围。</p></div>
+          <div class="field"><label for="new-steps">初始执行计划 <span class="soft">· 可稍后添加</span></label>
+            <textarea id="new-steps" name="steps" maxlength="12000" rows="4" spellcheck="false" placeholder="[>] 检查当前状态与测试
+[ ] 修复高优先级缺口
+[ ] 全量本地验证
+[ ] 汇报结果"></textarea>
+            <p class="helper">[ ] 待办 · [&gt;] 进行中 · [x] 完成 · :: 说明。最多 12 步。</p></div>
+          <div class="toolbar"><button type="submit" class="primary" ${projects.length?'':'disabled'}>＋ 创建并保存目标</button><span class="soft">仅保存，不自动运行</span></div>
+        </form></div></section>
+        <aside class="card limit-card"><div class="card-body">
+          <div class="card-kicker">02 · RUNTIME STATUS</div><h2 class="card-title">执行与限流状态</h2>
+          <div class="limit-header" style="margin-top:18px"><span class="limit-dot ${model==='clear'?'clear':model==='review'?'review':''}"></span>${model==='cooldown'?'模型冷却中':model==='review'?'等待人工复核':model==='clear'?'本机未设置限流暂停':'状态待确认'}</div>
+          <p class="limit-message">${modelText}</p><div class="limit-detail">
+          <p class="hint">历史列表：${args.limit?.history==='degraded'?'检测到加载限流，不等于模型额度耗尽':'未记录当前加载限流（不代表网络已验证）'}</p>
+          <p class="mini-line">计划修改、状态记录与本地保存不需要模型。</p>
+          <p class="mini-line">自动 Goal/Loop 仍未启用，不会擅自续发网页消息。</p>
+          <p class="mini-line">仅人工授权后可恢复等待或异常目标。</p>
+          </div></div></aside></div>
+      <section aria-label="当前目标"><div class="section-heading"><h2>当前目标</h2><p>${live.length} 个需要跟进的目标 · 按状态优先级排列</p></div>
+        ${live.length?`<div class="goals">${live.map(entry).join('')}</div>`:
+        '<div class="empty"><div class="empty-icon">◎</div><h3>还没有需要跟进的目标</h3><p>从上方创建第一个目标，或者查看下方已完成的目标。</p></div>'}
+      </section>
+      ${archived.length?`<details class="archive"><summary>历史目标 · ${archived.length} 个（已完成 / 已取消）</summary><div class="goals">${archived.map(entry).join('')}</div></details>`:''}
+      <footer class="footer">CoS Next · 原生安全工作台 · 无 JavaScript / 无 ChatGPT 网页访问权限 / 不读取 Cookie 或密钥。<br>计划与持久任务并非自动执行授权；修改文件、终端命令和网页续接仍须通过各自的安全门禁。</footer>
+    </main></body></html>`;
 }

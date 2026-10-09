@@ -18,6 +18,7 @@ import {PageRecoveryGate,type SafePageProbe} from './page-recovery.js';
 import {allowedOAuthStoragePermission,allowedOAuthPopup} from './login-permissions.js';
 import {WebFirstProjectRegistry, type WebFirstProject} from './project-registry.js';
 import {renderProjectSidebar} from './project-sidebar.js';
+import {renderWorkspaceHeader} from './workspace-header.js';
 import {WebFirstReadAuthority, type ReadAction, type NativeReadApproval} from './project-read.js';
 import {WebFirstReadGrants,isSensitiveProjectPath} from './read-grants.js';
 import {WebFirstOperationJournal} from './operation-journal.js';
@@ -26,7 +27,7 @@ import {WebFirstTaskLedger} from './task-ledger.js';
 import {WebFirstTaskTools} from './task-tools.js';
 import {WebFirstPlanLedger} from './plan-ledger.js';
 import {WebFirstPlanTools} from './plan-tools.js';
-import {renderGoalWorkbench,parseWorkbenchAction,parsePlanLines} from './goal-workbench.js';
+import {renderGoalWorkbench,parseWorkbenchAction,parsePlanLines,completePlanStep} from './goal-workbench.js';
 import {conversationFromUrl,VISIBLE_REPLY_SCRIPT,WebReplySettleTracker,WebFirstReplyJournal,type VisibleWebReply} from './web-reply-observer.js';
 import {WebFirstWebOutbox} from './web-outbox.js';
 import {sendNativeWebFirstMessage} from './native-web-input.js';
@@ -285,13 +286,19 @@ export function launchNextWebFirstHost(options: {
     let goalSummary={total:0,active:0,waiting:0,error:false};
     try{const saved=await taskLedger.list();
       goalSummary={total:saved.length,active:saved.filter(t=>t.phase==='active').length,
-        waiting:saved.filter(t=>['waiting','recovery-hold','paused'].includes(t.phase)).length,
+        waiting:saved.filter(t=>['waiting','recovery-hold','paused','review'].includes(t.phase)).length,
         error:false};
     }catch{goalSummary.error=true;}
     if(closingForTunnelStop||owner.isDestroyed()||sidebar.webContents.isDestroyed())return;
     await sidebar.webContents.loadURL('data:text/html;charset=utf-8,'+
       encodeURIComponent(renderProjectSidebar(cachedProjects,state,registryError,
         grantSummary,goalSummary)));
+    // Reuse the existing, JavaScript-disabled BrowserWindow toolbar rather than
+    // creating an extra privileged UI surface or Electron renderer process.
+    if(!owner.isDestroyed()){
+      await owner.loadURL('data:text/html;charset=utf-8,'+
+        encodeURIComponent(renderWorkspaceHeader(state))).catch(()=>undefined);
+    }
   };
   const headerHeight = 48;
   const sidebarWidth=268;
@@ -356,10 +363,6 @@ export function launchNextWebFirstHost(options: {
     if(!view.webContents.isDestroyed())view.webContents.close();
     if(!sidebar.webContents.isDestroyed())sidebar.webContents.close();
   });
-  const toolbar = '<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'">'+
-    '<style>body{margin:0;background:#121820;color:#f1f5f9;font:13px system-ui;padding:14px 18px}strong{color:#9ad3ff}small{margin-left:12px;color:#b5bbc6}</style>'+
-    '<strong>CoS Next · Web-First</strong><small>ChatGPT 官方网页 · 原生项目侧栏 · 独立 MCP · 不使用 Chrome 扩展</small>';
-  void owner.loadURL('data:text/html;charset=utf-8,'+encodeURIComponent(toolbar));
   owner.webContents.setWindowOpenHandler(()=>({action:'deny'}));
   owner.webContents.on('will-navigate',e=>e.preventDefault());
   owner.webContents.on('will-attach-webview',e=>e.preventDefault());
@@ -940,8 +943,8 @@ export function launchNextWebFirstHost(options: {
       goalWindow.show();goalWindow.focus();return;
     }
     const goalUi=new BrowserWindow({parent:owner,title:'CoS Next · Goal / 计划工作台',
-      width:850,height:760,minWidth:580,minHeight:460,show:true,
-      backgroundColor:'#111c29',webPreferences:{nodeIntegration:false,
+      width:1040,height:820,minWidth:650,minHeight:520,show:true,
+      backgroundColor:'#0b1220',webPreferences:{nodeIntegration:false,
         contextIsolation:true,sandbox:true,webSecurity:true,javascript:false,webviewTag:false}});
     goalWindow=goalUi;
     goalUi.webContents.setWindowOpenHandler(()=>({action:'deny'}));
@@ -978,6 +981,17 @@ export function launchNextWebFirstHost(options: {
               nonce:randomUUID(),explanation:'由原生 Goal 工作台创建',steps});
             await render('目标已保存到本机。创建目标不会启动自动模型循环。');
             void refreshSidebar();return;
+          }
+          if(command.kind==='advance'){
+            const task=await taskLedger.get(command.taskId);
+            if(task.revision!==command.taskRevision)throw Error('GOAL_TASK_STALE_REVISION');
+            if(task.phase!=='active')throw Error('GOAL_TASK_NOT_ACTIVE');
+            const plan=await planLedger.status(task.id);
+            if(!plan||plan.revision!==command.planRevision)throw Error('PLAN_STALE_REVISION');
+            const steps=completePlanStep(plan.steps,command.at);
+            await planLedger.update({taskId:task.id,expectedRevision:plan.revision,
+              nonce:randomUUID(),explanation:'用户手动确认完成一步，未运行模型',steps});
+            await render('计划步骤已更新。目标仍需人工验收。');return;
           }
           if(command.kind==='update-plan'){
             const steps=parsePlanLines(command.lines);
@@ -1152,6 +1166,13 @@ export function launchNextWebFirstHost(options: {
   };
   const menus: MenuItemConstructorOptions[] = [
     {label:'CoS Next',submenu:[{role:'quit'}]},
+    {label:'目标',submenu:[
+      {label:'打开 Goal / 计划工作台',accelerator:'CmdOrCtrl+Shift+G',click:()=>{void openGoalWorkbench();}},
+      {label:'管理任务与恢复',click:()=>{void manageDurableTasks();}},
+      {type:'separator'},
+      {label:'查看限流暂停与恢复',click:()=>{void manageRateLimit();}},
+      {label:'检查连续工作准备状态',click:()=>{void inspectContinuity();}}
+    ]},
     {label:'本地项目',submenu:[
       {label:'连接现有 ChatGPT Core Tunnel（需批准）',click:()=>{void connectRemoteCore();}},
       {label:'断开 ChatGPT Core Tunnel',click:()=>{void disconnectRemoteCore().catch(()=>undefined);}},
@@ -1256,6 +1277,40 @@ export function launchNextWebFirstHost(options: {
       }
     }
     if(!found)process.stderr.write('WEB_FIRST_OFFLINE_GOAL_FORM_DID_NOT_PERSIST\n');
+    if(found){
+      // A second real native click must update the persisted plan, without
+      // executing a tool, invoking a model, or completing the parent task.
+      let advanced=false,attachedAgain=false;
+      try{
+        wc.debugger.attach('1.3');attachedAgain=true;
+        const root=(await wc.debugger.sendCommand('DOM.getDocument',{depth:-1})) as {
+          root:{nodeId:number}};
+        const target=(await wc.debugger.sendCommand('DOM.querySelector',{
+          nodeId:root.root.nodeId,selector:'form[action$="advance"] button'})) as {nodeId:number};
+        if(!target.nodeId)throw Error('GOAL_ADVANCE_BUTTON_NOT_RENDERED');
+        await wc.debugger.sendCommand('DOM.scrollIntoViewIfNeeded',{nodeId:target.nodeId});
+        const rect=(await wc.debugger.sendCommand('DOM.getBoxModel',{nodeId:target.nodeId})) as {
+          model:{content:number[]}};
+        const points=rect.model.content;
+        const x=((points[0]??0)+(points[2]??0)+(points[4]??0)+(points[6]??0))/4;
+        const y=((points[1]??0)+(points[3]??0)+(points[5]??0)+(points[7]??0))/4;
+        await wc.debugger.sendCommand('Input.dispatchMouseEvent',{
+          type:'mousePressed',x,y,button:'left',clickCount:1});
+        await wc.debugger.sendCommand('Input.dispatchMouseEvent',{
+          type:'mouseReleased',x,y,button:'left',clickCount:1});
+        for(let i=0;i<18;i++){
+          await new Promise(resolve=>setTimeout(resolve,120));
+          const task=(await taskLedger.list()).find(t=>t.goal==='OFFLINE_NATIVE_GOAL_FORM_PASS');
+          if(!task)continue;
+          const plan=await planLedger.status(task.id);
+          if(plan?.steps[0]?.status==='completed'&&plan.steps[1]?.status==='in_progress'&&
+            task.phase==='active') {advanced=true;break;}
+        }
+      }catch{process.stderr.write('WEB_FIRST_OFFLINE_GOAL_ADVANCE_NATIVE_INPUT_FAILED\n');}
+      finally{if(attachedAgain&&wc.debugger.isAttached())wc.debugger.detach();}
+      if(!advanced)found=false;
+      else process.stdout.write('WEB_FIRST_OFFLINE_GOAL_STEP_ADVANCE_PASS\n');
+    }
     if(!window.isDestroyed())window.close();
     return found;
   };

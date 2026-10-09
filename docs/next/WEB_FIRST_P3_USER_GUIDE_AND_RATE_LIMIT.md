@@ -39,3 +39,11 @@ On expiry, the app reports **operator review**, not “quota restored.” The us
 - **P4d:** Fault-inject App/browser/Tunnel restart, provider 429, website cap banner, history-list 429, slow responses and partial file operations; prohibit false “completed,” duplicate side effects and silent provider switching. Any optional independent inference provider requires explicit user approval and its own quota/account rules. There is **no** technique to override OpenAI's server-side usage limits.
 
 The P3.3 preview's **running** binary may be older. A separate verified `webfirst-p3-goal-workbench` ARM64 candidate includes the rate-limit menu and Goal editor; local packaging does not constitute a live deployment. Never confuse a passing offline fixture with a live ChatGPT website generation-loop acceptance test.
+
+## P3.3.1 workbench UI (2026-10-09)
+
+Open the new 「目标」 menu or press ⌘⇧G to open the Goal workbench. The older local-project menu option remains. The dashboard separates active, waiting, completed, and archived goals. Edit plans in collapsed panels. The model cooldown panel is informational, not proof of provider entitlement.
+
+In an ACTIVE Goal with an explicit `[>]` step, click 「✓ 完成当前步骤」 to mark it `[x]` and bring the next pending `[ ]` step into progress. This only changes the versioned native plan snapshot after exact task/plan revision checks. It does not run the plan, send a browser turn or complete the parent Goal. To change other steps, expand plan editing.
+
+The native top toolbar and project sidebar now use one visual language; the ChatGPT web partition is untouched. See `P3_UI_PRODUCT_AND_LOCAL_EXECUTION_PLAN.md` for the P3.4 durable queue and recovery gates.
