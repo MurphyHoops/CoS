@@ -18,6 +18,9 @@ import {renderProjectSidebar} from './project-sidebar.js';
 import {WebFirstReadAuthority, type ReadAction, type NativeReadApproval} from './project-read.js';
 import {WebFirstReadGrants,isSensitiveProjectPath} from './read-grants.js';
 import {WebFirstOperationJournal} from './operation-journal.js';
+import {WebFirstTaskLedger} from './task-ledger.js';
+import {WebFirstTaskTools} from './task-tools.js';
+import {conversationFromUrl,VISIBLE_REPLY_SCRIPT,WebReplySettleTracker,WebFirstReplyJournal,type VisibleWebReply} from './web-reply-observer.js';
 import {createWebFirstCoreLoopback} from './core-loopback.js';
 import {readWebFirstLocalToolList,EXPECTED_READ_ONLY_CORE_TOOLS} from './core-catalogue.js';
 import {connectWebFirstImportedCore,type CoreTunnelState} from './core-transport.js';
@@ -37,6 +40,7 @@ export interface NativeWebHost {
   enableNativeCore: () => Promise<{endpointUrl:string;port:number}>;
   disableNativeCore: () => Promise<void>;
   getCorePosture:()=>string;
+  snapshotVisibleAssistant:()=>Promise<VisibleWebReply|null>;
 }
 export function launchNextWebFirstHost(options: {
   /** Only a fixture launch may use data URLs; the production path is fixed. */
@@ -93,6 +97,58 @@ export function launchNextWebFirstHost(options: {
   const projects=new WebFirstProjectRegistry(options.projectStoreDir);
   const grants=new WebFirstReadGrants(options.projectStoreDir);
   const journal=new WebFirstOperationJournal(options.projectStoreDir);
+  const taskLedger=new WebFirstTaskLedger(options.projectStoreDir);
+  const webReplies=new WebFirstReplyJournal(options.projectStoreDir);
+  const replyTracker=new WebReplySettleTracker();
+  let recordingChat:string|null=null;
+  let replyTimer:NodeJS.Timeout|null=null;
+  let replyBusy=false;
+  async function snapshotVisibleAssistant():Promise<VisibleWebReply|null>{
+    if(view.webContents.isDestroyed())return null;
+    const conversationId=offline?'offline-synthetic':conversationFromUrl(view.webContents.getURL());
+    if(!conversationId)return null;
+    try{
+      const data:unknown=await view.webContents.executeJavaScript(VISIBLE_REPLY_SCRIPT,true);
+      if(!data||typeof data!=='object')return null;
+      const result=data as {messageId?:unknown;text?:unknown;editorReady?:unknown;generating?:unknown};
+      if(typeof result.text!=='string'||typeof result.messageId!=='string'||
+        typeof result.editorReady!=='boolean'||typeof result.generating!=='boolean'||
+        result.text.length>24576||result.messageId.length>256)return null;
+      return {conversationId,messageId:result.messageId,text:result.text,
+        editorReady:result.editorReady,generating:result.generating};
+    }catch{return null;}
+  }
+  async function captureVisibleReply(){
+    if(!recordingChat||replyBusy||owner.isDestroyed())return;
+    replyBusy=true;
+    try{
+      const snapshot=await snapshotVisibleAssistant();
+      if(!snapshot||snapshot.conversationId!==recordingChat){
+        if(snapshot&&snapshot.conversationId!==recordingChat)stopReplyCapture();
+        return;
+      }
+      const settled=replyTracker.observe(snapshot);
+      if(settled)await webReplies.record(settled);
+    }catch{/* local ledger failure does not mutate ChatGPT or retry a message */}
+    finally{replyBusy=false;}
+  }
+  function stopReplyCapture(){
+    recordingChat=null;replyTracker.reset();
+    if(replyTimer){clearInterval(replyTimer);replyTimer=null;}
+  }
+
+  const taskTools=new WebFirstTaskTools(taskLedger,projects,async (_action,details)=>{
+    if(offline)return true;
+    if(owner.isDestroyed())return false;
+    const approve=await dialog.showMessageBox(owner,{
+      type:'question',title:'开始 Web-First 持久任务',
+      message:'允许 ChatGPT 为 '+details.name+' 创建本地持久任务吗？',
+      detail:'目标：'+details.goal+'\n\n这只是创建任务状态与检查点；不会自动发送网页消息、执行终端或写入文件。'
+        +'身份归属尚未通过验证，请确认这是你请求的任务。',
+      buttons:['取消','创建任务'],defaultId:0,cancelId:0,noLink:true
+    });
+    return !owner.isDestroyed()&&approve.response===1;
+  });
   let approvals:Promise<unknown>=Promise.resolve();
   let mcpService:Awaited<ReturnType<typeof createWebFirstCoreLoopback>>|null=null;
   let mcpStartFlight:Promise<{endpointUrl:string;port:number}>|null=null;
@@ -154,6 +210,7 @@ export function launchNextWebFirstHost(options: {
     })();
   });
   owner.on('closed',()=>{
+    stopReplyCapture();
     void disableNativeCore().catch(()=>undefined);
     // BaseWindow-based children must be explicitly closed; do not leave a web
     // renderer process keeping an authenticated session alive after its owner.
@@ -386,7 +443,7 @@ export function launchNextWebFirstHost(options: {
         if(consent.response!==1)throw Error('WEBFIRST_CORE_NOT_APPROVED');
       }
       const authority=new WebFirstReadAuthority(projects,approveScopedRead);
-      const created=await createWebFirstCoreLoopback(authority,journal);
+      const created=await createWebFirstCoreLoopback(authority,journal,taskTools);
       if(owner.isDestroyed()){
         await created.close();throw Error('WEBFIRST_WINDOW_CLOSED');
       }
@@ -463,6 +520,80 @@ export function launchNextWebFirstHost(options: {
     if(current)await current.close();
     if(!owner.isDestroyed())await refreshSidebar();
   }
+  const toggleReplyCapture=async()=>{
+    if(recordingChat){
+      stopReplyCapture();
+      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{
+        type:'info',message:'已停止记录内嵌网页回复。',buttons:['关闭']});
+      return;
+    }
+    const id=conversationFromUrl(view.webContents.getURL());
+    if(!id||owner.isDestroyed()){
+      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{
+        type:'warning',message:'请先打开一个 ChatGPT 具体对话，再开启回复记录。',buttons:['关闭']});
+      return;
+    }
+    const accepted=await dialog.showMessageBox(owner,{
+      type:'question',title:'开启当前 ChatGPT 对话的本地回复记录',
+      message:'允许 CoS 只读取当前对话在网页上已显示的助手回复吗？',
+      detail:'回复文本仅写入此 Mac 的独立 0600 本地记录，不读取 Cookie、密钥或其他标签页。'
+        +'切换对话将自动停止；不自动发送新消息，也不额外调用模型。',
+      buttons:['取消','开启当前对话记录'],defaultId:0,cancelId:0,noLink:true
+    });
+    if(accepted.response!==1||owner.isDestroyed()||
+      conversationFromUrl(view.webContents.getURL())!==id)return;
+    recordingChat=id;replyTracker.reset();
+    replyTimer=setInterval(()=>{void captureVisibleReply();},2500);
+    replyTimer.unref();void captureVisibleReply();
+  };
+  const inspectCapturedReplies=async()=>{
+    if(owner.isDestroyed())return;
+    try{
+      const latest=(await webReplies.last(12)).at(-1);
+      await dialog.showMessageBox(owner,{
+        type:'info',title:'CoS 本地网页回复记录（仅本机）',
+        message:latest?'最新记录：'+new Date(latest.at).toLocaleString():'尚无已经稳定捕获的助手回复',
+        detail:latest?latest.text.slice(0,1800):
+          '开启记录后仅观察当前 ChatGPT 对话。网页回复需要稳定显示一段时间才被接收。',
+        buttons:['关闭']
+      });
+    }catch{if(!owner.isDestroyed())await dialog.showMessageBox(owner,{
+      type:'error',message:'本地回复记录不安全或已损坏，读取已拒绝。',buttons:['关闭']});}
+  };
+  const manageDurableTasks=async()=>{
+    if(owner.isDestroyed())return;
+    try{
+      const all=await taskLedger.list();
+      const recent=all.slice(-10).reverse();
+      const display=recent.map(t=>t.id.slice(0,8)+' · '+t.phase+' · rev '+t.revision+
+        ' · '+t.goal.slice(0,72)).join('\n');
+      const menu=await dialog.showMessageBox(owner,{
+        type:'question',title:'Web-First 持久任务',
+        message:all.length+' 个本地任务 · 未验证会话身份',
+        detail:(display||'当前没有任务。')+'\n\n重启后中断的任务必须先由你确认恢复；此处不会自动发送 ChatGPT Prompt。',
+        buttons:['关闭','管理最近一项任务'],defaultId:0,cancelId:0,noLink:true
+      });
+      if(menu.response!==1||!recent.length||owner.isDestroyed())return;
+      const task=recent[0]!;
+      const next=await dialog.showMessageBox(owner,{
+        type:'question',title:'任务状态检查与操作',
+        message:task.goal.slice(0,140)+' · '+task.phase,
+        detail:'最近事件：'+(task.events.at(-1)?.kind??'unknown')+
+          '\n请不要把模型报告等同于经验证的成功。',
+        buttons:['返回','批准恢复','确认完成','取消任务'],defaultId:0,cancelId:0,noLink:true
+      });
+      const action=next.response===1?'resume':next.response===2?'complete':
+        next.response===3?'cancel':null;
+      if(action){
+        const result=await taskLedger.nativeDecision(task.id,task.revision,action);
+        if(!owner.isDestroyed())await dialog.showMessageBox(owner,{type:'info',
+          message:'已保存任务状态：'+result.phase,buttons:['关闭']});
+      }
+    }catch{
+      if(!owner.isDestroyed())await dialog.showMessageBox(owner,{type:'error',
+        message:'任务状态或检查点验证失败。已拒绝改变任务，原记录保持不变。',buttons:['关闭']});
+    }
+  };
   const showCoreCatalogue=async()=>{
     if(owner.isDestroyed())return;
     const local=mcpService;
@@ -517,6 +648,9 @@ export function launchNextWebFirstHost(options: {
       {label:'管理/撤销只读授权',click:()=>{void manageReadGrants();}},
       {label:'撤销全部只读授权',click:()=>{void revokeAllReadGrants();}},
       {label:'查看本地操作收据',click:()=>{void showOperations();}},
+      {label:'P3 持久任务与恢复',click:()=>{void manageDurableTasks();}},
+      {label:'开始/停止当前 ChatGPT 回复记录',click:()=>{void toggleReplyCapture();}},
+      {label:'查看已接收的 ChatGPT 最新回复',click:()=>{void inspectCapturedReplies();}},
       {type:'separator'},
       {label:'显示/隐藏项目侧栏',accelerator:'CmdOrCtrl+Shift+P',click:()=>{
         sidebarVisible=!sidebarVisible;resize();
@@ -531,11 +665,11 @@ export function launchNextWebFirstHost(options: {
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(menus));
   resize();
-  const url=offline?'data:text/html;charset=utf-8,'+encodeURIComponent('<!doctype html><html><body><input id="native-smoke-input" style="position:fixed;left:40px;top:40px;height:30px;width:220px"></body></html>'):CHATGPT_START_URL;
+  const url=offline?'data:text/html;charset=utf-8,'+encodeURIComponent('<!doctype html><html><body><input id="native-smoke-input" contenteditable="true" style="position:fixed;left:40px;top:40px;height:30px;width:220px"><article data-message-author-role="assistant" data-message-id="offline-assistant-1">COS_WEBFIRST_OFFLINE_ASSISTANT_REPLY_OK</article></body></html>'):CHATGPT_START_URL;
   void view.webContents.loadURL(url).catch(()=>{
     // 'did-fail-load' owns the error code; never log full URL or auth redirect.
     if(status.state!=='load-failed')status.state='load-failed';
   });
   return {window:owner,status:()=>({...status}),reload:()=>view.webContents.reload(),diagnostics,
-    nativeProjects:()=>projects.list(),enableNativeCore,disableNativeCore,getCorePosture:()=>mcpState};
+    nativeProjects:()=>projects.list(),enableNativeCore,disableNativeCore,getCorePosture:()=>mcpState,snapshotVisibleAssistant};
 }

@@ -4,13 +4,15 @@ import os from 'node:os';
 import path from 'node:path';
 import {WebFirstProjectRegistry} from '../../src/main/next/web-first/project-registry.js';
 import {WebFirstReadAuthority,type ReadAction} from '../../src/main/next/web-first/project-read.js';
+import {WebFirstTaskLedger} from '../../src/main/next/web-first/task-ledger.js';
+import {WebFirstTaskTools} from '../../src/main/next/web-first/task-tools.js';
 import {createWebFirstCoreLoopback} from '../../src/main/next/web-first/core-loopback.js';
 import {readWebFirstLocalToolList,EXPECTED_READ_ONLY_CORE_TOOLS} from '../../src/main/next/web-first/core-catalogue.js';
 import {WebFirstReadGrants} from '../../src/main/next/web-first/read-grants.js';
 import {WebFirstOperationJournal} from '../../src/main/next/web-first/operation-journal.js';
 const paths:string[]=[];
 afterEach(async()=>{for(const name of paths.splice(0))await rm(name,{recursive:true,force:true});});
-async function prepare(allow:ReadAction[]=[]){
+async function prepare(allow:ReadAction[]=[],allowTask=false){
   const temp=await mkdtemp(path.join(os.tmpdir(),'cos-web-first-mcp-'));paths.push(temp);
   await mkdir(path.join(temp,'profile'));await mkdir(path.join(temp,'project'));
   await writeFile(path.join(temp,'project','hello.txt'),'CONTENTS FROM DISPOSABLE FIXTURE');
@@ -19,7 +21,8 @@ async function prepare(allow:ReadAction[]=[]){
   const p=await store.register(path.join(temp,'project'));
   const approvals:ReadAction[]=[];
   const authority=new WebFirstReadAuthority(store,async desc=>{approvals.push(desc.action);return allow.includes(desc.action);});
-  const service=await createWebFirstCoreLoopback(authority);
+  const tasks=new WebFirstTaskTools(new WebFirstTaskLedger(path.join(temp,'profile')),store,async()=>allowTask);
+  const service=await createWebFirstCoreLoopback(authority,undefined,tasks);
   return {temp,service,p,approvals};
 }
 async function rpc(url:string,method:string,name?:string,args?:Record<string,unknown>,meta:Record<string,unknown>={}){
@@ -49,14 +52,46 @@ describe('Web-First read-only MCP over a real owner-controlled loopback socket',
       const tools=r.data.result.tools;
       expect(r.status).toBe(200);
       expect(tools.map((x:{name:string})=>x.name).sort()).toEqual([
-        'identity_diagnostics','project_list','project_ls','project_read','runtime_health']);
-      expect(tools.every((x:{annotations:{readOnlyHint:boolean}})=>x.annotations.readOnlyHint)).toBe(true);
+        'identity_diagnostics','project_list','project_ls','project_read','runtime_health',
+        'task_begin','task_checkpoint','task_finish_request','task_status','task_wait']);
+      expect(tools.find((x:{name:string})=>x.name==='project_read').annotations.readOnlyHint).toBe(true);
+      expect(tools.find((x:{name:string})=>x.name==='task_checkpoint').annotations.readOnlyHint).toBe(false);
       const health=await rpc(service.endpointUrl,'tools/call','runtime_health');
       expect(health.data.result.structuredContent).toMatchObject({
         mcp:'LOCAL_ONLY',identity_verified:false,chatgpt_tool_registry:'NOT_VERIFIED',
-        server_toolset:'web-first-readonly-p2b-v1'
+        server_toolset:'web-first-project-workflow-p3-v1'
       });
       expect(health.data.result.structuredContent.server_tools.sort()).toEqual([...EXPECTED_READ_ONLY_CORE_TOOLS]);
+    }finally{await service.close();}
+  });
+  it('native approval is mandatory for task creation and user cannot claim task completion',async()=>{
+    const {service,p}=await prepare();try{
+      const creation=await rpc(service.endpointUrl,'tools/call','task_begin',{
+        project_id:p.id,goal:'Do not start without a native confirmation'});
+      expect(creation.data.result.isError).toBe(true);
+      expect(JSON.stringify(creation.data)).toContain('NATIVE_TASK_APPROVAL_DENIED');
+    }finally{await service.close();}
+  });
+  it('runs real HTTP task begin, checkpoint, durable waiting and review without auto-completion',async()=>{
+    const {service,p}=await prepare([],true);try{
+      const started=await rpc(service.endpointUrl,'tools/call','task_begin',{
+        project_id:p.id,goal:'Test durable ChatGPT web workflow'});
+      const a=started.data.result.structuredContent.result;
+      expect(a.phase).toBe('active');expect(a.revision).toBe(1);
+      const checkpoint=await rpc(service.endpointUrl,'tools/call','task_checkpoint',{
+        task_id:a.task_id,revision:1,nonce:'mcp-test-checkpoint-1',note:'Observation recorded'});
+      expect(checkpoint.data.result.structuredContent.result.revision).toBe(2);
+      const retry=await rpc(service.endpointUrl,'tools/call','task_checkpoint',{
+        task_id:a.task_id,revision:1,nonce:'mcp-test-checkpoint-1',note:'Observation recorded'});
+      expect(retry.data.result.structuredContent.result.revision).toBe(2);
+      const wait=await rpc(service.endpointUrl,'tools/call','task_wait',{
+        task_id:a.task_id,revision:2,nonce:'mcp-test-wait-001',minutes:null});
+      expect(wait.data.result.structuredContent.result.phase).toBe('waiting');
+      const status=await rpc(service.endpointUrl,'tools/call','task_status',{task_id:a.task_id});
+      expect(status.data.result.structuredContent.result.phase).toBe('waiting');
+      const finished=await rpc(service.endpointUrl,'tools/call','task_finish_request',{
+        task_id:a.task_id,revision:3,nonce:'mcp-test-finish-001',note:'Claimed done'});
+      expect(finished.data.result.isError).toBe(true);
     }finally{await service.close();}
   });
   it('refuses project reads and forged host metadata without actual native approval',async()=>{

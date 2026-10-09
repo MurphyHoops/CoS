@@ -2,6 +2,8 @@
 import {app,Menu} from 'electron';
 import {mkdtempSync,mkdirSync,rmSync} from 'node:fs';
 import {WebFirstProjectRegistry} from './project-registry.js';
+import {WebFirstTaskLedger} from './task-ledger.js';
+import {WebFirstReplyJournal} from './web-reply-observer.js';
 import {WebFirstReadGrants} from './read-grants.js';
 import {WebFirstOperationJournal} from './operation-journal.js';
 import {inspectExistingCredentialProfiles} from './credential-diagnostics.js';
@@ -53,6 +55,14 @@ app.whenReady().then(async()=>{
     process.stdout.write('WEB_FIRST_OFFLINE_GRANT_LIFECYCLE_PASS\n');
     process.stdout.write('WEB_FIRST_OFFLINE_PROJECT_RESTORED\n');
   }
+  // Never auto-continue a task after a crash/restart. User reviews it in
+  // 本地项目 → P3 持久任务与恢复. An invalid ledger fails closed for task tools.
+  try{
+    const held=await new WebFirstTaskLedger(profile).holdInterruptedTasks();
+    if(offlineSmoke)process.stdout.write('WEB_FIRST_OFFLINE_RECOVERY_HOLD='+held+'\n');
+  }catch{
+    if(offlineSmoke)throw Error('WEBFIRST_TASK_RECOVERY_LEDGER_FAILED');
+  }
   let httpsReported=false;
   const smokeTimeout=httpsSmoke?setTimeout(()=>{
     process.stdout.write('WEB_FIRST_HTTPS_TIMEOUT\n'); app.quit();
@@ -96,6 +106,41 @@ app.whenReady().then(async()=>{
       const raw=await response.text();
       if(response.status!==200||!raw.includes('WEBFIRST_LOCAL_MCP_READ_OK'))
         throw Error('WEBFIRST_LOCAL_MCP_SMOKE_FAILED');
+      const taskPayload=(name:string,args:Record<string,unknown>,id:number)=>({
+        jsonrpc:'2.0',id,method:'tools/call',params:{name,arguments:args,
+          _meta:{'io.modelcontextprotocol/protocolVersion':'2026-07-28',
+            'io.modelcontextprotocol/clientCapabilities':{}}}
+      });
+      const taskCall=async(name:string,args:Record<string,unknown>,id:number)=>{
+        const result=await fetch(local.endpointUrl,{method:'POST',headers:{...headers,'Mcp-Name':name},
+          body:JSON.stringify(taskPayload(name,args,id))});
+        if(result.status!==200)throw Error('WEBFIRST_OFFLINE_TASK_RPC_HTTP_FAILED');
+        const text=await result.text();
+        const event=text.startsWith('{')?text:
+          [...text.matchAll(/^data: (\{.*\})$/gm)].at(-1)?.[1];
+        if(!event)throw Error('WEBFIRST_OFFLINE_TASK_RPC_MISSING');
+        const parsed=JSON.parse(event) as {result?:{structuredContent?:{result?:unknown}}};
+        return parsed.result?.structuredContent?.result as {task_id:string;phase:string;revision:number};
+      };
+      const task=await taskCall('task_begin',{project_id:(await host.nativeProjects())[0]?.id,goal:'Offline task fixture only'},21);
+      if(task.phase!=='active'||task.revision!==1)throw Error('WEBFIRST_OFFLINE_TASK_CREATE_FAILED');
+      const saved=await taskCall('task_checkpoint',{task_id:task.task_id,revision:1,
+        nonce:'smoke-checkpoint-1',note:'MCP fixture verified'},22);
+      if(saved.revision!==2)throw Error('WEBFIRST_OFFLINE_TASK_CHECKPOINT_FAILED');
+      const waiting=await taskCall('task_wait',{task_id:task.task_id,revision:2,
+        nonce:'smoke-wait-0001',minutes:null},23);
+      if(waiting.phase!=='waiting')throw Error('WEBFIRST_OFFLINE_TASK_WAIT_FAILED');
+      if((await new WebFirstTaskLedger(profile).get(task.task_id)).phase!=='waiting')
+        throw Error('WEBFIRST_OFFLINE_TASK_PERSIST_FAILED');
+      const visible=await host.snapshotVisibleAssistant();
+      if(visible?.text!=='COS_WEBFIRST_OFFLINE_ASSISTANT_REPLY_OK'||
+        visible?.conversationId!=='offline-synthetic')
+        throw Error('WEBFIRST_OFFLINE_ASSISTANT_RECEIVE_FAILED');
+      await new WebFirstReplyJournal(profile).record(visible);
+      if((await new WebFirstReplyJournal(profile).last(1))[0]?.text!==visible.text)
+        throw Error('WEBFIRST_OFFLINE_ASSISTANT_PERSIST_FAILED');
+      process.stdout.write('WEB_FIRST_OFFLINE_ASSISTANT_RECEIVE_PASS\n');
+      process.stdout.write('WEB_FIRST_OFFLINE_DURABLE_TASK_RPC_PASS\n');
       await host.disableNativeCore();
       process.stdout.write('WEB_FIRST_OFFLINE_LOCAL_MCP_PASS\n');
       if(!projectMenu?.submenu?.items.some(item=>item.label==='管理/撤销只读授权')||

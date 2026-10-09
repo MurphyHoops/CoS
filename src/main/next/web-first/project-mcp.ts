@@ -3,15 +3,17 @@ import {createMcpHandler,McpServer} from '@modelcontextprotocol/server';
 import {z} from 'zod';
 import type {WebFirstReadAuthority} from './project-read.js';
 import type {WebFirstOperationJournal,ProjectOperation} from './operation-journal.js';
+import type {WebFirstTaskTools} from './task-tools.js';
 
 /** Stable local catalogue. ChatGPT's *approved* tool snapshot is independent. */
 export const WEBFIRST_CORE_TOOLS = Object.freeze([
-  'runtime_health','identity_diagnostics','project_list','project_ls','project_read'
+  'runtime_health','identity_diagnostics','project_list','project_ls','project_read',
+  'task_begin','task_status','task_checkpoint','task_wait','task_finish_request'
 ]);
-export const WEBFIRST_CORE_TOOLSET = 'web-first-readonly-p2b-v1';
+export const WEBFIRST_CORE_TOOLSET = 'web-first-project-workflow-p3-v1';
 
 
-export function createWebFirstCoreMcp(authority:WebFirstReadAuthority,journal?:WebFirstOperationJournal){
+export function createWebFirstCoreMcp(authority:WebFirstReadAuthority,journal?:WebFirstOperationJournal,tasks?:WebFirstTaskTools){
   const handler=createMcpHandler(()=>{
     const server=new McpServer({name:'cos-next-webfirst',version:'4.0.0-alpha.1'});
     server.registerTool('runtime_health',{
@@ -63,6 +65,38 @@ export function createWebFirstCoreMcp(authority:WebFirstReadAuthority,journal?:W
     register('project_read','Read max 32 KiB UTF-8 from registered project, with one native approval.',
       {project_id:z.string(),relative_path:z.string()},
       args=>authority.readFile(args.project_id as string,args.relative_path as string));
+    if(tasks){
+      // Public snapshot names and schemas remain stable across live refreshes.
+      // These update only local task metadata, never run code or type into ChatGPT.
+      const taskTool=(name:string,description:string,schema:Record<string,z.ZodTypeAny>,
+        call:(args:Record<string,unknown>)=>Promise<unknown>,readOnly=false)=>{
+        server.registerTool(name,{description,inputSchema:schema,
+          annotations:{readOnlyHint:readOnly,openWorldHint:false,idempotentHint:readOnly}
+        },async(args)=>{
+          try{const result=await call(args);
+            return {content:[{type:'text' as const,text:JSON.stringify(result)}],structuredContent:{result}};
+          }catch(error){
+            const message=error instanceof Error?error.message:'TASK_OPERATION_REJECTED';
+            return {isError:true,content:[{type:'text' as const,
+              text:/^[A-Z_]+$/.test(message)?message:'TASK_OPERATION_REJECTED'}]};
+          }
+        });
+      };
+      taskTool('task_begin','Start durable local task after one native user approval, without using a model API.',
+        {project_id:z.string(),goal:z.string().min(1).max(2000)},
+        a=>tasks.begin(a.project_id as string,a.goal as string));
+      taskTool('task_status','Read the durable task phase and revision. No auto-resume.',
+        {task_id:z.string().uuid()},a=>tasks.status(a.task_id as string),true);
+      taskTool('task_checkpoint','Record reported progress using an exact revision and retry nonce.',
+        {task_id:z.string().uuid(),revision:z.number().int().min(1),nonce:z.string().min(8).max(100),note:z.string().min(1).max(1000)},
+        a=>tasks.checkpoint(a.task_id as string,a.revision as number,a.nonce as string,a.note as string));
+      taskTool('task_wait','Persist a manual or time-bounded wait; does not send a ChatGPT message.',
+        {task_id:z.string().uuid(),revision:z.number().int().min(1),nonce:z.string().min(8).max(100),minutes:z.number().int().min(1).max(10080).nullable()},
+        a=>tasks.wait(a.task_id as string,a.revision as number,a.nonce as string,a.minutes as number|null));
+      taskTool('task_finish_request','Request native operator review; not an automatic success claim.',
+        {task_id:z.string().uuid(),revision:z.number().int().min(1),nonce:z.string().min(8).max(100),note:z.string().min(1).max(1000)},
+        a=>tasks.finishRequest(a.task_id as string,a.revision as number,a.nonce as string,a.note as string));
+    }
     return server;
   });
   return {handler,close:()=>handler.close()};
