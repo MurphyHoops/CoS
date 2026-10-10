@@ -1,5 +1,5 @@
 /** Standalone opt-in P1 preview. Does not import Classic Bridge, Chrome, Codex or inference. */
-import {app,Menu,BrowserWindow,session} from 'electron';
+import {app,Menu,BrowserWindow} from 'electron';
 import {mkdtempSync,mkdirSync,rmSync,appendFileSync} from 'node:fs';
 import {WebFirstProjectRegistry} from './project-registry.js';
 import {WebFirstTaskLedger} from './task-ledger.js';
@@ -10,7 +10,7 @@ import {WebFirstWebOutbox} from './web-outbox.js';
 import {WebFirstRateLimitSupervisor} from './rate-limit-supervisor.js';
 import {sendNativeWebFirstMessage} from './native-web-input.js';
 import {runApprovedWebGoalLoop} from './approved-web-goal-loop.js';
-import {createBackgroundWebComputer} from '../../web-runtime/browser-driver-electron.js';
+import {ElectronWebRuntimeSupervisor} from '../../web-runtime/supervisor.js';
 import {randomUUID,createHash} from 'node:crypto';
 import {WebFirstReadGrants} from './read-grants.js';
 import {WebFirstOperationJournal} from './operation-journal.js';
@@ -237,8 +237,9 @@ app.whenReady().then(async()=>{
       // hidden, non-focusable Electron window, using an isolated throwaway
       // session. Never touches user's Chrome, global keyboard, or profile.
       const frontmostBefore=BrowserWindow.getFocusedWindow()?.id??null;
-      const webComputer=createBackgroundWebComputer({offlineFixture:true,
-        sharedSession:session.fromPartition('cos-web-runtime-offline-'+randomUUID())});
+      const supervisor=new ElectronWebRuntimeSupervisor(
+        path.join(profile,'g2-background-runtime'),true);
+      const webComputer=await supervisor.start();
       try{
         const html='<!doctype html><html><body style="background:#eee">'+
           '<input id="smoke" style="position:absolute;left:60px;top:55px;width:260px;height:40px">'+
@@ -264,7 +265,19 @@ app.whenReady().then(async()=>{
           (BrowserWindow.getFocusedWindow()?.id??null)!==frontmostBefore)
           throw Error('WEB_RUNTIME_BACKGROUND_FOCUS_CHANGED');
         process.stdout.write('WEB_RUNTIME_G2_BACKGROUND_CDPSMOKE_PASS\n');
-      }finally{webComputer.close();}
+      }finally{await supervisor.stop();}
+      if(supervisor.running)throw Error('WEB_RUNTIME_SUPERVISOR_STOP_INCOMPLETE');
+      // A second start must be able to acquire the same Profile again, without
+      // reusing a disposed Window or accidentally taking user application focus.
+      const recycled=await supervisor.start();
+      try{
+        await recycled.open('data:text/html,'+encodeURIComponent(
+          '<html><body><p>Profile Reuse Fixture</p></body></html>'));
+        if(!recycled.isHidden()||
+          (BrowserWindow.getFocusedWindow()?.id??null)!==frontmostBefore)
+          throw Error('WEB_RUNTIME_SUPERVISOR_RESTART_FOCUS_CHANGED');
+        process.stdout.write('WEB_RUNTIME_G2_OWNED_PROFILE_RESTART_PASS\n');
+      }finally{await supervisor.stop();}
 
       // P3.6 packaged integration: true Electron CDP keyboard input into the
       // sandboxed offline browser + durable outbox + task checkpoint + stable

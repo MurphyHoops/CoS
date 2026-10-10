@@ -5,8 +5,8 @@
 ## GATE 状态（按实际证据）
 
 - **G0 PASS**：原 CoS/P3.6 只读审计、干净独立 worktree、8份实施规格、ChatGPT 资料库副本均存在。原始两个 dirty 工作树及安装 App 完全保留。
-- **G1 PASS（初始 transport core）**：新增 contracts.ts、delivery-state.ts、delivery-journal.ts、profile-owner.ts、page-registry.ts；浏览器所有权单写者、持久 WAL、单 Actor 在途、代次路由、SEND_ATTEMPTED/AMBIGUOUS 防重发均有测试。尚无网络/真实账号依赖。
-- **G2 PARTIAL**：复用了此前本地验证的 hidden Electron/CDP 逻辑，独立 ARM64 测试包运行隐藏真实 Chromium 页，截图、点击、输入、Enter、前台 Electron 窗口身份未改变，离线测试 PASS。仍未完成正式 Browser Supervisor 独立进程、连续重启、真正前台 macOS 应用焦点证明、Profile crash recovery。
+- **G1 PASS（初始 transport core）**：新增 contracts.ts、delivery-state.ts、delivery-journal.ts、profile-owner.ts、page-registry.ts、supervisor.ts；浏览器所有权单写者、持久 WAL、单 Actor 在途、代次路由、SEND_ATTEMPTED/AMBIGUOUS 防重发均有测试。尚无网络/真实账号依赖。
+- **G2 PARTIAL（Supervisor 已实现基础生命周期）**：复用以前验证过的 hidden Electron/CDP；新增 ElectronWebRuntimeSupervisor，先独占 ProfileLease、再使用 Electron session.fromPath(profile)，统一负责隐藏窗口、关闭与再次启动。独立 ARM64 包实际通过截图、点击、输入、Enter、Electron 前台窗口身份不变及同一 Profile 的 Stop/Start。仍未完成独立进程跨 App 重启、真正 macOS 前台应用焦点证明、Profile crash recovery。
 - **G3 NOT STARTED**：隔离开发分支尚未对真实 ChatGPT Plus 登录或发消息。
 - **G4 NOT STARTED**：一个共享 Connector、两个 ChatGPT 对话真实 A-B-A 配对未开始。
 - **G5 NOT STARTED**：Classic 完整 UI/Goal/Agent 尚未接 WebRuntimeAdapter。
@@ -17,7 +17,7 @@
 
 - npm run typecheck -> PASS
 - npx vitest run test/web-runtime -> **15 tests PASS**
-- npm run verify:ci（最终文件集合）-> 251 files passed, 14 skipped, 5174 tests passed, 131 skipped；独立 MCP 关闭测试 2/2 PASS；退出码 0。
+- npm run verify:ci（含新增 Supervisor 的最终文件集合）-> 251 files passed, 14 skipped, 5174 tests passed, 131 skipped；独立 MCP 关闭测试 2/2 PASS；退出码 0；记录 /tmp/cos-web-runtime-v1-g2-supervisor-full-ci.log。
 - 原生 bundle: node scripts/build-next-webfirst-runtime.mjs -> PASS。
 - Electron ARM64 package gate: WEB_FIRST_P1_PACKAGE_GATE=PASS、Chrome/Codex 依赖 ABSENT。
 - 打包实际 Electron 离线测试: WEB_RUNTIME_G2_BACKGROUND_CDPSMOKE_PASS；WEB_FIRST_OFFLINE_NATIVE_PAGE_CONTROL_PASS；WEB_FIRST_OFFLINE_APPROVED_WEB_GOAL_LOOP_PASS。
