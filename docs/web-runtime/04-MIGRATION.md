@@ -18,3 +18,7 @@
 迁移顺序：先建无插件 Driver 端口及测试；再用独立 BrowserOwner 验证真实页面；再做 MCP A-B-A；然后接 Classic Goal/Agent；最后双 Worker + 崩溃/限流/Stop/升级，逐项取消旧 Chrome Companion 在 Next 的必选依赖。
 
 绝不把 CCCC 整套 Rust Daemon 和 CoS 内核同时作为任务权威。CCCC 的 Web Runtime 模块是借鉴的运输协议，而不是新的 Mission Store。
+
+## GitHub main v3.1.5 verification supersedes local version labels
+
+Upstream main aa50d8d has same exact goal.ts/agents.ts/browser-control.ts/mcp/tools-browser.ts/extension/browser-control-page.js blobs as local Next 4e204ed, even though package.json in Next says 3.1.16. Keep original main semantics and selectively integrate audited Next fixes to bridge/continuation/input. See 09-UPSTREAM-MAIN-AUDIT-20261010.md.

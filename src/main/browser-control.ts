@@ -13,18 +13,45 @@ interface Pending {
 }
 const uuid = /^[a-f\d-]{36}$/i;
 const tabHandle = /^([a-f\d-]{36}):(\d+)$/i;
+/** Native 3.1.16 browser execution port: same authenticated BrowserTool RPC,
+ * but performed by CoS-owned Chromium, never by Chrome Companion extension.
+ * installNativeExecutor is only called after a separate native-profile lease.
+ */
+export interface NativeBrowserControlExecutor {
+  id: string;
+  name: string;
+  execute(command: BrowserCommand, check: () => Promise<boolean>): Promise<BrowserResult>;
+}
+
 
 export class BrowserControlBroker {
   private epoch = randomUUID();
   private clients = new Map<string, { name: string; seen: number; enabled: boolean }>();
   private pending = new Map<string, Pending>();
+  private nativeExecutor: NativeBrowserControlExecutor | null = null;
 
   constructor(private wake = () => wakeBrowserWork('browser-control')) {}
 
+  installNativeExecutor(executor: NativeBrowserControlExecutor): () => void {
+    if (!uuid.test(executor.id) || !executor.name || this.nativeExecutor)
+      throw new Error('BROWSER_NATIVE_EXECUTOR_INVALID_OR_BUSY');
+    this.nativeExecutor = executor;
+    return () => {
+      if (this.nativeExecutor === executor) {
+        this.nativeExecutor = null;
+        this.epoch = randomUUID(); // Fence all already-claimed native work.
+      }
+    };
+  }
+
   browsers(): Array<{ id: string; name: string; enabled: boolean }> {
     const now = Date.now();
-    return [...this.clients].filter(([, client]) => now - client.seen < BROWSER_LIMITS.presenceMs)
+    const clients = [...this.clients].filter(([, client]) => now - client.seen < BROWSER_LIMITS.presenceMs)
       .map(([id, { name, enabled }]) => ({ id, name, enabled }));
+    if (this.nativeExecutor) clients.push({
+      id: this.nativeExecutor.id, name: this.nativeExecutor.name, enabled: true
+    });
+    return clients;
   }
 
   poll(browserId: string, name: string, enabled: boolean): { epoch: string; requests: string[] } {
@@ -84,6 +111,33 @@ export class BrowserControlBroker {
     const client = browsers.find(b => b.id === browserId);
     if (!client) return { error: 'BROWSER_OFFLINE: this browser incarnation is no longer connected. List browsers again.' };
     if (!client.enabled) return { error: 'BROWSER_EXTENSION_PERMISSION: Chrome must grant the companion its debugger and tabs permissions. Reload/update the extension.' };
+    if (this.nativeExecutor?.id === browserId) {
+      const native = this.nativeExecutor, epoch = this.epoch;
+      const command: BrowserCommand = {
+        id:randomUUID(),epoch,owner,conversationId,tool,args,
+        expiresAt:Date.now()+BROWSER_LIMITS.timeoutMs
+      };
+      const check = async () => this.nativeExecutor === native &&
+        this.epoch === epoch && command.expiresAt > Date.now() &&
+        await allowed().catch(() => false);
+      if (!await check()) return {error:'BROWSER_PERMISSION_REVOKED: native command was not dispatched.'};
+      // A settled DOM/CDP command and timeout are not interchangeable. Never
+      // automatically retry an operation whose browser action was attempted.
+      const result = await Promise.race([
+        native.execute(command,check).catch(():BrowserResult => ({
+          error:'BROWSER_NATIVE_UNCONFIRMED: executor failed; inspect before repeating input.'
+        })),
+        new Promise<BrowserResult>(resolve => {
+          const delay=Math.max(1,command.expiresAt-Date.now());
+          const timer=setTimeout(() => resolve({error:
+            'BROWSER_RESULT_UNCONFIRMED: native executor timed out after claim; inspect before retry.'}),delay);
+          timer.unref?.();
+        })
+      ]);
+      if (Buffer.byteLength(JSON.stringify(result),'utf8') > BROWSER_LIMITS.resultBytes)
+        return {error:'BROWSER_RESULT_TOO_LARGE: native result may have completed.'};
+      return result;
+    }
     if (this.pending.size >= BROWSER_LIMITS.pending) return { error: 'BROWSER_BUSY: too many pending requests; no operation was dispatched.' };
     delete args.browserId;
     const id = randomUUID();
@@ -108,6 +162,9 @@ export class BrowserControlBroker {
       ? 'BROWSER_RESULT_UNCONFIRMED: bridge stopped after dispatch. Inspect before repeating the operation.'
       : 'BROWSER_NOT_DISPATCHED: bridge stopped.' });
     this.clients.clear(); this.epoch = randomUUID();
+    // The local BrowserOwner is explicit and retained until shutdown, but all
+    // existing native claims use the previous epoch and cannot dispatch more.
+
   }
 }
 

@@ -71,3 +71,45 @@
 - Included Apache-2.0 license resource; app.asar SHA-256
   fdcf40cda16477f7b29ed9368b6a7ea67259b82afcab43f7f442580a51086a1a.
 - No real ChatGPT account operations, no Classic Goal integration or installer replacement.
+
+## Authoritative version correction
+
+Remote GitHub CoS main = aa50d8d, official source version 3.1.5. Next local descendant = 4e204ed version field 3.1.16, not remote main; ~/Documents/CoS checkout = 3.1.2 (dirty). Original Goal/Agent/BrowserControl/MCP/extension browserPage byte-identical between main and 4e204ed. See 09-UPSTREAM-MAIN-AUDIT-20261010.md. New native broker adapter is still G2 offline only, not active in production or a full Goal flow.
+
+## 2026-10-10 upstream-main correction and native broker G2 milestone
+
+Remote main SHA aa50d8d, package version 3.1.5, is the upstream source
+authority. Local Next 3.1.16 is a descendant, not a published/main version.
+Verified exact Git blob identity for goal.ts, agents.ts,
+browser-control.ts, mcp/tools-browser.ts, extension/browser-control-page.js
+across remote main and local Next commit 4e204ed.
+
+Added optional native execution port directly to the original CoS
+BrowserControlBroker, and vendored the byte-identical original browserPage
+DOM implementation. An isolated packaged Electron offline fixture proves
+Classic browser_tabs -> snapshot -> browser_action(click) ->
+browser_evaluate result with permission revocation/cross-worker rejection.
+This is G2, NOT production Classic App/real ChatGPT acceptance. The current
+installed P3.6 preview has not been replaced and no user profile was modified.
+
+Exact latest verification:
+- npm run verify:ci: 253 files/5182 tests passed, 14 files/131 skipped,
+  independent MCP shutdown 2/2 passed, exit 0.
+- packaged Electron ARM64: WEB_FIRST_P1_PACKAGE_GATE=PASS,
+  WEB_FIRST_LEGACY_CHROME_AND_CODEX_DEPENDENCY=ABSENT.
+- WEB_RUNTIME_G2_BACKGROUND_CDPSMOKE_PASS,
+  WEB_RUNTIME_G2_OWNED_PROFILE_RESTART_PASS,
+  WEB_RUNTIME_CCCC_UPSTREAM_REAL_CHROMIUM_PASS,
+  WEB_RUNTIME_CCCC_NO_REPLAY_PASS,
+  WEB_RUNTIME_CCCC_AMBIGUOUS_HOLD_PASS,
+  WEB_RUNTIME_CLASSIC316_NATIVE_BROKER_PASS,
+  WEB_FIRST_OFFLINE_APPROVED_WEB_GOAL_LOOP_PASS;
+  offline binary exit 0.
+- packaged app.asar SHA256: 8bbb998b15dc2307f39402302b2db2a7c2079dbf7e86b4049e56de0eed20abda.
+- logs /tmp/cos-web-runtime-main-audit-full-ci.log and
+  /tmp/cos-main-audit-packaged-smoke.log.
+
+Next incomplete steps remain separate: enable native executor in guarded
+Classic startup; integrate real multi-Page actor ownership and shared MCP
+pairing; real website turn/ACK; real Goal/Agent and failure recovery.
+Do not claim G3+ PASS.

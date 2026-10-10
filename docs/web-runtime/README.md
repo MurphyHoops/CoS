@@ -13,6 +13,8 @@
 5. [05-ACCEPTANCE.md](05-ACCEPTANCE.md) — 真实验收、故障注入、发布与回滚。
 6. [06-SOURCE-AUDIT.md](06-SOURCE-AUDIT.md) — CCCC 与轻量项目的源码证据与取舍。
 7. [07-STATE.md](07-STATE.md) — 每次开发更新的唯一交接状态。
-8. [08-VALIDATION-20261010.md](08-VALIDATION-20261010.md) — 本轮 Git/TypeScript/Vitest/打包 Electron 证据。
+8. [08-VALIDATION-20261010.md](08-VALIDATION-20261010.md) — 本轮 Git/TypeScript/Vitest/打包 Electron 证据。\n9. [09-UPSTREAM-MAIN-AUDIT-20261010.md](09-UPSTREAM-MAIN-AUDIT-20261010.md) — 当前远端 main 3.1.5 与本地 Next 3.1.16 的真实 Git 对比。
 
 这是 Git 版本化权威规格；ChatGPT 资料库另存面向多对话阅读的整合副本。调整协议必须同时更新测试、规格和开发状态。实验不能代替实机验收。
+
+**Authoritative origin:** remote CoS main at aa50d8d (version 3.1.5). The local Next 3.1.16 tree is a descendant/experimental derivative. See 09-UPSTREAM-MAIN-AUDIT-20261010.md for verified file blob comparison; do NOT use the local version string as authority.

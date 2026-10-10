@@ -11,6 +11,8 @@ import {WebFirstRateLimitSupervisor} from './rate-limit-supervisor.js';
 import {sendNativeWebFirstMessage} from './native-web-input.js';
 import {runApprovedWebGoalLoop} from './approved-web-goal-loop.js';
 import {ElectronWebRuntimeSupervisor} from '../../web-runtime/supervisor.js';
+import {BrowserControlBroker} from '../../browser-control.js';
+import {NativeClassic316BrowserExecutor} from '../../web-runtime/classic316-browser-executor.js';
 import {ActorPageRegistry} from '../../web-runtime/page-registry.js';
 import {DeliveryJournal} from '../../web-runtime/delivery-journal.js';
 import {ChatGPTWebsiteDelivery} from '../../web-runtime/chatgpt-website-delivery.js';
@@ -368,6 +370,64 @@ app.whenReady().then(async()=>{
           throw Error('WEB_RUNTIME_CCCC_BACKGROUND_FOCUS_CHANGED');
         process.stdout.write('WEB_RUNTIME_CCCC_UPSTREAM_REAL_CHROMIUM_PASS\n');
       }finally{await ccccSupervisor.stop();}
+
+
+      // Native Chrome-extension-free execution of the EXISTING CoS 3.1.16
+      // BrowserControlBroker + original 3.1.16 browser-control-page.js refs.
+      // Same browser_* RPC as Classic MCP, not a new/parallel tool contract.
+      const classicBrowserSupervisor=new ElectronWebRuntimeSupervisor(
+        path.join(profile,'g2-classic316-browser'),true);
+      const classicComputer=await classicBrowserSupervisor.start();
+      const classicBroker=new BrowserControlBroker(()=>{});
+      const detachClassic=classicBroker.installNativeExecutor(
+        new NativeClassic316BrowserExecutor(classicComputer,true));
+      try{
+        const html='<!doctype html><html><body><h1>CoS v3.1.16</h1>'+
+          '<button id="native-click" style="position:absolute;top:100px;left:80px;'+
+          'width:220px;height:55px">Run native browser action</button>'+
+          '<output id="native-output">idle</output>'+
+          '<script>document.querySelector("#native-click").onclick=()=>{'+
+          'document.querySelector("#native-output").textContent="clicked";};</script>'+
+          '</body></html>';
+        const result=await classicBroker.execute('browser_tabs',
+          {action:'new',url:'data:text/html,'+encodeURIComponent(html)},
+          'session:classic-fixture',null,async()=>true);
+        const tabId=(result.value as {tabId?:string}|undefined)?.tabId;
+        if(!tabId)throw Error('WEB_RUNTIME_CLASSIC316_TAB_NOT_CREATED');
+        const observation=await classicBroker.execute('browser_snapshot',
+          {tabId,maxNodes:150,maxChars:8000},
+          'session:classic-fixture',null,async()=>true);
+        const snapshot=observation.value as {text?:string;pageId?:string}|undefined;
+        const match=snapshot?.text?.match(/\[([^\]]+)\] button "Run native browser action"/);
+        if(!match?.[1]||!snapshot?.pageId)
+          throw Error('WEB_RUNTIME_CLASSIC316_SNAPSHOT_FAILED');
+        const action=await classicBroker.execute('browser_action',
+          {tabId,pageId:snapshot.pageId,action:'click',ref:match[1]},
+          'session:classic-fixture',null,async()=>true);
+        if(action.error)throw Error('WEB_RUNTIME_CLASSIC316_CDP_CLICK_'+action.error);
+        const read=await classicBroker.execute('browser_evaluate',
+          {tabId,pageId:snapshot.pageId,expression:
+            'document.querySelector("#native-output").textContent'},
+          'session:classic-fixture',null,async()=>true);
+        if((read.value as {value?:unknown}|undefined)?.value!=='clicked')
+          throw Error('WEB_RUNTIME_CLASSIC316_CLICK_UNVERIFIED');
+        const deny=await classicBroker.execute('browser_action',
+          {tabId,pageId:snapshot.pageId,action:'click',ref:match[1]},
+          'session:classic-fixture',null,async()=>false);
+        if(!deny.error?.includes('PERMISSION_REVOKED'))
+          throw Error('WEB_RUNTIME_CLASSIC316_REVOKED_ACTION_ALLOWED');
+        const stranger=await classicBroker.execute('browser_action',
+          {tabId,pageId:snapshot.pageId,action:'click',ref:match[1]},
+          'session:other-worker',null,async()=>true);
+        if(!stranger.error?.includes('TAB_NOT_OWNED'))
+          throw Error('WEB_RUNTIME_CLASSIC316_CROSS_WORKER_ALLOWED');
+        if(!classicComputer.isHidden()||
+          (BrowserWindow.getFocusedWindow()?.id??null)!==frontmostBefore)
+          throw Error('WEB_RUNTIME_CLASSIC316_FOCUS_STOLEN');
+        process.stdout.write('WEB_RUNTIME_CLASSIC316_NATIVE_BROKER_PASS\n');
+      }finally{
+        detachClassic();classicBroker.reset();await classicBrowserSupervisor.stop();
+      }
 
       // P3.6 packaged integration: true Electron CDP keyboard input into the
       // sandboxed offline browser + durable outbox + task checkpoint + stable

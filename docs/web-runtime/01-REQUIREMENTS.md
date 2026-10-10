@@ -27,3 +27,7 @@
 ## Done 的严格定义
 
 不需要 Chrome 扩展安装；App 连续五次升级保留登录 Profile；独立后台网页实测不抢桌面；一条完整的旧版 Goal→真实 ChatGPT 网页→MCP 工具→checkpoint→finish 流程成功；两个真实独立 Worker 不串线；Stop、429、网络断连、重启后不重复副作用；App 安装、设置、Git/GitHub/MCP 的旧功能通过对照清单。
+
+## Source of truth correction 2026-10-10
+
+Original CoS main: aa50d8d, app 3.1.5. Local Next derivative: 3.1.16 at 4e204ed. Goal/Agent/browser-control/browser-MCP/legacy page engine are byte-identical at both commits. Main is the upstream authority; later local changes must be separately audited, not silently discarded or declared official.
