@@ -6,7 +6,7 @@
 
 - **G0 PASS**：原 CoS/P3.6 只读审计、干净独立 worktree、8份实施规格、ChatGPT 资料库副本均存在。原始两个 dirty 工作树及安装 App 完全保留。
 - **G1 PASS（初始 transport core）**：新增 contracts.ts、delivery-state.ts、delivery-journal.ts、profile-owner.ts、page-registry.ts、supervisor.ts；浏览器所有权单写者、持久 WAL、单 Actor 在途、代次路由、SEND_ATTEMPTED/AMBIGUOUS 防重发均有测试。尚无网络/真实账号依赖。
-- **G2 PARTIAL（Supervisor 已实现基础生命周期）**：复用以前验证过的 hidden Electron/CDP；新增 ElectronWebRuntimeSupervisor，先独占 ProfileLease、再使用 Electron session.fromPath(profile)，统一负责隐藏窗口、关闭与再次启动。独立 ARM64 包实际通过截图、点击、输入、Enter、Electron 前台窗口身份不变及同一 Profile 的 Stop/Start。仍未完成独立进程跨 App 重启、真正 macOS 前台应用焦点证明、Profile crash recovery。
+- **G2 PARTIAL（Supervisor 生命周期 + CCCC 原始脚本真实调用）**：复用以前验证过的 hidden Electron/CDP；新增 ElectronWebRuntimeSupervisor，先独占 ProfileLease、再使用 Electron session.fromPath(profile)，统一负责隐藏窗口、关闭与再次启动。独立 ARM64 包实际通过截图、点击、输入、Enter、Electron 前台窗口身份不变及同一 Profile 的 Stop/Start。仍未完成独立进程跨 App 重启、真正 macOS 前台应用焦点证明、Profile crash recovery。
 - **G3 NOT STARTED**：隔离开发分支尚未对真实 ChatGPT Plus 登录或发消息。
 - **G4 NOT STARTED**：一个共享 Connector、两个 ChatGPT 对话真实 A-B-A 配对未开始。
 - **G5 NOT STARTED**：Classic 完整 UI/Goal/Agent 尚未接 WebRuntimeAdapter。
@@ -38,3 +38,36 @@
 5. 再引入共享 MCP Conversation Pairing 和 Classic Goal/Agent Adapter，不建立第二套任务权威。
 
 **硬红线**：不安装 Chrome 插件、不用 Codex/API 模型推理、不借助 stealth/反检测、不冒用或跨 Worker 权限、不重试未知投递、不删除原用户资料、不以模拟测试声称网页或多 Worker 已完成。
+
+
+## 2026-10-10 direct CCCC source reuse
+
+- Vendor: src/main/web-runtime/vendor/cccc-webpage-probes.ts includes 3
+  verbatim embedded JavaScript callbacks from CCCC commit 561d94f,
+  provenance hashes and packaged Apache-2.0 license.
+- src/main/web-runtime/chatgpt-website-delivery.ts directly executes the
+  upstream inspect/send-control JS on owned Chromium, adds 2026 user-bubble
+  proof + Actor Target fence + fsynced WAL + no replay.
+- 19/19 focused Web Runtime tests passed; packaged synthetic Chromium:
+  WEB_RUNTIME_CCCC_UPSTREAM_REAL_CHROMIUM_PASS,
+  WEB_RUNTIME_CCCC_NO_REPLAY_PASS, WEB_RUNTIME_CCCC_AMBIGUOUS_HOLD_PASS.
+- G3 real ChatGPT Plus webpage, G4 trusted MCP pairing, G5 Classic UI/Goal
+  migration, multiworker and crash/429 hardening still NOT PROVEN.
+
+
+## Final verified direct source reuse (2026-10-10)
+
+- Exactly CCCC SHA 561d94f three verbatim browser JS routines (SHA in vendor/PROVENANCE.md).
+- npm run typecheck PASS; Web Runtime focused 19/19 PASS.
+- Full npm run verify:ci -> 252 test files PASS, 14 skipped; 5178 tests PASS,
+  131 skipped; separate MCP shutdown 2/2 PASS; exit 0.
+  Log: /tmp/cos-web-runtime-cccc-direct-ci.log.
+- Exact packaged ARM64 Electron: WEB_FIRST_P1_PACKAGE_GATE=PASS,
+  no legacy Chrome/Codex bundle dependency,
+  WEB_RUNTIME_CCCC_UPSTREAM_REAL_CHROMIUM_PASS,
+  WEB_RUNTIME_CCCC_NO_REPLAY_PASS,
+  WEB_RUNTIME_CCCC_AMBIGUOUS_HOLD_PASS.
+  Log: /tmp/cos-cccc-direct-final-smoke.log.
+- Included Apache-2.0 license resource; app.asar SHA-256
+  fdcf40cda16477f7b29ed9368b6a7ea67259b82afcab43f7f442580a51086a1a.
+- No real ChatGPT account operations, no Classic Goal integration or installer replacement.

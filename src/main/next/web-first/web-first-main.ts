@@ -11,6 +11,9 @@ import {WebFirstRateLimitSupervisor} from './rate-limit-supervisor.js';
 import {sendNativeWebFirstMessage} from './native-web-input.js';
 import {runApprovedWebGoalLoop} from './approved-web-goal-loop.js';
 import {ElectronWebRuntimeSupervisor} from '../../web-runtime/supervisor.js';
+import {ActorPageRegistry} from '../../web-runtime/page-registry.js';
+import {DeliveryJournal} from '../../web-runtime/delivery-journal.js';
+import {ChatGPTWebsiteDelivery} from '../../web-runtime/chatgpt-website-delivery.js';
 import {randomUUID,createHash} from 'node:crypto';
 import {WebFirstReadGrants} from './read-grants.js';
 import {WebFirstOperationJournal} from './operation-journal.js';
@@ -278,6 +281,93 @@ app.whenReady().then(async()=>{
           throw Error('WEB_RUNTIME_SUPERVISOR_RESTART_FOCUS_CHANGED');
         process.stdout.write('WEB_RUNTIME_G2_OWNED_PROFILE_RESTART_PASS\n');
       }finally{await supervisor.stop();}
+
+      // Direct upstream CCCC JavaScript (Apache-2.0), executed inside REAL
+      // packaged Chromium via the new CoS adapter and durable delivery journal.
+      // Synthetic ChatGPT DOM; absolutely no account, token or model request.
+      const ccccSupervisor=new ElectronWebRuntimeSupervisor(
+        path.join(profile,'g2-cccc-vendor'),true);
+      const ccccComputer=await ccccSupervisor.start();
+      try{
+        const ccccHtml='<!doctype html><html><body>'+
+          '<main><form><textarea id="prompt-textarea" '+
+          'style="position:absolute;left:60px;top:55px;width:340px;height:55px"></textarea>'+
+          '<button id="composer-submit-button" data-testid="send-button" type="button" '+
+          'style="position:absolute;left:420px;top:55px;width:100px;height:55px">Send</button>'+
+          '</form></main><section data-chatgpt-conversation-selection-target="true">'+
+          '<div data-turn-key="fixture-user"><div data-chatgpt-search-unit-key="fixture:user">'+
+          '<div data-user-message-bubble id="receipt"></div></div></div></section>'+
+          '<script>document.querySelector("#composer-submit-button").addEventListener('+
+          '"click",()=>{window.__coSsendCount=(window.__coSsendCount||0)+1;'+
+          'document.querySelector("#receipt").textContent='+
+          'document.querySelector("#prompt-textarea").value;'+
+          'document.querySelector("#prompt-textarea").value="";});</script>'+
+          '</body></html>';
+        await ccccComputer.open('data:text/html,'+encodeURIComponent(ccccHtml));
+        const ccccRegistry=new ActorPageRegistry();
+        const ccccConversation=randomUUID();
+        ccccRegistry.install({actorId:'builder-fixture',actorGeneration:1,
+          bindingRevision:1,conversationId:ccccConversation,
+          pageTargetId:'electron-'+ccccComputer.webContents.id,
+          connectorIdentityDigest:'f'.repeat(64),verifiedAt:Date.now()});
+        const ccccJournal=new DeliveryJournal(path.join(profile,'g2-cccc-delivery'));
+        const ccccPrompt='CCCC direct copied JS verified in CoS';
+        const ccccEnvelope={missionId:randomUUID(),actorId:'builder-fixture',
+          actorGeneration:1,turnId:randomUUID(),deliveryId:randomUUID(),
+          bindingRevision:1,conversationId:ccccConversation,
+          payloadDigest:createHash('sha256').update(ccccPrompt).digest('hex'),
+          payload:ccccPrompt,deadlineMs:Date.now()+120_000,
+          capabilityScope:'read-only-fixture'};
+        const ccccReceipt=await new ChatGPTWebsiteDelivery(
+          ccccRegistry,ccccJournal).submit(ccccEnvelope,ccccComputer,
+          {offlineFixture:true,maxProbeMs:4000});
+        if(ccccReceipt.phase!=='ACCEPTED'||
+          ccccReceipt.evidence!=='EXACT_USER_ECHO')
+          throw Error('WEB_RUNTIME_CCCC_VENDOR_PROBE_FAILED_'+ccccReceipt.phase);
+        const ccccRows=await new DeliveryJournal(
+          path.join(profile,'g2-cccc-delivery')).list();
+        if(ccccRows.length!==1||ccccRows[0]?.phase!=='ACCEPTED'||
+          ccccRows[0]?.revision!==5)
+          throw Error('WEB_RUNTIME_CCCC_DURABLE_RECEIPT_FAILED');
+        // Replaying the same acknowledged delivery may *never* click Send
+        // a second time; this is guaranteed by the journal's exact ID fence.
+        let rejectedReplay=false;
+        try{await new ChatGPTWebsiteDelivery(ccccRegistry,ccccJournal)
+          .submit(ccccEnvelope,ccccComputer,{offlineFixture:true,maxProbeMs:100});}
+        catch{rejectedReplay=true;}
+        const afterReplayCount:unknown=await ccccComputer.webContents.executeJavaScript(
+          'window.__coSsendCount',true);
+        if(!rejectedReplay||afterReplayCount!==1)
+          throw Error('WEB_RUNTIME_CCCC_DUPLICATE_SEND_ALLOWED');
+        process.stdout.write('WEB_RUNTIME_CCCC_NO_REPLAY_PASS\n');
+        // Browser click without a proved user-message echo is NOT success.
+        // Use a new Actor on this owned target, so the original accepted
+        // delivery stays immutable even under the next missing-ACK scenario.
+        ccccRegistry.disconnect('builder-fixture',1,1);
+        await ccccComputer.open('data:text/html,'+encodeURIComponent(
+          ccccHtml.replace(
+            'document.querySelector("#receipt").textContent='+
+              'document.querySelector("#prompt-textarea").value;',
+            'void 0;')));
+        ccccRegistry.install({actorId:'auditor-fixture',actorGeneration:1,
+          bindingRevision:1,conversationId:randomUUID(),
+          pageTargetId:'electron-'+ccccComputer.webContents.id,
+          connectorIdentityDigest:'f'.repeat(64),verifiedAt:Date.now()});
+        const auditor=ccccRegistry.lookup('auditor-fixture');
+        if(!auditor)throw Error('WEB_RUNTIME_CCCC_AUDITOR_BIND_FAILED');
+        const ambiguousEnvelope={...ccccEnvelope,actorId:'auditor-fixture',
+          conversationId:auditor.conversationId,deliveryId:randomUUID(),turnId:randomUUID()};
+        const ambiguous=await new ChatGPTWebsiteDelivery(ccccRegistry,ccccJournal)
+          .submit(ambiguousEnvelope,ccccComputer,{offlineFixture:true,maxProbeMs:200});
+        if(ambiguous.phase!=='AMBIGUOUS'||(await ccccJournal.list())
+          .find(row=>row.deliveryId===ambiguousEnvelope.deliveryId)?.phase!=='AMBIGUOUS')
+          throw Error('WEB_RUNTIME_CCCC_MISSING_ECHO_NOT_HELD');
+        process.stdout.write('WEB_RUNTIME_CCCC_AMBIGUOUS_HOLD_PASS\n');
+        if(!ccccComputer.isHidden()||
+          (BrowserWindow.getFocusedWindow()?.id??null)!==frontmostBefore)
+          throw Error('WEB_RUNTIME_CCCC_BACKGROUND_FOCUS_CHANGED');
+        process.stdout.write('WEB_RUNTIME_CCCC_UPSTREAM_REAL_CHROMIUM_PASS\n');
+      }finally{await ccccSupervisor.stop();}
 
       // P3.6 packaged integration: true Electron CDP keyboard input into the
       // sandboxed offline browser + durable outbox + task checkpoint + stable

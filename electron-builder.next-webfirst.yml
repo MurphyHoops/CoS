@@ -25,4 +25,6 @@ mac:
     - from: resources/packaging/tunnel/darwin/${arch}
       to: tunnel
       filter: ['tunnel-client']
+    - from: src/main/web-runtime/vendor/cccc-LICENSE.txt
+      to: licenses/CCCC-Apache-2.0.txt
   category: public.app-category.developer-tools

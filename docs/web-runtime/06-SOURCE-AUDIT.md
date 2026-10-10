@@ -26,3 +26,23 @@
 可借鉴小型持久 Daemon/健康检查和 CLI smoke。**不能复制** headless:false、page.bringToFront、Stealth/反检测、单 Page 串行架构、旧版 DOM 选择器或未经授权的 RUN/FILE shell 执行。
 
 两个项目都不是官方无限 ChatGPT 网页 API；账号、页面变化、反自动化限制及正常使用限额属于实际验收风险。复制代码须满足许可证；CoS 优先自主实现架构思想。
+
+
+## 2026-10-10 actual upstream SOURCE REUSE (not just design inspiration)
+
+Directly vendored three verbatim embedded JS callback source strings from
+CCCC commit 561d94f in src/main/web-runtime/vendor/cccc-webpage-probes.ts.
+See vendor/PROVENANCE.md for per-script SHA256 and exact source lines;
+vendor/cccc-LICENSE.txt preserves full upstream Apache-2.0 terms.
+The packaged macOS binary includes licenses/CCCC-Apache-2.0.txt.
+
+CoS src/main/web-runtime/chatgpt-website-delivery.ts CALLS the unchanged
+INSPECT_SUBMISSION_SCRIPT and SELECT_SEND_CONTROL_SCRIPT on the owned
+Chromium page. REQUEST_SUBMIT_SCRIPT was directly copied but NOT invoked:
+an unguarded fallback could submit an unrelated draft.
+CoS adds independent modern-2026 DOM user role detection, exact Actor/Target
+fencing, a durable SEND_ATTEMPTED fence and read-only response verification.
+It never treats assistant-quoted markers or generic page text as user ACKs.
+
+chatgpt-browser-agent remains design/reference only: no stealth, unsafe
+text-to-shell execution, frontend takeover or old DOM selectors are copied.
