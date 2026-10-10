@@ -1,5 +1,5 @@
 /** Standalone opt-in P1 preview. Does not import Classic Bridge, Chrome, Codex or inference. */
-import {app,Menu} from 'electron';
+import {app,Menu,BrowserWindow,session} from 'electron';
 import {mkdtempSync,mkdirSync,rmSync,appendFileSync} from 'node:fs';
 import {WebFirstProjectRegistry} from './project-registry.js';
 import {WebFirstTaskLedger} from './task-ledger.js';
@@ -10,6 +10,7 @@ import {WebFirstWebOutbox} from './web-outbox.js';
 import {WebFirstRateLimitSupervisor} from './rate-limit-supervisor.js';
 import {sendNativeWebFirstMessage} from './native-web-input.js';
 import {runApprovedWebGoalLoop} from './approved-web-goal-loop.js';
+import {createBackgroundWebComputer} from '../../web-runtime/browser-driver-electron.js';
 import {randomUUID,createHash} from 'node:crypto';
 import {WebFirstReadGrants} from './read-grants.js';
 import {WebFirstOperationJournal} from './operation-journal.js';
@@ -231,6 +232,40 @@ app.whenReady().then(async()=>{
       if(!await host.testNativePageControlsOffline?.())
         throw Error('WEBFIRST_OFFLINE_NATIVE_PAGE_CONTROL_PROBE_FAILED');
       process.stdout.write('WEB_FIRST_OFFLINE_NATIVE_PAGE_CONTROL_PASS\n');
+
+      // Browser runtime G2: genuine Chromium CDP operation inside an OWNED,
+      // hidden, non-focusable Electron window, using an isolated throwaway
+      // session. Never touches user's Chrome, global keyboard, or profile.
+      const frontmostBefore=BrowserWindow.getFocusedWindow()?.id??null;
+      const webComputer=createBackgroundWebComputer({offlineFixture:true,
+        sharedSession:session.fromPartition('cos-web-runtime-offline-'+randomUUID())});
+      try{
+        const html='<!doctype html><html><body style="background:#eee">'+
+          '<input id="smoke" style="position:absolute;left:60px;top:55px;width:260px;height:40px">'+
+          '<output id="result"></output>'+
+          '<script>document.querySelector("#smoke").addEventListener("keydown",e=>{'+
+          'if(e.key==="Enter")document.querySelector("#result").textContent='+
+          'document.querySelector("#smoke").value;});</script>'+
+          '</body></html>';
+        await webComputer.open('data:text/html,'+encodeURIComponent(html));
+        if(!webComputer.isHidden())throw Error('WEB_RUNTIME_BACKGROUND_FOCUS');
+        const png=await webComputer.screenshot();
+        if(png.length<256)throw Error('WEB_RUNTIME_SCREENSHOT_EMPTY');
+        await webComputer.action({kind:'click',x:120,y:70});
+        await webComputer.action({kind:'type',text:'COS_WEB_RUNTIME_G2_OK'});
+        if((await webComputer.webContents.executeJavaScript(
+            'document.querySelector("#smoke").value',true))!=='COS_WEB_RUNTIME_G2_OK')
+          throw Error('WEB_RUNTIME_BACKGROUND_INPUT_MISSING');
+        await webComputer.action({kind:'key',key:'Enter'});
+        if((await webComputer.webContents.executeJavaScript(
+            'document.querySelector("#result").textContent',true))!=='COS_WEB_RUNTIME_G2_OK')
+          throw Error('WEB_RUNTIME_BACKGROUND_SUBMIT_MISSING');
+        if(!webComputer.isHidden()||
+          (BrowserWindow.getFocusedWindow()?.id??null)!==frontmostBefore)
+          throw Error('WEB_RUNTIME_BACKGROUND_FOCUS_CHANGED');
+        process.stdout.write('WEB_RUNTIME_G2_BACKGROUND_CDPSMOKE_PASS\n');
+      }finally{webComputer.close();}
+
       // P3.6 packaged integration: true Electron CDP keyboard input into the
       // sandboxed offline browser + durable outbox + task checkpoint + stable
       // reply settle. No remote model, Codex or user account is involved.
