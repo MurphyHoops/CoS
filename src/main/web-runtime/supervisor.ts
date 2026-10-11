@@ -21,6 +21,10 @@ export class ElectronWebRuntimeSupervisor {
     if(!path.isAbsolute(root)||root.includes('\0'))throw Error('WEB_SUPERVISOR_ROOT_INVALID');
     this.profilePath=path.join(root,'profile');
   }
+  get ownedSession():Session {
+    if(!this.running||!this.browserSession)throw Error('WEB_SUPERVISOR_NOT_RUNNING');
+    return this.browserSession;
+  }
   get running():boolean{return this.owner!==null&&this.browserSession!==null&&this.pages.size>0;}
   async start():Promise<BackgroundWebComputer>{
     if(this.running||this.busy)throw Error('WEB_SUPERVISOR_ALREADY_RUNNING');

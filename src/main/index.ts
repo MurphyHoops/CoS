@@ -73,6 +73,9 @@ import { browserWindowIconPath } from './window-icon.js';
 import { classicControlPermitted, classicTestTransportDisabled, startClassicTestControl } from './next/runtime/classic-test-control.js';
 import { liveControlPermitted, startClassicLiveControl } from './next/runtime/classic-live-control.js';
 import { editContextMenuTemplate } from './edit-context-menu.js';
+import { isOwnedWebContents } from './web-runtime/owned-contents.js';
+import {realAccountSmoke} from './web-runtime/real-account-smoke.js';
+import { startClassicNativeWebRuntime, stopClassicNativeWebRuntime, showClassicNativeLogin, cancelClassicNativeLogin, onClassicNativeStatusChange, classicNativeWebHealth, showNativeBrowserForVerification, openClassicNativeConversation } from './web-runtime/classic-native-runtime.js';
 
 
 let window: BrowserWindow | null = null;
@@ -80,10 +83,26 @@ let tray: Tray | null = null;
 let quitting = false;
 let shutdownStarted = false;
 let shutdownComplete = false;
+let nativeSmokeActive = false;
+let nativeSmokeStatus = 'NOT_CHECKED';
+async function runOperatorNativeSmoke(mode:'probe'|'send'):Promise<void>{
+  if(nativeSmokeActive||classicNativeWebHealth()!=='READY')return;
+  nativeSmokeActive=true;
+  refreshTray();
+  try{
+    const result=await realAccountSmoke(mode);
+    nativeSmokeStatus=result.phase;
+    logInfo('NEXT_OPERATOR_WEB_SMOKE_STATUS='+result.phase+' REASON='+result.reason);
+  }catch{
+    nativeSmokeStatus='ERROR';
+    logWarn('NEXT_OPERATOR_WEB_SMOKE_FAILED');
+  }finally{nativeSmokeActive=false;refreshTray();}
+}
 const usageWarmup = new AbortController();
 
 // One instance only: two copies would fight over the tunnel and the config file.
 const isNextClassic = process.env.COS_NEXT_CLASSIC_WORKFLOW === '1';
+if (isNextClassic) onClassicNativeStatusChange(refreshTray);
 const syntheticClassicTest = classicTestTransportDisabled() && process.env.COS_NEXT_E2E_TEMP_PROFILE === '1' && classicControlPermitted({
   isNext: isNextClassic, packaged: app.isPackaged, home: process.env.HOME ?? '',
   userData: app.getPath('userData'), socket: process.env.COS_NEXT_TEST_CONTROL_SOCKET ?? ''
@@ -273,6 +292,18 @@ function refreshTray(): void {
       { label, enabled: false },
       { type: 'separator' },
       { label: 'Open', click: windowActivation.request },
+      ...(isNextClassic ? [
+        // Reopen is deliberately available even while login Chrome remains
+        // alive with zero windows (normal macOS close-window behavior).
+        { label: 'Open / reopen ChatGPT login in Chrome', enabled:classicNativeWebHealth()!=='CHROME_PROFILE_TRANSITION', click: () => void showClassicNativeLogin().then(refreshTray).catch(e => logWarn('Chrome login: '+(e instanceof Error?e.message:'failed'))) },
+        { label: 'Finish login / return to background', enabled:classicNativeWebHealth()==='USER_LOGIN_STANDARD_CHROME', click: () => { cancelClassicNativeLogin(); refreshTray(); } },
+        { label: 'Show managed Chrome for website verification', enabled:classicNativeWebHealth()==='READY', click: () => void showNativeBrowserForVerification(true).catch(e=>logWarn('Show Chrome: '+(e instanceof Error?e.message:'failed'))) },
+        { label: 'Return managed Chrome offscreen', enabled:classicNativeWebHealth()==='READY', click: () => void showNativeBrowserForVerification(false).catch(e=>logWarn('Hide Chrome: '+(e instanceof Error?e.message:'failed'))) },
+        { label: 'Check official ChatGPT website (no send)', enabled:classicNativeWebHealth()==='READY'&&!nativeSmokeActive, click: () => void runOperatorNativeSmoke('probe') },
+        { label: 'One-time isolated website reply test', enabled:classicNativeWebHealth()==='READY'&&!nativeSmokeActive&&nativeSmokeStatus==='EDITOR_READY', click: () => void runOperatorNativeSmoke('send') },
+        { label: 'Web Runtime: '+classicNativeWebHealth(), enabled:false },
+        { label: 'Website gate: '+(nativeSmokeActive?'CHECKING':nativeSmokeStatus), enabled:false }
+      ] : []),
       {
         label: running ? 'Disconnect' : 'Connect',
         click: () => void (running ? disconnect() : connect())
@@ -350,7 +381,11 @@ void app.whenReady().then(async () => {
   // a browser without this extension in it — from the one holding chat A. That decision belongs
   // to the browser that owns the source chat; see bridge.ts::offerPlacement.
   setBrowserOpener(async (url) => {
-    // Let the command owner report launch failure; another browser may belong to another account.
+    if (isNextClassic) {
+      // Never commandeer the user's default Chrome, desktop or cursor.
+      await openClassicNativeConversation(url);
+      return;
+    }
     await openInPreferredBrowser(url);
   });
 
@@ -446,12 +481,43 @@ void app.whenReady().then(async () => {
   refreshTray();
   onStatusChange(refreshTray);
 
+  // The complete Next Classic UI uses its ORIGINAL main Goal/Agent/MCP
+  // authority. Browser input is a CoS-owned Chromium page, not a Chrome plugin.
+  if (isNextClassic) {
+    try{
+      await startClassicNativeWebRuntime(path.join(userData,'browser-runtime'),syntheticClassicTest);
+      logInfo('Next Classic native ChatGPT Web Runtime ready (no extension)');
+      const requested=process.env.COS_NEXT_REAL_ACCOUNT_SMOKE;
+      if(app.isPackaged&&(requested==='probe'||requested==='send')){
+        // Operator-initiated REAL webpage smoke. Never enabled by ordinary
+        // Goal/Worker dispatch. Outputs status codes, not account data.
+        void realAccountSmoke(requested).then(async(result)=>{
+          nativeSmokeStatus=result.phase;
+          refreshTray();
+          const safe='NEXT_REAL_ACCOUNT_SMOKE_STATUS='+result.phase+
+            ' REASON='+result.reason;
+          process.stdout.write(safe+'\n');
+          logInfo(safe);
+          if(result.phase==='AUTH_REQUIRED'){
+            try{await showClassicNativeLogin();}
+            catch{logWarn('NEXT_REAL_ACCOUNT_LOGIN_WINDOW_UNAVAILABLE');}
+          }
+        }).catch(()=>{
+          process.stdout.write('NEXT_REAL_ACCOUNT_SMOKE_STATUS=ERROR\n');
+        });
+      }
+    }catch(error){
+      logWarn('Native ChatGPT Web Runtime unavailable: '+
+        (error instanceof Error?error.message:'unknown'));
+    }
+  }
+
   // Materialize the bundled companion before the bridge can accept an old service worker.
   // This used to happen lazily when the renderer painted the Setup path, so a background/tray
   // restart after an app update could leave Chrome reloading yesterday's files indefinitely.
   // The Chrome-visible path is stable; extensionDir() refreshes its contents to this app build.
-  const preparedExtension = extensionDir();
-  if (app.isPackaged && !preparedExtension) {
+  const preparedExtension = isNextClassic ? null : extensionDir();
+  if (!isNextClassic && app.isPackaged && !preparedExtension) {
     logWarn('browser companion: packaged extension could not be materialized at startup');
   }
 
@@ -491,7 +557,7 @@ void app.whenReady().then(async () => {
   // Recording, workers and direct browser tools share one extension transport.
   // ipc.ts uses the same eligibility rule when settings change.
   if (!syntheticClassicTest) startInputStartupRuntime();
-  if (!syntheticClassicTest && browserExtensionRequired(getConfig())) {
+  if (!isNextClassic && !syntheticClassicTest && browserExtensionRequired(getConfig())) {
     void startBridge();
   }
   // Preserve the user's saved connection preference without silently
@@ -555,7 +621,8 @@ app.on('will-quit', (event) => {
       {
         name: 'process cleanup',
         budgetMs: 15_000,
-        run: () => [unifiedExecManager.terminateAllProcesses(), stopComputerHelper(), pluginManager.close()]
+        run: () => [unifiedExecManager.terminateAllProcesses(), stopComputerHelper(),
+          stopClassicNativeWebRuntime(), pluginManager.close()]
       },
       // Phase 3: recorder work can enqueue both session projections and named durable state.
       { name: 'recorder flush', budgetMs: 10_000, run: () => [flushRecorder()] },
@@ -590,6 +657,10 @@ app.on('will-quit', (event) => {
 // navigate. External links go through the vetted allowlist in ipc.ts instead.
 app.on('web-contents-created', (_event, contents) => {
   contents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  contents.on('will-navigate', (event) => event.preventDefault());
-  contents.on('will-redirect', (event) => event.preventDefault());
+  contents.on('will-navigate', (event) => {
+    if (!isNextClassic || !isOwnedWebContents(contents)) event.preventDefault();
+  });
+  contents.on('will-redirect', (event) => {
+    if (!isNextClassic || !isOwnedWebContents(contents)) event.preventDefault();
+  });
 });

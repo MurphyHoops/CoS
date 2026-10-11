@@ -172,6 +172,13 @@ async function verify(app){
     try {await socketRequest(info.home,{op:'arbitrary-js',source:'process.exit()'});
       throw new Error('NEXT_CLI_FORBIDDEN_OPERATION_ACCEPTED');
     }catch(error){if(error instanceof Error && error.message==='NEXT_CLI_FORBIDDEN_OPERATION_ACCEPTED')throw error;}
+    const wrote=await socketRequest(info.home,{op:'native-profile-fixture',action:'write'});
+    if(!wrote.written)throw new Error('NEXT_CLI_NATIVE_PROFILE_WRITE_FAILED');
+    const native=await socketRequest(info.home,{op:'native-browser-smoke'});
+    if(!native?.classicBrowserBroker||!native.webPageClick||!native.workerIsolation||!native.twoIndependentWorkerPages||
+      native.chromeExtension!==false)
+      throw new Error('NEXT_CLI_NATIVE_NO_EXTENSION_SMOKE_FAILED');
+    console.log('NEXT_CLASSIC_NATIVE_NO_EXTENSION_BROWSER_PASS');
     const before=await socketRequest(info.home,{op:'ui-status'});
     if(!before.hasChat||!before.hasGoal||!before.hasSettings)throw new Error('NEXT_CLI_CLASSIC_UI_MISSING');
     const theme=before.theme==='dark'?'light':'dark';
@@ -191,6 +198,13 @@ async function verify(app){
     const accepted=await sendFixture(info,text);
     if(accepted.state!=='queued'||accepted.deliveredAt!==null)throw new Error('NEXT_CLI_OFFLINE_FALSE_DELIVERY');
     await restart(info);
+    const restoredProfile=await socketRequest(info.home,
+      {op:'native-profile-fixture',action:'read'});
+    if(!restoredProfile.persistent)throw new Error('NEXT_CLI_BROWSER_PROFILE_LOST_ON_RESTART');
+    const restoredNative=await socketRequest(info.home,{op:'native-browser-smoke'});
+    if(!restoredNative?.twoIndependentWorkerPages)
+      throw new Error('NEXT_CLI_NATIVE_WORKERS_LOST_ON_RESTART');
+    console.log('NEXT_CLASSIC_NATIVE_PROFILE_AND_WORKERS_RESTART_PASS');
     const after=await socketRequest(info.home,{op:'ui-status'});
     if(after.theme!==theme)throw new Error('NEXT_CLI_THEME_NOT_RESTORED');
     const rows=await socketRequest(info.home,{op:'outbox'});
@@ -199,7 +213,7 @@ async function verify(app){
       throw new Error('NEXT_CLI_DURABLE_INPUT_NOT_RESTORED');
     const ended=await shutdown(info);
     finished=true;
-    return {verified:true,privateSocket:true,realPackagedRenderer:true,
+    return {verified:true,privateSocket:true,realPackagedRenderer:true,nativeBrowserNoExtension:true,twoIndependentWorkerPages:true,profileSurvivedRestart:true,
       themeSavedAndRestored:true,queuedInputIdPreserved:true,noFalseDelivery:true,arbitraryCodeRejected:true,
       oldProfileUnchanged:ended.oldProfileUnchanged,temporaryHomeCleaned:true};
   }finally{

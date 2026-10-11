@@ -19,17 +19,19 @@ const validateUrl=(url:string):boolean=>{
 };
 type PageResult=Record<string,unknown>;
 export class NativeClassic316BrowserExecutor implements NativeBrowserControlExecutor {
-  readonly id=randomUUID();
+  readonly id:string;
   readonly name='CoS Native ChatGPT Website (no Chrome extension)';
   private owner:string|null=null;
   private pageId=randomUUID();
-  private readonly tabId=1;
+  private readonly tabId:number;
   private busy=false;
   private opened=false;
   private screenshotId:string|null=null;
   private readonly lease=randomUUID();
   constructor(private readonly computer:BackgroundWebComputer,
-    private readonly offlineFixture=false){}
+    private readonly offlineFixture=false,id=randomUUID(),tabId=1){
+    this.id=id;this.tabId=tabId;
+  }
   private handle(){return this.id+':'+this.tabId;}
   private url(){return this.computer.webContents.getURL();}
   private async current(command:BrowserCommand,check:()=>Promise<boolean>,

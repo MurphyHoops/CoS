@@ -54,6 +54,8 @@ void launch().catch(error => {
   const code = typeof error === 'object' && error !== null && 'code' in error &&
     typeof error.code === 'string' ? error.code : 'UNKNOWN';
   process.stderr.write('NEXT_CLASSIC_STARTUP_FAILED=' + code + '\n');
+  if(process.env.COS_NEXT_E2E_TEMP_PROFILE==='1')
+    process.stderr.write('NEXT_CLASSIC_TEST_DIAGNOSTIC='+String(error instanceof Error?error.stack:error)+'\n');
   // An imported native binding may fail before the legacy logger initializes.
   // Show the operator a clear local error instead of a silent Dock-only app.
   void app.whenReady().then(() => dialog.showMessageBox({

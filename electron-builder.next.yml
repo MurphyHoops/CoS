@@ -34,9 +34,6 @@ extraResources:
     to: LICENSE
   - from: THIRD-PARTY-NOTICES.txt
     to: THIRD-PARTY-NOTICES.txt
-  - from: extension
-    to: extension
-    filter: ['**/*', '!**/*.map']
 
 npmRebuild: false
 compression: maximum
@@ -70,6 +67,27 @@ mac:
       filter: ['**/*']
     - from: node_modules/tree-sitter-bash/prebuilds/darwin-${arch}
       to: node_modules/tree-sitter-bash/prebuilds/darwin-${arch}
+      filter: ['**/*']
+    - from: node_modules/@img/sharp-darwin-${arch}
+      to: node_modules/@img/sharp-darwin-${arch}
+      filter: ['**/*']
+    - from: node_modules/@img/sharp-libvips-darwin-${arch}
+      to: node_modules/@img/sharp-libvips-darwin-${arch}
+      filter: ['**/*']
+    - from: node_modules/@img/colour
+      to: node_modules/@img/colour
+      filter: ['**/*']
+    - from: node_modules/detect-libc
+      to: node_modules/detect-libc
+      filter: ['**/*']
+    - from: node_modules/semver
+      to: node_modules/semver
+      filter: ['**/*']
+    - from: node_modules/node-addon-api
+      to: node_modules/node-addon-api
+      filter: ['**/*']
+    - from: node_modules/node-gyp-build
+      to: node_modules/node-gyp-build
       filter: ['**/*']
   extraResources:
     # Stage from installed, version-matched CoS with:

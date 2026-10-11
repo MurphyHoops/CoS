@@ -9,6 +9,7 @@
 import {BrowserWindow,session,type Session,type WebContents} from 'electron';
 import {WEB_FIRST_PARTITION} from '../next/web-first/host-policy.js';
 import {inspectNativeChatGPTPage} from '../next/web-first/web-page-controls.js';
+import {registerOwnedWebContents} from './owned-contents.js';
 
 export type ComputerAction=
   | {kind:'click';x:number;y:number}
@@ -46,6 +47,8 @@ export function validateComputerAction(value:ComputerAction):void{
   throw Error('COMPUTER_ACTION_INVALID');
 }
 export interface BackgroundWebComputer {
+  transportTargetId?:string;
+  documentHttpStatus?:()=>number|null;
   webContents:WebContents;
   open(url:string):Promise<void>;
   observe():Promise<{page:'CHATGPT'|'OFFLINE_FIXTURE'|'OTHER';conversation:boolean;
@@ -71,6 +74,7 @@ export function createBackgroundWebComputer(options:{offlineFixture?:boolean;
     }
   });
   const wc=background.webContents;
+  registerOwnedWebContents(wc);
   let closed=false;
   let actionBusy=false;
   const insist=()=>{
@@ -84,6 +88,7 @@ export function createBackgroundWebComputer(options:{offlineFixture?:boolean;
   wc.on('will-attach-webview',event=>event.preventDefault());
   background.on('closed',()=>{closed=true;});
   return {
+    transportTargetId:'electron-'+wc.id,
     webContents:wc,
     async open(url){
       insist();

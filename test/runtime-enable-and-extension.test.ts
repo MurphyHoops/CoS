@@ -32,11 +32,12 @@ describe('runtime multi-agent enable regression', () => {
 describe('companion extension setup contract', () => {
   it('materializes the packaged companion before the browser bridge can start', async () => {
     const source = await readFile(path.join(repo, 'src/main/index.ts'), 'utf8');
-    const materialize = source.indexOf('const preparedExtension = extensionDir();');
+    const materialize = source.indexOf('const preparedExtension = isNextClassic ? null : extensionDir();');
     const bridgeStart = source.indexOf('void startBridge();', materialize);
 
     expect(materialize).toBeGreaterThanOrEqual(0);
     expect(bridgeStart).toBeGreaterThan(materialize);
+    expect(source).toContain('if (!isNextClassic && !syntheticClassicTest && browserExtensionRequired(getConfig())) {');
   });
 
   it('keeps standalone recovery visible without pointing an installed app at releases/latest', async () => {

@@ -127,7 +127,8 @@ export class ChatGPTWebsiteDelivery {
     Promise<WebSubmissionReceipt>{
     assertTurnEnvelope(turn);
     const binding=this.registry.requireForTurn(turn);
-    if(binding.pageTargetId!=='electron-'+computer.webContents.id)
+    if(binding.pageTargetId!==(computer.transportTargetId??
+      'electron-'+computer.webContents.id))
       throw Error('WEB_SUBMIT_WRONG_TARGET_ID');
     const url=computer.webContents.getURL();
     const fixture=opts.offlineFixture===true;

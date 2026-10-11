@@ -8,6 +8,8 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { BrowserWindow, App } from 'electron';
+import {session} from 'electron';
+import {browserControl} from '../../browser-control.js';
 
 export interface ClassicControlOptions {
   isNext: boolean;
@@ -72,6 +74,90 @@ export async function startClassicTestControl(args: ClassicControlOptions & {
       return {ready:!!win && !win.isDestroyed() && !win.webContents.isLoading(),
         title:win?.getTitle() ?? '', hasWindow:!!win && !win.isDestroyed(),
         transport:'disabled:isolated-test'};
+    }
+    if (request.op === 'native-profile-fixture') {
+      // ONLY private temporary Classic CLI HOME, never real account cookies.
+      // Tests Chromium persistent Session without any request to chatgpt.com.
+      const web=session.fromPath(path.join(args.userData,'browser-runtime','profile'));
+      const name='cos_native_offline_fixture';
+      if(request.action==='write'){
+        await web.cookies.set({url:'https://chatgpt.com',name,value:'persisted-v1',
+          expirationDate:Math.floor(Date.now()/1000)+86400});
+        await web.cookies.flushStore();
+        return {written:true};
+      }
+      if(request.action==='read'){
+        const cookies=await web.cookies.get({url:'https://chatgpt.com',name});
+        return {persistent:cookies.length===1&&cookies[0]?.value==='persisted-v1'};
+      }
+      throw Error('NEXT_NATIVE_PROFILE_FIXTURE_INVALID_OPERATION');
+    }
+    if (request.op === 'native-browser-smoke') {
+      // Strict packaged TEMP HOME only. Real Classic broker and Electron
+      // Chromium page, fake local HTML; no Plus login/account/model use.
+      const owner='session:classic-native-fixture';
+      const browsers=browserControl.browsers();
+      if(browsers.length!==1||!browsers[0]?.name.includes('Native ChatGPT'))
+        throw Error('NEXT_NATIVE_BROWSER_NOT_READY');
+      const html='<!doctype html><html><body><h1>Classic Native Browser</h1>'+
+        '<button id="click" style="position:absolute;left:60px;top:55px;width:250px;height:50px">'+
+        'Verify native click</button><output id="state">idle</output>'+
+        '<script>document.querySelector("#click").onclick=()=>'+
+        '{document.querySelector("#state").textContent="clicked";};</script></body></html>';
+      const created=await browserControl.execute('browser_tabs',
+        {action:'new',browserId:browsers[0].id,url:'data:text/html,'+encodeURIComponent(html)},
+        owner,null,async()=>true);
+      const tabId=(created.value as {tabId?:string}|undefined)?.tabId;
+      if(!tabId)throw Error('NEXT_NATIVE_BROWSER_CREATE_FAILED');
+      const snap=await browserControl.execute('browser_snapshot',
+        {tabId,maxNodes:120,maxChars:8000},owner,null,async()=>true);
+      const result=snap.value as {text?:string;pageId?:string}|undefined;
+      const ref=result?.text?.match(/\[([^\]]+)\] button "Verify native click"/)?.[1];
+      if(!ref||!result?.pageId)throw Error('NEXT_NATIVE_BROWSER_SNAPSHOT_FAILED:'+JSON.stringify({error:snap.error,pageId:result?.pageId,preview:result?.text?.slice(0,250)}));
+      const clicked=await browserControl.execute('browser_action',
+        {tabId,pageId:result.pageId,action:'click',ref},
+        owner,null,async()=>true);
+      if(clicked.error)throw Error('NEXT_NATIVE_BROWSER_CLICK_'+clicked.error);
+      const read=await browserControl.execute('browser_evaluate',
+        {tabId,pageId:result.pageId,expression:'document.querySelector("#state").textContent'},
+        owner,null,async()=>true);
+      if((read.value as {value?:unknown}|undefined)?.value!=='clicked')
+        throw Error('NEXT_NATIVE_BROWSER_RESULT_MISSING');
+      const cross=await browserControl.execute('browser_action',
+        {tabId,pageId:result.pageId,action:'click',ref},'session:other-worker',null,
+        async()=>true);
+      if(!cross.error?.includes('TAB_NOT_OWNED'))throw Error('NEXT_NATIVE_BROWSER_CROSS_OWNER');
+      // A SECOND real Chromium Page Target shares the SAME browser Profile,
+      // but has a different Worker owner and independent DOM state.
+      const second=await browserControl.execute('browser_tabs',
+        {action:'new',browserId:browsers[0].id,url:'data:text/html,'+encodeURIComponent(html)},
+        'session:other-worker',null,async()=>true);
+      const secondTab=(second.value as {tabId?:string}|undefined)?.tabId;
+      if(!secondTab||secondTab===tabId)throw Error('NEXT_NATIVE_SECOND_WORKER_TAB_MISSING');
+      const listed=await browserControl.execute('browser_tabs',
+        {action:'list',browserId:browsers[0].id},owner,null,async()=>true);
+      const tabs=(listed.value as {tabs?:Array<{tabId:string}>}|undefined)?.tabs;
+      if(tabs?.length!==2||!tabs.some(t=>t.tabId===tabId)||
+        !tabs.some(t=>t.tabId===secondTab))
+        throw Error('NEXT_NATIVE_MULTI_TAB_LIST_INCOMPLETE');
+      const snapOther=await browserControl.execute('browser_snapshot',
+        {tabId:secondTab,maxNodes:120,maxChars:8000},
+        'session:other-worker',null,async()=>true);
+      const secondValue=snapOther.value as {text?:string;pageId?:string}|undefined;
+      const otherRef=secondValue?.text?.match(/\[([^\]]+)\] button "Verify native click"/)?.[1];
+      if(!otherRef||!secondValue?.pageId||secondValue.pageId===result.pageId)
+        throw Error('NEXT_NATIVE_WORKER_PAGE_ID_COLLISION');
+      const otherClick=await browserControl.execute('browser_action',
+        {tabId:secondTab,pageId:secondValue.pageId,action:'click',ref:otherRef},
+        'session:other-worker',null,async()=>true);
+      if(otherClick.error)throw Error('NEXT_NATIVE_OTHER_WORKER_CLICK_FAILED');
+      const noEscape=await browserControl.execute('browser_action',
+        {tabId:secondTab,pageId:secondValue.pageId,action:'click',ref:otherRef},
+        owner,null,async()=>true);
+      if(!noEscape.error?.includes('TAB_NOT_OWNED'))
+        throw Error('NEXT_NATIVE_REVERSE_WORKER_ESCAPE');
+      return {classicBrowserBroker:true,webPageClick:true,
+        workerIsolation:true,twoIndependentWorkerPages:true,chromeExtension:false};
     }
     if (request.op === 'ui-status') return await ui(`(async () => {
       const state=await window.api.getState();
