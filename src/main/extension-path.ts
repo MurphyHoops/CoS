@@ -256,31 +256,38 @@ function materializePackagedExtension(bundled: string, stable: string): string |
 /**
  * The folder to open for chrome://extensions → Load unpacked, or null if it is missing.
  *
- * Packaged first: in an installed build the source tree is not present at all, and in a
- * dev run process.resourcesPath points into Electron's own resources, where there is no
- * extension folder — so the checkout path is what answers there.
+ * Packaged and development builds both publish into the same per-user stable root.
+ * The packaged resource or current checkout is only an update source; Chrome must never be
+ * asked to follow a versioned install directory or a worktree-specific extension path.
  */
 export function extensionDir(): string | null {
-  if (app.isPackaged) {
-    const bundled = path.join(process.resourcesPath, 'extension');
-    const stable = path.join(app.getPath('userData'), 'extension');
-    try {
-      return materializePackagedExtension(bundled, stable);
-    } catch {
-      // Fingerprinting itself can fail if the packaged resource is damaged. A previously
-      // materialized extension remains useful and must not be hidden merely because the update
-      // source is unreadable.
-      return usableMaterializedExtension(stable) ? stable : null;
-    }
-  }
+  const stable = path.join(app.getPath('userData'), 'extension');
+  const resourceSource = typeof process.resourcesPath === 'string'
+    ? path.join(process.resourcesPath, 'extension')
+    : null;
+  const sources = app.isPackaged
+    ? [resourceSource].filter((candidate): candidate is string => candidate !== null)
+    : [
+        path.join(app.getAppPath(), 'extension'),
+        path.join(process.cwd(), 'extension'),
+        ...(resourceSource ? [resourceSource] : [])
+      ];
 
-  const candidates = [
-    path.join(app.getAppPath(), 'extension'),
-    path.join(process.cwd(), 'extension'),
-    path.join(process.resourcesPath, 'extension')
-  ];
-  for (const candidate of candidates) {
-    if (existsSync(path.join(candidate, 'manifest.json'))) return candidate;
+  // Chrome must never be pointed at a checkout/worktree path. Development and packaged
+  // builds both publish into the same per-user stable root, so switching branches, worktrees
+  // or app versions cannot strand Chrome on yesterday's unpacked companion directory.
+  //
+  // If no source is currently healthy, still call the materializer with the first candidate:
+  // recovery of an interrupted refresh (.old/.new) happens before source validation, and the
+  // previous stable copy may remain fully usable even while the current package/checkout is bad.
+  const source = sources.find(candidate => existsSync(path.join(candidate, 'manifest.json')))
+    ?? sources[0]
+    ?? path.join(path.dirname(stable), '.missing-extension-source');
+  try {
+    return materializePackagedExtension(source, stable);
+  } catch {
+    // Fingerprinting itself can fail if the source is damaged. A previously materialized
+    // extension remains useful and must not be hidden merely because refresh is unreadable.
+    return usableMaterializedExtension(stable) ? stable : null;
   }
-  return null;
 }

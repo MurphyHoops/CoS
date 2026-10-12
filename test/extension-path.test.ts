@@ -252,3 +252,38 @@ it('preserves rollback authority when both publication and rollback fail, then r
   await expect(fs.access(backup)).rejects.toBeDefined();
   await expect(fs.access(stage)).rejects.toBeDefined();
 });
+
+
+it('materializes a development checkout into the same stable per-user folder', async () => {
+  base = await makeTempDir('clf-extension-dev-stable-');
+  const checkout = path.join(base, 'worktree');
+  const source = path.join(checkout, 'extension');
+  const userData = path.join(base, 'user-data');
+  const stable = path.join(userData, 'extension');
+  await fs.mkdir(source, { recursive: true });
+  await fs.writeFile(path.join(source, 'manifest.json'), JSON.stringify({ version: '3.1.16' }));
+  await fs.writeFile(path.join(source, 'background.js'), 'dev build A');
+
+  vi.doMock('electron', () => ({
+    app: {
+      isPackaged: false,
+      getPath: (name: string) => (name === 'userData' ? userData : ''),
+      getAppPath: () => checkout
+    }
+  }));
+
+  const { extensionDir } = await import('../src/main/extension-path.js');
+  const first = extensionDir();
+  expect(first).toBe(stable);
+  expect(first).not.toBe(source);
+  expect(await fs.readFile(path.join(stable, 'background.js'), 'utf8')).toBe('dev build A');
+  const firstStat = await fs.stat(stable);
+
+  // Switching source content (as happens while developing/upgrading) refreshes the exact
+  // Chrome-visible root instead of making the browser follow a worktree-specific directory.
+  await fs.writeFile(path.join(source, 'background.js'), 'dev build B');
+  expect(extensionDir()).toBe(stable);
+  expect(await fs.readFile(path.join(stable, 'background.js'), 'utf8')).toBe('dev build B');
+  const secondStat = await fs.stat(stable);
+  if (process.platform !== 'win32' && firstStat.ino !== 0) expect(secondStat.ino).toBe(firstStat.ino);
+});
