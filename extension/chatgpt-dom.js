@@ -577,7 +577,14 @@ var CLF_DOM = (() => {
         // canonical assistant final or task completion.
         if (turn.role !== 'user' || !turn.id || seen.has(turn.id)) return out;
         const bubble = turn.node?.querySelector('[data-user-message-bubble]');
-        const prose = bubble?.querySelector('.text-size-chat.whitespace-pre-wrap');
+        // ChatGPT uses the compact whitespace-pre-wrap renderer for short prompts, but
+        // long app-framed prompts now switch to a collapsible Markdown surface. Both are
+        // provider-owned children of this exact user search unit. Keeping the same UUID
+        // cross-check above preserves receipt identity while allowing long COS_CONTEXT
+        // sends to produce the native user row needed by the exact Fiber source reader.
+        const prose = bubble?.querySelector(
+          '.text-size-chat.whitespace-pre-wrap, [data-testid="collapsible-user-message-content"] .markdown'
+        );
         if (!prose || prose.closest('[data-chatgpt-search-unit-key]') !== turn.node) return out;
         const value = pageText(prose);
         if (!value) return out;

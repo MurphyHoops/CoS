@@ -60,6 +60,18 @@ describe('October 2026 native turn/message markup', () => {
       [userId, 'user', 'Exact sent user message']
     ]);
   });
+  it('witnesses the current collapsible Markdown renderer used for long app-framed user messages', () => {
+    const host = document.createElement('div');
+    host.setAttribute('data-turn-key', userId);
+    host.innerHTML = `<div data-chatgpt-search-unit-key="fallback-turn-0:0:user" data-chatgpt-search-message-ids="${userId}"><div data-user-message-bubble="true"><div data-testid="collapsible-user-message-content"><div class="markdown"><p>Long framed prompt</p><p>Visible user tail</p></div></div><button type="button">Show more</button></div></div>`;
+    const transcript = document.createElement('div');
+    transcript.setAttribute('data-chatgpt-conversation-selection-target', 'true');
+    transcript.append(host); document.body.append(transcript);
+    expect(api.messages()).toEqual([
+      expect.objectContaining({ id: userId, role: 'user', text: 'Long framed promptVisible user tail' })
+    ]);
+  });
+
   it('rejects a mixed-turn user UUID rather than claiming a neighbouring message', () => {
     modern(userId, 'a0000000-bbbb-4ccc-8ddd-eeeeeeeeeeee');
     expect(api.messages()).toEqual([]);
