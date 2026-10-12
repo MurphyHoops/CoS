@@ -174,7 +174,7 @@ const {
 } = await import('../src/main/session/long-run.js');
 const { makeTempDir, removeTempDir, SAMPLE_BRIEF, faultGate } = await import('./helpers.js');
 const { resumeBootstrapText } = await import('../src/main/session/handoff.js');
-const { beginSelfHealingEpisode, setSelfHealingRecoveryHooksForTests } = await import('../src/main/session/self-healing.js');
+const { beginEmergencyResumeDestinationSend, beginSelfHealingEpisode, prepareEmergencyResume, setSelfHealingRecoveryHooksForTests } = await import('../src/main/session/self-healing.js');
 const { SELF_HEAL_POST_RELOAD_MS } = await import('../src/shared/recovery.js');
 const { getLog } = await import('../src/main/logger.js');
 const { publishProviderTransportStatus, resetProviderTransportForTests } = await import('../src/main/session/connectivity.js');
@@ -6316,6 +6316,93 @@ describe('targeted open', () => {
 });
 
 describe('Emergency Resume command reconciliation', () => {
+  it('does not promote automatic self-healing into a fresh executor while Browser only is enabled', async () => {
+    await saveConfig({
+      ...suiteConfig,
+      ui: { ...suiteConfig.ui, browserOnly: true },
+      multiAgent: { ...suiteConfig.multiAgent, selfHealingSessions: true }
+    });
+    const source = '90909090-1111-4111-8111-111111111111';
+    const session = await createSession({ title: 'browser-only recovery gate', conversationId: source });
+    const episode = await beginSelfHealingEpisode(session.id, source, 'silence');
+    expect(episode).not.toBeNull();
+    expect(episode?.phase).toBe('suspected_stall');
+
+    expect(await queueEmergencyResume(session.id, source, episode!.failureEpisodeId)).toBeNull();
+    expect((await getSession(session.id))?.recovery?.phase).toBe('suspected_stall');
+    expect(pendingCommands().filter((entry) => entry.what === `recovery:${session.id}`)).toEqual([]);
+    expect(opened).toEqual([]);
+  });
+
+  it('retires a restored pre-Send recovery command instead of reopening it under Browser only', async () => {
+    const source = '90909090-2222-4222-8222-222222222222';
+    const commandId = 'browser-only-pre-send-recovery';
+    await saveConfig({
+      ...suiteConfig,
+      multiAgent: { ...suiteConfig.multiAgent, selfHealingSessions: true }
+    });
+    const session = await createSession({ title: 'browser-only restored recovery', conversationId: source });
+    const episode = await beginSelfHealingEpisode(session.id, source, 'silence');
+    expect(episode).not.toBeNull();
+    const prepared = await prepareEmergencyResume(session.id, source, episode!.failureEpisodeId);
+    expect(prepared?.state.phase).toBe('hard_recovery');
+    expect(await beginEmergencyResumeDestinationSend(
+      session.id,
+      episode!.failureEpisodeId,
+      prepared!.state.recoveryGeneration,
+      commandId
+    )).toMatchObject({ allowed: true, checkpoint: { state: 'attempted-unresolved', commandId } });
+
+    const now = Date.now();
+    await writeDurableNow(BRIDGE_COMMANDS_STATE, {
+      version: 5,
+      commands: [{
+        id: commandId,
+        phase: 'leased',
+        spec: {
+          type: 'recovery',
+          sessionId: session.id,
+          fromConversationId: source,
+          episodeId: episode!.failureEpisodeId,
+          generation: prepared!.state.recoveryGeneration,
+          text: prepared!.text,
+          agent: null,
+          runId: null,
+          model: null,
+          reasoningEffort: null
+        },
+        createdAt: now - 1000,
+        deadlineCreatedAt: now - 1000,
+        claimedAt: now - 500,
+        deadlineClaimedAt: now - 500,
+        lastError: null,
+        owner: `recovery:${commandId}:tab:test`
+      }],
+      receipts: [],
+      transportPausedAt: null
+    });
+    await flushDurable();
+
+    resetBridgeForTests();
+    opened.length = 0;
+    setBrowserOpener(async (url) => { opened.push(url); });
+    await saveConfig({
+      ...suiteConfig,
+      ui: { ...suiteConfig.ui, browserOnly: true },
+      multiAgent: { ...suiteConfig.multiAgent, selfHealingSessions: true }
+    });
+
+    await restoreCommands();
+
+    expect(opened).toEqual([]);
+    expect(pendingCommands().some((entry) => entry.id === commandId)).toBe(false);
+    expect((await getSession(session.id))?.recovery).toMatchObject({
+      phase: 'recovery_failed',
+      destinationSend: { state: 'attempted-unresolved', commandId },
+      error: 'Browser only is enabled; automatic recovery stopped before provider Send.'
+    });
+  });
+
   async function recoveryCommand(
     source: string,
     client = 'recovery-tab'

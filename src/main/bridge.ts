@@ -6434,7 +6434,11 @@ export async function queueEmergencyResume(
   fromConversationId: string,
   episodeId: string
 ): Promise<BridgeCommand | null> {
-  if (providerReplacementRecoveryPaused() || !getConfig().multiAgent.selfHealingSessions || providerTransportUnavailable()) return null;
+  // Browser only is an explicit user boundary: automatic chat recovery may repair the
+  // current document, but it must never create a fresh provider executor. Check before
+  // prepareEmergencyResume() because that transition itself fences the old conversation.
+  if (getConfig().ui.browserOnly === true || providerReplacementRecoveryPaused() ||
+      !getConfig().multiAgent.selfHealingSessions || providerTransportUnavailable()) return null;
   if (runningToolCalls(fromConversationId) > 0 || settlingToolCalls(fromConversationId) > 0) return null;
   // Close the zero-inflight race synchronously. From this point A cannot begin another local
   // operation while the durable hard-recovery transition and browser command are prepared.
@@ -6730,6 +6734,7 @@ function pendingBrowserPlacement(conversationId: string | null): {
   const command = commands.find(entry => entry.owner === null && entry.placement &&
     (entry.placement.conversationId === conversationId || (conversationId === null && entry.spec.type === 'worker')));
   if (!command?.placement) return null;
+  if (command.spec.type === 'recovery' && getConfig().ui.browserOnly === true) return null;
   if ((command.spec.type === 'resume' || command.spec.type === 'recovery') && providerReplacementRecoveryPaused()) return null;
   const placement = command.placement;
   delete command.placement;
@@ -9204,6 +9209,7 @@ async function deliverOne(): Promise<void> {
     commands.includes(command) &&
     !browserCommandRecoveryPaused() &&
     !providerTransportUnavailable() &&
+    !(command.spec.type === 'recovery' && getConfig().ui.browserOnly === true) &&
     !((command.spec.type === 'worker' || command.spec.type === 'revive') && agentsRecoveryPaused()) &&
     !((command.spec.type === 'resume' || command.spec.type === 'recovery') && providerReplacementRecoveryPaused());
   if (!deliveryStillCurrent()) return;
@@ -9815,12 +9821,15 @@ function nextDeliverable(): Command | null {
   if (commandWrites.size > 0) return null;
   const providerReplacementPaused = providerReplacementRecoveryPaused();
   const agentsPaused = agentsRecoveryPaused();
+  const browserOnly = getConfig().ui.browserOnly === true;
   // A spent lease stays spent even after its deadline; only expiry settles it. Both resume and
   // Emergency Resume are provider-replacement transports and stay inert while continuation
-  // ownership is unknown.
+  // ownership is unknown. Browser only additionally parks automatic recovery commands while
+  // leaving explicit worker/resume actions available.
   return commands.find((command) => command.claimedAt === null &&
     ((!agentsPaused && command.spec.type === 'worker') ||
-      (!providerReplacementPaused && (command.spec.type === 'resume' || command.spec.type === 'recovery')))) ?? null;
+      (!providerReplacementPaused && command.spec.type === 'resume') ||
+      (!providerReplacementPaused && !browserOnly && command.spec.type === 'recovery'))) ?? null;
 }
 
 /**
@@ -10663,6 +10672,21 @@ async function restoreMissingEmergencyResumes(plan: CommandRestorePlan, now: num
       logInfo(`bridge: recovery ${session.id} already has a durable destination; not reopening transport`);
       continue;
     }
+    if (getConfig().ui.browserOnly === true) {
+      // At this point dispatched-unresolved/sent were handled above, so the provider Send
+      // boundary was never crossed. Browser only forbids manufacturing a fresh executor on
+      // restart; terminate this automatic attempt and release its admission fences so the user
+      // can continue the original session explicitly.
+      await failSelfHealingRecovery(
+        session.id,
+        session.conversationId,
+        recovery.failureEpisodeId,
+        recovery.recoveryGeneration,
+        'hard_recovery',
+        'Browser only is enabled; automatic recovery stopped before provider Send.'
+      );
+      continue;
+    }
     if (!getConfig().multiAgent.selfHealingSessions) {
       await failSelfHealingRecovery(
         session.id,
@@ -10758,6 +10782,28 @@ export async function restoreCommands(): Promise<void> {
   const currentCommands: Command[] = [];
   const providerReplacementPaused = providerReplacementRecoveryPaused();
   for (const command of plan.commands) {
+    if (!providerReplacementPaused && command.spec.type === 'recovery' && getConfig().ui.browserOnly === true) {
+      const session = await getSession(command.spec.sessionId);
+      const recovery = session?.recovery;
+      if (session && recovery &&
+          recovery.phase === 'hard_recovery' &&
+          recovery.failureEpisodeId === command.spec.episodeId &&
+          recovery.recoveryGeneration === command.spec.generation &&
+          (recovery.destinationSend.state === 'not-attempted' ||
+           recovery.destinationSend.state === 'attempted-unresolved')) {
+        await failSelfHealingRecovery(
+          session.id,
+          session.conversationId!,
+          recovery.failureEpisodeId,
+          recovery.recoveryGeneration,
+          'hard_recovery',
+          'Browser only is enabled; automatic recovery stopped before provider Send.'
+        );
+        if (command.timer) clearTimeout(command.timer);
+        command.timer = null;
+        continue;
+      }
+    }
     if (!providerReplacementPaused && command.spec.type === 'recovery' && !(await recoveryCommandCurrent(command.spec))) {
       if (command.timer) clearTimeout(command.timer);
       command.timer = null;
