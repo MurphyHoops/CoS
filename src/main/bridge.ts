@@ -5546,6 +5546,7 @@ async function startBridgeOnce(epoch: number): Promise<number | null> {
       // has nobody to ask until this moment — and queue() folds a replayed worker into
       // the restored command for the same worker rather than opening a second tab.
       try {
+        await restoreProviderHistoryBackoff();
         await restoreCommands();
       } catch (err) {
         // Recovery is part of opening the bridge, not best-effort work after it. In particular,
@@ -7366,8 +7367,35 @@ const TURN_SCOPED_REPAIRS: ReadonlySet<Repair['reason']> = new Set(['unattribute
 const repairsInFlight = new Map<string, Repair>();
 /** Exact provider Retry-After deadline for conversation-history reads. Delays recovery; never creates one. */
 const providerHistoryBackoffUntil = new Map<string, number>();
+const PROVIDER_HISTORY_BACKOFF_STATE = 'provider-history-backoff';
+/** An unreadable limit ledger must not authorize a browser reload. Ordinary chats remain usable. */
+let providerHistoryBackoffUncertain = false;
+
+/** Restore provider HTTP 429 evidence before any recovered browser work becomes dispatchable. */
+async function restoreProviderHistoryBackoff(): Promise<void> {
+  const result = await readDurableResult<unknown>(PROVIDER_HISTORY_BACKOFF_STATE);
+  if (result.kind === 'missing') return;
+  const value = result.kind === 'valid' ? result.value : null;
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
+      (value as { version?: unknown }).version !== 1 ||
+      !Array.isArray((value as { deadlines?: unknown }).deadlines) ||
+      (value as { deadlines: unknown[] }).deadlines.length > 2048 ||
+      !(value as { deadlines: unknown[] }).deadlines.every(row =>
+        Array.isArray(row) && row.length === 2 && conversationId(row[0]) === row[0] &&
+        typeof row[1] === 'number' && Number.isFinite(row[1]) && row[1] > 0)) {
+    providerHistoryBackoffUncertain = true;
+    logWarn('bridge: provider history-limit ledger is unreadable; automatic browser repairs are held until the ledger is repaired');
+    return;
+  }
+  const now = Date.now();
+  for (const [id, until] of (value as { deadlines: Array<[string, number]> }).deadlines) {
+    if (until <= now || until - now > 24 * 60 * 60_000) continue;
+    providerHistoryBackoffUntil.set(id, Math.max(providerHistoryBackoffUntil.get(id) ?? 0, until));
+  }
+}
 
 function providerHistoryBackoff(conversationId: string, now = Date.now()): number | null {
+  if (providerHistoryBackoffUncertain) return Number.POSITIVE_INFINITY;
   const until = providerHistoryBackoffUntil.get(conversationId);
   if (!until) return null;
   if (until <= now) {
@@ -7377,20 +7405,44 @@ function providerHistoryBackoff(conversationId: string, now = Date.now()): numbe
   return until;
 }
 
-function noteProviderHistoryBackoff(conversationId: string, observations: readonly ChatObservation[]): void {
+/** Test seams for the process-local pressure map; no session or bridge lifecycle is touched. */
+export function providerHistoryBackoffForTests(id: string, now = Date.now()): number | null {
+  return providerHistoryBackoff(id, now);
+}
+export async function reloadProviderHistoryBackoffForTests(): Promise<void> {
+  providerHistoryBackoffUntil.clear();
+  providerHistoryBackoffUncertain = false;
+  await restoreProviderHistoryBackoff();
+}
+
+async function noteProviderHistoryBackoff(conversationId: string, observations: readonly ChatObservation[]): Promise<void> {
   const now = Date.now();
   for (const [id, deadline] of providerHistoryBackoffUntil) if (deadline <= now) providerHistoryBackoffUntil.delete(id);
-  let until = providerHistoryBackoff(conversationId, now) ?? 0;
+  const prior = providerHistoryBackoffUntil.get(conversationId) ?? 0;
+  let until = prior;
+  let observed = false;
   for (const item of observations) {
     if (item.kind !== 'chat_error' || item.blocking !== true || !Number.isFinite(item.retryAt) ||
         item.retryAt! <= now || item.retryAt! - item.time > 24 * 60 * 60_000) continue;
+    observed = true;
     until = Math.max(until, item.retryAt!);
   }
-  if (!until) return;
-  providerHistoryBackoffUntil.set(conversationId, until);
-  const repair = repairsInFlight.get(conversationId);
-  if (repair && repair.state !== 'done') repair.notBefore = Math.max(repair.notBefore, until);
-  armSilenceSweep(now);
+  if (!observed) return;
+  // Repeated exact evidence must retry the durable commit if an earlier disk write
+  // failed after the in-memory backoff had already been installed.
+  if (until > prior) {
+    providerHistoryBackoffUntil.set(conversationId, until);
+    const repair = repairsInFlight.get(conversationId);
+    if (repair && repair.state !== 'done') repair.notBefore = Math.max(repair.notBefore, until);
+    armSilenceSweep(now);
+  }
+  // Persist the deadline before acknowledging the browser observation. A full app restart
+  // must not turn a provider-imposed wait into an immediate reload of chat history.
+  const deadlines = [...providerHistoryBackoffUntil]
+    .filter(([, deadline]) => deadline > now)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 2048);
+  await writeDurableNow(PROVIDER_HISTORY_BACKOFF_STATE, { version: 1, deadlines });
 }
 /** Last browser action per exact chat. Error/no-tab recovery shares a cooldown; owned schedules do not. */
 const lastBrowserRecoveryAt = new Map<string, number>();
@@ -7574,7 +7626,7 @@ async function noteRecoveryObservations(
   observations: readonly ChatObservation[],
   activity: { meaningful: boolean; working: boolean; terminal: boolean; at?: number; toolStartedAt?: number; endedTurnId?: string }
 ): Promise<void> {
-  noteProviderHistoryBackoff(conversationId, observations);
+  await noteProviderHistoryBackoff(conversationId, observations);
   const accessLimit = (item: ChatObservation): boolean => item.kind === 'chat_error' &&
     (item.blocking === true ||
       /^too many requests\b.*temporarily limited.*access.*few minutes/i.test((item.text ?? '').replace(/\s+/g, ' ')));
@@ -10942,6 +10994,7 @@ export function resetBridgeForTests(): void {
   softRecoveryTransportGrace.clear();
   clearUnattributedIncident();
   providerHistoryBackoffUntil.clear();
+  providerHistoryBackoffUncertain = false;
   activeUntil.clear();
   awaitingReturn.clear();
   lastAttributedCallAt.clear();

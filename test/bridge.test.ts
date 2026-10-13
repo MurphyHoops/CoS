@@ -52,6 +52,8 @@ const {
   browserCommandRecoveryPaused,
   bridgePort,
   bridgeStatus,
+  providerHistoryBackoffForTests,
+  reloadProviderHistoryBackoffForTests,
   flushBridgeTransportRecoveryForTests,
   sessionControlsFor,
   onBridgeChange,
@@ -484,6 +486,7 @@ beforeEach(async () => {
   });
   resetRecorderForTests();
   writeDurableSoon('bridge-commands', null);
+  writeDurableSoon('provider-history-backoff', null);
   await flushDurable();
   await writeDurableCheckpointNow('bridge-commands', null);
   await setSecret('bridgeToken', '');
@@ -7980,6 +7983,57 @@ describe('unattributed activity recovery', () => {
       await sweepStaleSwarm(Date.now());
       expect(await maintenance()).toMatchObject({ conversationId: PRIME, reason: 'silence' });
     } finally { vi.useRealTimers(); }
+  });
+
+  it('restores exact history Retry-After from durable state after process-local pressure is cleared', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      await events(PRIME, [openTurn('durable-history-limit')]);
+      const retryAt = Date.now() + CHAT_SILENCE_MS + 60_000;
+      await events(PRIME, [{
+        kind: 'chat_error', time: Date.now(), turnId: 'durable-history-limit',
+        recoverable: false, blocking: true, retryAt,
+        text: 'Conversation history HTTP 429 Retry-After.'
+      }]);
+      expect(await readDurable('provider-history-backoff')).toEqual({
+        version: 1, deadlines: [[PRIME, retryAt]]
+      });
+      // Mirrors the pressure-only part of a process restart, without resetting the
+      // globally shared Bridge/Goal/Worker fixture used by other tests in this file.
+      await reloadProviderHistoryBackoffForTests();
+      expect(providerHistoryBackoffForTests(PRIME)).toBe(retryAt);
+      expect(providerHistoryBackoffForTests('abababab-1111-2222-3333-999999999999')).toBeNull();
+      await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS + 60_001);
+      expect(providerHistoryBackoffForTests(PRIME)).toBeNull();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('persists a repeated provider history limit even if its previous ledger write was lost', async () => {
+    await pair();
+    const retryAt = Date.now() + 90_000;
+    const error = { kind: 'chat_error', time: Date.now(), turnId: 'retry-write',
+      recoverable: false, blocking: true, retryAt, text: 'Conversation history HTTP 429.' };
+    await events(PRIME, [openTurn('retry-write'), error]);
+    expect((await readDurable<{ deadlines: unknown[] }>('provider-history-backoff'))?.deadlines)
+      .toContainEqual([PRIME, retryAt]);
+    // Simulate the previous commit's durability being lost while live pressure remains.
+    await writeDurableNow('provider-history-backoff', null);
+    await events(PRIME, [{ ...error, time: Date.now() + 1 }]);
+    expect((await readDurable<{ deadlines: unknown[] }>('provider-history-backoff'))?.deadlines)
+      .toContainEqual([PRIME, retryAt]);
+  });
+
+  it('holds automatic repair on an invalid durable history-pressure ledger', async () => {
+    await writeDurableNow('provider-history-backoff', {
+      version: 1, deadlines: [['not-a-conversation', Date.now() + 120_000]]
+    });
+    await reloadProviderHistoryBackoffForTests();
+    expect(providerHistoryBackoffForTests(PRIME)).toBe(Number.POSITIVE_INFINITY);
+    expect(providerHistoryBackoffForTests('abababab-1111-2222-3333-999999999999')).toBe(Number.POSITIVE_INFINITY);
+    await writeDurableNow('provider-history-backoff', null);
+    await reloadProviderHistoryBackoffForTests();
+    expect(providerHistoryBackoffForTests(PRIME)).toBeNull();
   });
 
   it.each(['goal', 'loop'] as const)('preserves the existing %s silence deadline after a provider access limit', async mode => {

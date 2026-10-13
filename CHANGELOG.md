@@ -15,6 +15,16 @@ self-reloads once when it sees a newer expected build. Existing ChatGPT tabs are
 that reload; a normal page refresh is sufficient if a tab still shows stale UI. Manual
 chrome://extensions reload remains the fallback only for an intentionally different unpacked path.
 
+## [3.1.17] — 2026-10-13
+
+### Restart-safe ChatGPT history-limit recovery
+
+- Persist exact conversation-history HTTP 429 `Retry-After` deadlines before acknowledging the browser observation, and restore those deadlines before the bridge publishes recovered browser work. Restarting the app no longer discards the provider's recovery hold.
+- A malformed or unreadable history-pressure ledger fails closed for **automatic browser repairs**, while ordinary chats and manual controls remain available. The app logs the ledger fault rather than guessing that a provider limit expired.
+- Preserve all 3.x Goal/Loop, Durable Runtime and MCP interfaces; bridge protocol stays **15**. Bump the paired app and companion to **3.1.17**.
+
+This is a focused reliability update, not a claim of verified unattended multi-day operation.
+
 ## [3.1.16] — 2026-10-08
 
 ### Terminal capacity and browser request identity
