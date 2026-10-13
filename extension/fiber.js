@@ -41,7 +41,7 @@
   'use strict';
 
   /** Bumped when the descriptor shape changes, so a stale pair cannot half-understand. */
-  const VERSION = 12;
+  const VERSION = 13;
   // The MAIN world survives an extension reload because the ChatGPT document survives it.
   // Recovery may therefore execute this file again in a page that still has an older helper
   // listener. Keep at most one listener for this protocol version; content.js rejects older
@@ -70,10 +70,15 @@
   const MAX_CALLS = 200;
   /** Public generated-image descriptors retained per turn. Pixels never cross this boundary. */
   const MAX_GENERATED_IMAGES = 200;
-  /** ChatGPT's own assistant turn sections, which is where a turn's message model hangs. */
-  const TURN_SECTION = 'section[data-testid^="conversation-turn"]';
+  /** ChatGPT's own turn anchors. Modern shell support is ported from upstream #319. */
+  const LEGACY_TURN_SECTION = 'section[data-testid^="conversation-turn"]';
+  const SHELL_TURN = '[data-app-shell-main-surface] [data-thread-find-target="conversation"] [data-turn-key]';
+  const SEARCH_TURN_ANCHOR = '[data-chatgpt-search-unit-key$=":user"]';
+  const SEARCH_TURN_UNIT = '[data-chatgpt-search-unit-key][data-chatgpt-search-message-ids]';
+  const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
+  const TURN_SECTION = LEGACY_TURN_SECTION;
   /** ChatGPT-rendered authored prose. Tool rows and this extension's own surfaces are excluded. */
-  const MARKDOWN = '.markdown';
+  const MARKDOWN = '.markdown, [class*="MarkdownRoot-"], [data-markdown-text-style="assistant-message"]';
   const TOOL = 'span[class*="tool-message"], div.pointer-events-none.contents';
   const GENERATED_IMAGE = '[class~="group/imagegen-image"] img';
   const OWN_SURFACES = '.clf-stream, .clf-stage, .clf-composer, .clf-boot';
@@ -199,6 +204,93 @@
    * how many requests in the turn actually target TobisComputer instead of treating
    * ChatGPT's folded-row count as if api_tool metadata calls were local MCP calls.
    */
+  /** The current typed search-unit turn view on this Fiber branch. */
+  function turnViewOf(fiber) {
+    let at = fiber;
+    for (let up = 0; at && up < MAX_CLIMB; up++, at = at.return) {
+      const props = at.memoizedProps;
+      if (!props || typeof props !== 'object') continue;
+      const turn = props.turn;
+      if (turn && typeof turn === 'object' && Array.isArray(turn.items)) return turn;
+    }
+    return null;
+  }
+
+  /** Projects only public user/final assistant bytes from the modern typed turn model. */
+  function messagesFromTurnView(turn) {
+    if (!turn || typeof turn !== 'object' || !Array.isArray(turn.items)) return null;
+    const out = [], seen = new Set();
+    for (const item of turn.items) {
+      if (!item || typeof item !== 'object' || out.length >= MAX_CALLS) continue;
+      if (item.type === 'user-message') {
+        const id = str(item.messageId) || str(item.serverMessageId);
+        const body = typeof item.message === 'string' ? item.message.slice(0, MAX_RENDERED_TEXT) : '';
+        if (!id || seen.has(id) || !body) continue;
+        seen.add(id);
+        out.push({
+          id, author: { role: 'user' }, recipient: 'all',
+          ...(Number.isFinite(Number(item.sentAtMs)) ? { create_time: Number(item.sentAtMs) / 1000 } : {}),
+          content: { content_type: 'text', parts: [body] }, metadata: {}
+        });
+        continue;
+      }
+      if (item.type !== 'assistant-message') continue;
+      const id = str(item.messageId) || str(item.latestMessageId);
+      if (!id || seen.has(id)) continue;
+      const body = typeof item.content === 'string' ? item.content.slice(0, MAX_RENDERED_TEXT) : '';
+      const phase = str(item.phase), complete = item.completed === true;
+      const terminal = complete && phase === 'final_answer' && turn.status === 'complete';
+      const exchange = str(item.turnExchangeId);
+      seen.add(id);
+      out.push({
+        id, author: { role: 'assistant' }, recipient: 'all',
+        ...(phase === 'final_answer' ? { channel: 'final' } : {}),
+        ...(Number.isFinite(Number(item.sentAtMs)) ? { create_time: Number(item.sentAtMs) / 1000 } : {}),
+        status: complete ? 'finished_successfully' : 'in_progress', end_turn: terminal,
+        content: { content_type: 'text', parts: body ? [body] : [] },
+        metadata: { message_type: 'next', ...(exchange ? { turn_exchange_id: exchange } : {}) }
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Reads only allowlisted MCP call identity from the typed turn model.
+   * Invocation arguments/results never cross the MAIN-world boundary.
+   */
+  function viewCallsOf(fiber) {
+    const turn = turnViewOf(fiber);
+    if (!turn) return [];
+    const out = [], seen = new Set(), duplicated = new Set();
+    const visit = items => {
+      if (!Array.isArray(items) || out.length >= MAX_CALLS) return;
+      for (const item of items) {
+        if (!item || typeof item !== 'object' || out.length >= MAX_CALLS) continue;
+        if (item.type === 'chatgpt-reasoning-group') { visit(item.items); continue; }
+        if (item.type !== 'mcp-tool-call') continue;
+        const invocation = item.invocation && typeof item.invocation === 'object' ? item.invocation : null;
+        const app = invocation ? str(invocation.server) : null;
+        const tool = invocation ? toolName(str(invocation.tool)) : null;
+        const id = str(item.callId);
+        if (!app || !ourApp(app) || !tool || !id) continue;
+        if (seen.has(id)) duplicated.add(id);
+        seen.add(id);
+        out.push({
+          messageId: id,
+          tool,
+          order: out.length,
+          answered: turn.status === 'complete',
+          requestId: null,
+          createTime: null
+        });
+      }
+    };
+    visit(turn.items);
+    const kept = duplicated.size ? out.filter(call => !duplicated.has(call.messageId)) : out;
+    for (let at = 0; at < kept.length; at++) kept[at].order = at;
+    return kept;
+  }
+
   function turnMessagesOf(fiber) {
     let at = fiber;
     for (let up = 0; at && up < MAX_CLIMB; up++, at = at.return) {
@@ -206,6 +298,7 @@
       if (!props || typeof props !== 'object') continue;
       const turn = props.turn;
       if (turn && typeof turn === 'object' && Array.isArray(turn.messages)) return turn.messages;
+      if (turn && typeof turn === 'object' && Array.isArray(turn.items)) return messagesFromTurnView(turn);
       if (Array.isArray(props.allMessages)) return props.allMessages;
     }
     return null;
@@ -241,11 +334,13 @@
         } catch { /* Unresolved signal carries no durable identity. */ }
         conversations.set(conversation, serverId);
       }
-      const values = [props.clientThreadId, props.conversationId, conversation && conversation.id,
-        conversations.get(conversation), turn && turn.clientThreadId, turn && turn.conversationId];
+      const values = [props.clientThreadId, props.browserConversationId, props.conversationId,
+        conversation && conversation.id, conversations.get(conversation),
+        turn && turn.clientThreadId, turn && turn.conversationId];
       for (let index = 0; index < values.length; index++) {
         const value = str(values[index]);
-        if (!value || value.startsWith('WEB:')) continue;
+        // Modern ChatGPT mounts a renderer-local identity beside the durable /c UUID.
+        if (!value || value.startsWith('WEB:') || value.startsWith('local-chatgpt:')) continue;
         if (found && found !== value) return { conversationId: null, conflict: true };
         found = value;
       }
@@ -266,6 +361,7 @@
       const direct = candidate && typeof candidate === 'object' && candidate.author?.role === 'assistant' &&
         !requestOf(candidate) && !resultOf(candidate) ? str(candidate.id) : null;
       const scoped = props.conversation && scope.conversationId && scope.conversationId === conversationId ? str(props.messageId) : null;
+      const typed = props.item?.type === 'assistant-message' ? str(props.item.messageId) : null;
       // Native public interim rows expose a typed preamble key, while their
       // messageId/conversation props can both be undefined. Join the complete key
       // to this turn's authored candidates; displayed prose is never identity.
@@ -276,7 +372,7 @@
         preamble = candidates.find(candidate => item.key === `preamble-${candidate.id}`)?.id;
         if (!preamble) return null;
       }
-      for (const id of [direct, scoped, preamble]) {
+      for (const id of [direct, scoped, preamble, typed]) {
         if (!id) continue;
         if (!candidates.some(candidate => candidate.id === id)) return null;
         if (found && found !== id) return null;
@@ -1303,11 +1399,52 @@
    * exists for is the turn that rendered *no* row: climbing from a row cannot reach a turn
    * that has none, which is exactly the turn whose calls went missing.
    */
+  /** ChatGPT can keep earlier routed pages mounted but hidden; never record those as this tab. */
+  function onKeptPage(node) {
+    for (let page = node?.closest?.('[data-app-shell-page-surface]'); page;
+      page = page.parentElement?.closest?.('[data-app-shell-page-surface]')) {
+      try { if (getComputedStyle(page).display === 'none') return true; } catch { return true; }
+    }
+    return false;
+  }
+
   function turnsOf(scanToken) {
     const out = [];
-    let sections;
+    let sections = [];
+    const groups = [];
     try {
-      sections = document.querySelectorAll(TURN_SECTION);
+      const legacy = [...document.querySelectorAll(TURN_SECTION)];
+      if (legacy.length) {
+        sections = legacy;
+        for (const section of legacy) {
+          const id = str(section.getAttribute('data-turn-id'));
+          const previous = groups[groups.length - 1];
+          if (id && previous && previous.turnId === id) previous.sections.push(section);
+          else groups.push({ turnId: id, sections: [section], modern: false });
+        }
+      } else {
+        // Upstream #319: the alternate/current shell groups user and assistant search units
+        // beneath one stable data-turn-key. Only units owned by that exact host participate.
+        const transcript = document.querySelector('[data-chatgpt-conversation-selection-target="true"]') || document;
+        const modernHosts = [...transcript.querySelectorAll(SHELL_TURN)];
+        // Some A/B layouts expose only the typed user anchor. Recover its exact host without
+        // accepting arbitrary data-turn-key nodes elsewhere in the shell.
+        for (const anchor of transcript.querySelectorAll(SEARCH_TURN_ANCHOR)) {
+          const host = anchor.closest('[data-turn-key]');
+          if (host && !modernHosts.includes(host)) modernHosts.push(host);
+        }
+        for (const host of modernHosts) {
+          const turnId = str(host.getAttribute('data-turn-key'));
+          if (!turnId || !UUID.test(turnId) || onKeptPage(host)) continue;
+          const units = [...host.querySelectorAll(SEARCH_TURN_UNIT)].filter(unit =>
+            unit.closest('[data-turn-key]') === host &&
+            /:(?:user|assistant)$/.test(unit.getAttribute('data-chatgpt-search-unit-key') || '')
+          );
+          if (!units.length) continue;
+          groups.push({ turnId, sections: units, modern: true });
+          sections.push(...units);
+        }
+      }
     } catch {
       return out;
     }
@@ -1320,14 +1457,6 @@
     const desiredMessageStamps = new Map();
     const desiredThoughtStamps = new Map();
     const desiredImageStamps = new Map();
-    const groups = [];
-    for (let at = 0; at < sections.length; at++) {
-      const section = sections[at];
-      const id = str(section.getAttribute('data-turn-id'));
-      const previous = groups[groups.length - 1];
-      if (id && previous && previous.turnId === id) previous.sections.push(section);
-      else groups.push({ turnId: id, sections: [section] });
-    }
     // Keep the latest user/assistant boundary even while reading older history.
     // Visible groups share the remaining slots; no additional scan lifecycle.
     const selected = new Set();
@@ -1352,13 +1481,27 @@
     const responseBudget = { remaining: MAX_RESPONSE_TEXT };
     for (const at of [...selected].sort((a, b) => a - b)) {
       const group = groups[at];
-      const section = group.sections[0];
+      let section = group.sections[0];
       let entry = null;
       try {
-        const fiber = fiberOf(section);
-        if (!fiber) continue;
-        const messages = turnMessagesOf(fiber);
-        const calls = callsOf(messages);
+        let fiber = null;
+        let messages = null;
+        // In the modern shell the typed turn owner is normally above the assistant unit.
+        // Probe newest-to-oldest; legacy sections keep their established path.
+        const candidates = group.modern ? [...group.sections].reverse() : group.sections;
+        for (const candidate of candidates) {
+          const current = fiberOf(candidate);
+          if (!current) continue;
+          const currentMessages = turnMessagesOf(current);
+          if (!Array.isArray(currentMessages)) continue;
+          fiber = current;
+          messages = currentMessages;
+          section = candidate;
+          break;
+        }
+        if (!fiber || !Array.isArray(messages)) continue;
+        const legacyCalls = callsOf(messages);
+        const calls = legacyCalls.length ? legacyCalls : group.modern ? viewCallsOf(fiber) : legacyCalls;
         const requests = requestIdsOf(messages);
         const conversation = conversationEvidenceOf(fiber);
         const exactAnchors = new Map();
@@ -1424,7 +1567,7 @@
       const section = sections[at];
       try {
         if (!section || !section.getAttribute) continue;
-        for (const node of section.querySelectorAll('[data-clf-fiber-message], .markdown')) {
+        for (const node of section.querySelectorAll(`[data-clf-fiber-message], ${MARKDOWN}`)) {
           const wantedMessage = desiredMessageStamps.get(node);
           const currentMessage = node.getAttribute('data-clf-fiber-message');
           if (wantedMessage === undefined) {
@@ -1746,7 +1889,7 @@
   // Re-execution is a repair, not a marker check. A stale primitive marker could survive
   // while its listener did not, so keep the actual listener and always replace it.
   const prior = window[ACTIVE_HELPER];
-  if (prior && prior.version === VERSION && typeof prior.listener === 'function') {
+  if (prior && typeof prior.listener === 'function') {
     try {
       window.removeEventListener('message', prior.listener);
     } catch {

@@ -44,7 +44,7 @@ const TIMED_OUT = 'the app took too long to answer';
 /** Bumped only when the request/response shape changes; the app compares it. */
 const BRIDGE_PROTOCOL = 15;
 /** Must match companion-build.txt; packaging/tests enforce this release identity. */
-const COMPANION_BUILD_ID = 'cos-3.1.16-modern-assistant-final-v5';
+const COMPANION_BUILD_ID = 'cos-3.1.16-upstream-modern-recorder-v6';
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a
@@ -2513,6 +2513,7 @@ async function maintainOnce() {
       conversationId: cleanConversationId(entry && entry.conversationId),
       token: entry && typeof entry.token === 'string' ? entry.token : '',
       requiresClaim: entry?.requiresClaim === true,
+      reason: entry && typeof entry.reason === 'string' ? entry.reason : '',
       focus: Boolean(entry && entry.focus === true)
     }))
     .filter((entry) => entry.conversationId && entry.token);
@@ -2602,7 +2603,7 @@ async function maintainOnce() {
 }
 
 async function performBrowserRepairs(repairs, policy) {
-  for (const { conversationId, token, focus, requiresClaim } of repairs) {
+  for (const { conversationId, token, reason, focus, requiresClaim } of repairs) {
     let target = null;
     let repairAction = null;
     try {
@@ -2638,6 +2639,17 @@ async function performBrowserRepairs(repairs, policy) {
       // desktop app. Tab selection and window activation are separate operations.
       if (target && focus) {
         await chrome.tabs.update(target.id, { active: true });
+      }
+      // Ported from upstream #433. Attribution repair exists to make a live page report again;
+      // reloading while ChatGPT is streaming can destroy the stream and trigger full history
+      // reloads. A responsive streaming page is already alive, so leave the repair retryable.
+      if (target && reason === 'unattributed') {
+        let page = null;
+        try { page = await chrome.tabs.sendMessage(target.id, { type: 'clf-page-status' }); } catch { /* stale page: fall through */ }
+        if (page?.ok === true && page.streaming === true) {
+          if (await queueRepairAck(token, 'failed', 'reloaded')) await drainRepairAcks();
+          continue;
+        }
       }
       if (target) await chrome.tabs.reload(target.id);
       else {
@@ -4211,7 +4223,43 @@ async function restoreChatgptTab(id) {
   }
 }
 
-async function restoreOpenChatgptTabs() {
+/**
+ * Replaces the MAIN-world usage observer on an already-open tab only when ChatGPT is not
+ * streaming. This is the upstream hot-update pattern: never cancel a live response merely
+ * to refresh extension instrumentation.
+ *
+ * The pre-v6 boolean observer cannot be disposed safely. The injected v6 usage.js marks that
+ * one legacy case for an ordinary page refresh instead of stacking two readers or reloading
+ * the page automatically.
+ */
+const USAGE_REPLACE_RETRY_MS = 20_000;
+const USAGE_REPLACE_ATTEMPTS = 90;
+async function replaceUsageObserver(tabId, attempt = 0) {
+  const later = () => {
+    if (attempt + 1 < USAGE_REPLACE_ATTEMPTS) {
+      const timer = setTimeout(() => { void replaceUsageObserver(tabId, attempt + 1); }, USAGE_REPLACE_RETRY_MS);
+      timer?.unref?.();
+    }
+    return false;
+  };
+  let status = null;
+  try { status = await chrome.tabs.sendMessage(tabId, { type: 'clf-page-status' }); } catch { status = null; }
+  if (status?.ok !== true || status.streaming !== false) return later();
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: () => { window.__cosUsageReplace = true; }
+    });
+    await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', files: ['usage.js'] });
+    return true;
+  } catch {
+    // A closed/navigated tab receives a fresh document_start observer on its next document.
+    return false;
+  }
+}
+
+async function restoreOpenChatgptTabs(replaceUsage = false) {
   let tabs = [];
   try {
     tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
@@ -4220,12 +4268,14 @@ async function restoreOpenChatgptTabs() {
   }
   for (const tab of tabs) {
     const id = tab && typeof tab.id === 'number' ? tab.id : null;
-    if (id !== null) await restoreChatgptTab(id);
+    if (id === null) continue;
+    await restoreChatgptTab(id);
+    if (replaceUsage) void replaceUsageObserver(id);
   }
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  void restoreOpenChatgptTabs().then(() => recoverDeferredRevivals()).catch(() => undefined);
+  void restoreOpenChatgptTabs(true).then(() => recoverDeferredRevivals()).catch(() => undefined);
   void load().then(() => {
     scheduleRetry();
   });

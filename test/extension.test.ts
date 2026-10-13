@@ -850,7 +850,7 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
    * app does it. `asked` records what a receipt actually quoted, so a test can tell the
    * difference between a pass that reported the repair and one that reported something else.
    */
-  function appWith(repair: string | null, browserOnly = false) {
+  function appWith(repair: string | null, browserOnly = false, reason = '') {
     const asked: string[] = [];
     const actions: string[] = [];
     const failedActions: string[] = [];
@@ -874,7 +874,7 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
         if (repaired && repaired === token) outstanding = null;
         if (!outstanding) return response(200, { ok: true, repairs: [] });
         token = `tok-${(minted += 1)}`;
-        return response(200, { ok: true, browserOnly, repairs: [{ conversationId: outstanding, token }] });
+        return response(200, { ok: true, browserOnly, repairs: [{ conversationId: outstanding, token, ...(reason ? { reason } : {}) }] });
       }
       return response(404, {});
     });
@@ -897,6 +897,38 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
     expect(worker.tabsCreate).not.toHaveBeenCalled();
     expect(asked).toContain(`repaired:${OTHER}`);
   });
+  it('does not reload a streaming page for unattributed recovery', async () => {
+    const { fetch, failedActions } = appWith(CHAT, false, 'unattributed');
+    const worker = loadWorker({
+      local: new FakeStorageArea(paired),
+      session: new FakeStorageArea(),
+      fetch,
+      tabsSendMessage: async (_tabId, message) =>
+        message.type === 'clf-page-status' ? { ok: true, streaming: true } : { ok: true }
+    });
+    await worker.registerTab(20);
+    await worker.send({ type: 'bind', conversationId: CHAT }, 20);
+    await worker.fireAlarm();
+    expect(worker.tabsReload).not.toHaveBeenCalled();
+    expect(failedActions).toContain('reloaded');
+  });
+
+  it('reloads an idle page for unattributed recovery', async () => {
+    const { fetch, actions } = appWith(CHAT, false, 'unattributed');
+    const worker = loadWorker({
+      local: new FakeStorageArea(paired),
+      session: new FakeStorageArea(),
+      fetch,
+      tabsSendMessage: async (_tabId, message) =>
+        message.type === 'clf-page-status' ? { ok: true, streaming: false } : { ok: true }
+    });
+    await worker.registerTab(20);
+    await worker.send({ type: 'bind', conversationId: CHAT }, 20);
+    await worker.fireAlarm();
+    expect(worker.tabsReload).toHaveBeenCalledWith(20);
+    expect(actions).toContain('reloaded');
+  });
+
   it('reloads the exact tab holding the chat the app named, and reports it once', async () => {
     const { fetch, asked, actions } = appWith(CHAT);
     const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch });
@@ -1936,7 +1968,7 @@ describe('extension command delivery', () => {
     worker.tabsSendMessage.mockResolvedValueOnce({
       ok: true,
       recorderVersion: 14,
-      recorderBuildId: 'cos-3.1.16-modern-assistant-final-v5'
+      recorderBuildId: 'cos-3.1.16-upstream-modern-recorder-v6'
     });
 
     await worker.installed('update');
@@ -1946,6 +1978,57 @@ describe('extension command delivery', () => {
       [{ target: { tabId: 41 }, world: 'MAIN', files: ['fiber.js'] }]
     ]);
     expect(worker.scriptingInsertCSS).not.toHaveBeenCalled();
+  });
+
+  it('hot-replaces the MAIN-world usage observer only after an updated page reports idle', async () => {
+    const local = new FakeStorageArea(paired);
+    const session = new FakeStorageArea();
+    const worker = loadWorker({
+      local,
+      session,
+      tabsSendMessage: async (_tabId, message) => {
+        if (message.type === 'clf-recorder-ping') return {
+          ok: true,
+          recorderVersion: 14,
+          recorderBuildId: 'cos-3.1.16-upstream-modern-recorder-v6'
+        };
+        if (message.type === 'clf-page-status') return { ok: true, streaming: false };
+        return { ok: true };
+      }
+    });
+    worker.tabsQuery.mockResolvedValueOnce([{ id: 41 }]);
+
+    await worker.installed('update');
+
+    expect(worker.tabsSendMessage).toHaveBeenCalledWith(41, { type: 'clf-page-status' });
+    expect(worker.scriptingExecuteScript.mock.calls).toEqual([
+      [{ target: { tabId: 41 }, world: 'MAIN', files: ['fiber.js'] }],
+      [expect.objectContaining({ target: { tabId: 41 }, world: 'MAIN', func: expect.any(Function) })],
+      [{ target: { tabId: 41 }, world: 'MAIN', files: ['usage.js'] }]
+    ]);
+  });
+
+  it('does not replace the MAIN-world usage observer while ChatGPT is streaming', async () => {
+    const worker = loadWorker({
+      local: new FakeStorageArea(paired),
+      session: new FakeStorageArea(),
+      tabsSendMessage: async (_tabId, message) => {
+        if (message.type === 'clf-recorder-ping') return {
+          ok: true,
+          recorderVersion: 14,
+          recorderBuildId: 'cos-3.1.16-upstream-modern-recorder-v6'
+        };
+        if (message.type === 'clf-page-status') return { ok: true, streaming: true };
+        return { ok: true };
+      }
+    });
+    worker.tabsQuery.mockResolvedValueOnce([{ id: 41 }]);
+
+    await worker.installed('update');
+
+    expect(worker.scriptingExecuteScript.mock.calls).toEqual([
+      [{ target: { tabId: 41 }, world: 'MAIN', files: ['fiber.js'] }]
+    ]);
   });
 
   it('re-injects a recorder from a stale companion build even when its recorder protocol matches', async () => {
@@ -2095,7 +2178,7 @@ describe('extension revival delivery', () => {
       ? {
           ok: true,
           recorderVersion: 14,
-          recorderBuildId: 'cos-3.1.16-modern-assistant-final-v5'
+          recorderBuildId: 'cos-3.1.16-upstream-modern-recorder-v6'
         }
       : { ok: true, claimed: true };
 

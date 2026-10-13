@@ -7920,6 +7920,68 @@ describe('unattributed activity recovery', () => {
     } finally { vi.useRealTimers(); }
   });
 
+  it('refuses an already-handed repair while a newer history Retry-After is active', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const { setGoalSwitchNow } = await import('../src/main/goal.js');
+      await setGoalSwitchNow(PRIME, 'loop', true, true);
+      await events(PRIME, [
+        { kind: 'model_selection', time: Date.now(), model: 'GPT-5.6 Sol', reasoningEffort: 'high' },
+        openTurn('history-limit-race')
+      ]);
+      await attributed(PRIME, false, Date.now());
+      await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS + 1);
+      await sweepStaleSwarm(Date.now());
+      const handout = await maintenance();
+      expect(handout).toMatchObject({ conversationId: PRIME, reason: 'silence' });
+
+      const retryAt = Date.now() + 31_000;
+      await events(PRIME, [{
+        kind: 'chat_error', time: Date.now(), turnId: 'history-limit-race',
+        recoverable: false, blocking: true, retryAt,
+        text: 'ChatGPT temporarily rate-limited loading this conversation history.'
+      }]);
+
+      expect((await request('POST', '/repairs/claim', { body: { token: handout!.token } })).body.allowed).toBe(false);
+      await vi.advanceTimersByTimeAsync(31_001);
+      expect((await request('POST', '/repairs/claim', { body: { token: handout!.token } })).body.allowed).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('keeps the history Retry-After deadline across a reversible bridge stop/start', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const { setGoalSwitchNow } = await import('../src/main/goal.js');
+      await setGoalSwitchNow(PRIME, 'loop', true, true);
+      await events(PRIME, [
+        { kind: 'model_selection', time: Date.now(), model: 'GPT-5.6 Sol', reasoningEffort: 'high' },
+        openTurn('history-limit-restart')
+      ]);
+      await attributed(PRIME, false, Date.now());
+      const retryAt = Date.now() + CHAT_SILENCE_MS + 60_000;
+      await events(PRIME, [{
+        kind: 'chat_error', time: Date.now(), turnId: 'history-limit-restart',
+        recoverable: false, blocking: true, retryAt,
+        text: 'ChatGPT temporarily rate-limited loading this conversation history.'
+      }]);
+
+      await stopBridge();
+      const restarted = await startBridge();
+      expect(restarted).not.toBeNull();
+      base = `http://127.0.0.1:${restarted}`;
+
+      await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS + 1);
+      await sweepStaleSwarm(Date.now());
+      expect(await maintenance()).toBeNull();
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      await sweepStaleSwarm(Date.now());
+      expect(await maintenance()).toMatchObject({ conversationId: PRIME, reason: 'silence' });
+    } finally { vi.useRealTimers(); }
+  });
+
   it.each(['goal', 'loop'] as const)('preserves the existing %s silence deadline after a provider access limit', async mode => {
     vi.useFakeTimers();
     try {

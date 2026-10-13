@@ -9,10 +9,27 @@
  */
 (() => {
   'use strict';
-  if (window.__cosUsageObserver) return;
-  window.__cosUsageObserver = true;
-  const post = window.postMessage.bind(window);
+  const OBSERVER_VERSION = 1;
+  const prior = window.__cosUsageObserver;
+  const replace = window.__cosUsageReplace === true;
+  try { delete window.__cosUsageReplace; } catch { window.__cosUsageReplace = false; }
+  if (!replace && prior?.version === OBSERVER_VERSION && typeof prior.refresh === 'function' && prior.refresh() === true) return;
+  // The pre-v6 recorder used a boolean marker with no disposal handle. Stacking a second
+  // response reader would duplicate clones and ownership evidence, so that one upgrade
+  // requires only an ordinary page refresh; no extension remove/reload is needed.
+  if (prior && typeof prior.dispose !== 'function') { window.__cosUsageObserverNeedsReload = true; return; }
+  if (replace && prior) {
+    try { window.dispatchEvent(new MessageEvent('message', {
+      data: { type: 'cos-usage-request' }, origin: location.origin, source: window
+    })); } catch { /* Retained evidence replay is best-effort. */ }
+  }
+  prior?.dispose();
+  let active = true;
+  try { delete window.__cosUsageObserverNeedsReload; } catch { window.__cosUsageObserverNeedsReload = false; }
+  const nativePost = window.postMessage.bind(window);
+  const post = (...args) => { if (active) nativePost(...args); };
   let latest = null;
+  let latestHistoryLimit = null;
   let requestOrder = 0, latestOrder = 0;
   const CONVERSATION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   // The HTTP x-request-id may now use the provider's UUID form. Both shapes
@@ -24,8 +41,14 @@
   // repeated provider observations across responses as well as inside one stream.
   const origins = new Map();
   const originReaders = new Set();
+  const readers = new Set();
   const ORIGIN_LISTEN_MS = 15 * 60_000;
+  // Ported from upstream #1181/#1317: history 429 is provider-owned recovery evidence.
+  const MAX_HISTORY_RETRY_MS = 24 * 60 * 60_000;
+  const HEADERLESS_HISTORY_BACKOFF_MS = 60_000;
+  const HISTORY_PATH = /^\/backend-api\/conversations?\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i;
   function publishOrigin(conversationId, requestIds, observedAt) {
+    if (!active) return;
     const fresh = requestIds.filter(id => !origins.has(`${conversationId}:${id}`));
     if (!fresh.length) return;
     for (const requestId of fresh) {
@@ -35,7 +58,7 @@
     post({ type: 'cos-request-origin', conversationId, requestIds: fresh, observedAt }, location.origin);
   }
   const project = (data, observedAt, order) => {
-    if (!data || typeof data !== 'object') return;
+    if (!active || !data || typeof data !== 'object') return;
     const rows = [];
     const label = (value) => typeof value === 'string' && /^[a-zA-Z0-9_. /-]{1,100}$/.test(value) ? value : null;
     const finite = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
@@ -68,13 +91,40 @@
     latestOrder = order;
     latest = { type: 'cos-usage', rows, observedAt }; post(latest, location.origin);
   };
+  function retryAfterAt(response, observedAt) {
+    for (const name of ['retry-after', 'x-oai-history-initial-retry-after']) {
+      const raw = response.headers?.get?.(name);
+      if (typeof raw !== 'string' || !raw.trim()) continue;
+      const value = raw.trim();
+      let retryAt = NaN;
+      if (/^\d{1,6}$/.test(value)) retryAt = observedAt + Number(value) * 1000;
+      else retryAt = Date.parse(value);
+      if (Number.isFinite(retryAt) && retryAt > observedAt && retryAt - observedAt <= MAX_HISTORY_RETRY_MS) return retryAt;
+    }
+    return null;
+  }
+  function inspectHistoryLimit(response, observedAt, method) {
+    if (!active || method !== 'GET') return;
+    let url;
+    try { url = new URL(response.url); } catch { return; }
+    if (url.origin !== location.origin) return;
+    const match = HISTORY_PATH.exec(url.pathname);
+    if (!match || response.status !== 429) return;
+    const retryAt = retryAfterAt(response, observedAt) ?? observedAt + HEADERLESS_HISTORY_BACKOFF_MS;
+    const projected = { type: 'cos-history-rate-limit', conversationId: match[1], retryAt, observedAt };
+    if (!latestHistoryLimit || projected.retryAt > latestHistoryLimit.retryAt ||
+        projected.conversationId !== latestHistoryLimit.conversationId) latestHistoryLimit = projected;
+    post(projected, location.origin);
+  }
   async function inspect(response, observedAt, order) {
+    if (!active) return;
     let url;
     try { url = new URL(response.url); } catch { return; }
     if (url.origin !== location.origin || !/^\/backend-api\/(?:wham\/usage|conversation\/init|conversation\/prepare|models)(?:\?|$)/.test(url.pathname)) return;
     if (!response.ok || !response.headers.get('content-type')?.includes('application/json')) return;
     const copy = response.clone(), reader = copy.body?.getReader();
     if (!reader) return;
+    readers.add(reader);
     const timer = setTimeout(() => void reader.cancel().catch(() => {}), 10000);
     let bytes = 0, text = ''; const decoder = new TextDecoder();
     try {
@@ -85,7 +135,7 @@
       }
       project(JSON.parse(text + decoder.decode()), observedAt, order);
     } catch { /* Unsupported metadata is unavailable, never guessed. */ }
-    finally { clearTimeout(timer); void reader.cancel().catch(() => {}); }
+    finally { clearTimeout(timer); readers.delete(reader); void reader.cancel().catch(() => {}); }
   }
   /**
    * Reads bounded complete SSE events from a clone without changing the page's response.
@@ -116,6 +166,7 @@
       return requestIds.size ? { conversationId, requestIds: [...requestIds] } : null;
   }
   async function inspectRequestOrigins(response, observedAt) {
+    if (!active) return;
     let url;
     try { url = new URL(response.url); } catch { return; }
     if (url.origin !== location.origin || !/^\/backend-api\/(?:f\/)?conversation$/.test(url.pathname)) return;
@@ -163,6 +214,7 @@
   let observedWebSocket = null;
   const observedSockets = new WeakSet();
   function inspectSocketMessage(event) {
+    if (!active) return;
     // Pro hands its HTTP stream to the native conversation-turn-stream socket.
     // Observe only complete server envelopes; never subscribe, send or join deltas.
     if (typeof event.data !== 'string' || event.data.length > 2 * 1024 * 1024 ||
@@ -185,7 +237,7 @@
     }
   }
   function installSocketObserver() {
-    if (typeof window.WebSocket !== 'function' || window.WebSocket === observedWebSocket) return;
+    if (!active || typeof window.WebSocket !== 'function' || window.WebSocket === observedWebSocket) return;
     observedWebSocket = new Proxy(window.WebSocket, {
       construct(target, args, newTarget) {
         const socket = Reflect.construct(target, args, newTarget);
@@ -204,7 +256,7 @@
   }
   const inspectedResponses = new WeakSet();
   const installFetchObserver = () => {
-    if (window.fetch === observedFetch || typeof window.fetch !== 'function') return;
+    if (!active || window.fetch === observedFetch || typeof window.fetch !== 'function') return;
     // A page wrapper may still call our earlier wrapper. Capture its downstream
     // function per installation; changing a shared pointer would create a cycle.
     const downstreamFetch = window.fetch;
@@ -212,8 +264,9 @@
       // Request order fences late responses, not accounts. No account identity is inferred.
       const observedAt = Date.now(), order = ++requestOrder;
       const result = downstreamFetch.apply(this, args);
+      if (!active) return result;
       void result.then((response) => {
-        if (inspectedResponses.has(response)) return;
+        if (!active || inspectedResponses.has(response)) return;
         inspectedResponses.add(response);
         void inspect(response, observedAt, order).catch(() => {});
         let method = 'GET';
@@ -222,6 +275,7 @@
           const inherited = args[0] && typeof args[0] === 'object' && typeof args[0].method === 'string' ? args[0].method : null;
           method = String(explicit || inherited || 'GET').toUpperCase();
         } catch { return; }
+        inspectHistoryLimit(response, observedAt, method);
         if (method === 'POST') void inspectRequestOrigins(response, observedAt).catch(() => {});
       }).catch(() => {});
       return result;
@@ -237,16 +291,35 @@
     window.addEventListener('DOMContentLoaded', installFetchObserver, { once: true });
     window.addEventListener('DOMContentLoaded', installSocketObserver, { once: true });
   }
-  window.addEventListener('message', (event) => {
-    if (event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-usage-request') return;
+  const request = (event) => {
+    if (!active || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-usage-request') return;
     if (latest) post(latest, location.origin);
+    if (latestHistoryLimit && latestHistoryLimit.retryAt > Date.now()) post(latestHistoryLimit, location.origin);
     // Newest first: old evidence must not fill content's 16-ID pending capacity
     // before the current workflow can enter it during document startup.
     for (const { conversationId, requestId, observedAt } of [...origins.values()].slice(-16).reverse())
       post({ type: 'cos-request-origin', conversationId, requestIds: [requestId], observedAt }, location.origin);
-  });
-  window.addEventListener('pagehide', () => {
+  };
+  const hide = () => {
     for (const reader of originReaders) void reader.cancel().catch(() => {});
     origins.clear();
-  });
+    latestHistoryLimit = null;
+  };
+  window.addEventListener('message', request);
+  window.addEventListener('pagehide', hide);
+  window.__cosUsageObserver = {
+    version: OBSERVER_VERSION,
+    refresh() { installFetchObserver(); installSocketObserver(); return active; },
+    current: () => active && window.fetch === observedFetch && window.WebSocket === observedWebSocket,
+    dispose() {
+      active = false;
+      for (const reader of readers) void reader.cancel().catch(() => {});
+      for (const reader of originReaders) void reader.cancel().catch(() => {});
+      readers.clear(); originReaders.clear(); origins.clear(); latest = null; latestHistoryLimit = null;
+      window.removeEventListener('message', request);
+      window.removeEventListener('pagehide', hide);
+      window.removeEventListener('DOMContentLoaded', installFetchObserver);
+      window.removeEventListener('DOMContentLoaded', installSocketObserver);
+    }
+  };
 })();

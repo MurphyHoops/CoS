@@ -41,7 +41,7 @@
   // the build id proves it is the recorder shipped with the currently running companion.
   // Both are required because a behavioral change can keep the same protocol surface while
   // still requiring already-open ChatGPT pages to replace their old isolated-world script.
-  const RECORDER_BUILD_ID = 'cos-3.1.16-modern-assistant-final-v5';
+  const RECORDER_BUILD_ID = 'cos-3.1.16-upstream-modern-recorder-v6';
   const recorderHandle = {
     version: RECORDER_VERSION,
     buildId: RECORDER_BUILD_ID,
@@ -3042,7 +3042,7 @@
   // 11: adds exact typed thought-notification ids and ephemeral DOM stamps for selective
   //     presentation suppression. Caption text and per-call adjacency remain non-authority.
   // 12: adds exact provider-message/sediment generated-image descriptors and DOM pixel stamps.
-  const FIBER_VERSION = 12;
+  const FIBER_VERSION = 13;
   const FIBER_TIMEOUT_MS = 1500;
   const FIBER_MAX_ROWS = 400;
   /** Assistant turns whose per-call evidence is accepted from one scan. */
@@ -10723,6 +10723,28 @@
     if (encoded.length > 24000 || encoded === lastUsageProjection) return;
     void ask({ type: 'usage_observation', rows, observedAt }).then((reply) => { if (reply?.ok) lastUsageProjection = encoded; });
   });
+  // Ported from upstream #1181/#1317. The MAIN-world passive observer publishes only the
+  // exact conversation id and bounded retry deadline of ChatGPT's own history 429.
+  let pendingHistoryRateLimit = null;
+  window.addEventListener('message', (event) => {
+    if (!alive || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-history-rate-limit') return;
+    const claimed = typeof event.data.conversationId === 'string' ? event.data.conversationId : '';
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(claimed) ||
+        CLF_DOM.conversationId() !== claimed) return;
+    const retryAt = Number(event.data.retryAt), observedAt = Number(event.data.observedAt);
+    if (!Number.isFinite(retryAt) || !Number.isFinite(observedAt) || retryAt <= observedAt ||
+        retryAt - observedAt > 24 * 60 * 60_000 || retryAt <= Date.now()) return;
+    if (pendingHistoryRateLimit?.conversationId === claimed && pendingHistoryRateLimit.retryAt >= retryAt) return;
+    pendingHistoryRateLimit = { conversationId: claimed, retryAt, observedAt };
+    emit({
+      kind: 'chat_error',
+      text: 'ChatGPT temporarily rate-limited loading this conversation history. Chat On Steroids is pausing automatic recovery until the retry wait ends.',
+      recoverable: false,
+      blocking: true,
+      retryAt
+    });
+    void flush();
+  });
   function flushStreamRequestOrigins() {
     const route = CLF_DOM.conversationId();
     const pendingEpoch = epoch, calls = [];
@@ -11299,6 +11321,9 @@
           agent,
           epoch,
           generating,
+          // ChatGPT's own native streaming state. Recovery uses this narrower fact before
+          // considering a reload; recorder "generating" may remain true while waiting on tools.
+          streaming: CLF_DOM.generating(),
           turnId,
           generations: genCount,
           queued: queue.length,

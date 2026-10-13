@@ -1146,6 +1146,9 @@ function parseObservations(input: unknown): ChatObservation[] {
     if (typeof item['detail'] === 'string') observation.detail = item['detail'].slice(0, 500);
     if (typeof item['recoverable'] === 'boolean') observation.recoverable = item['recoverable'];
     if (item['blocking'] === true) observation.blocking = true;
+    if (kind === 'chat_error' && item['blocking'] === true && typeof item['retryAt'] === 'number' &&
+        Number.isFinite(item['retryAt']) && item['retryAt'] > observation.time &&
+        item['retryAt'] - observation.time <= 24 * 60 * 60_000) observation.retryAt = Math.floor(item['retryAt']);
     if (Array.isArray(item['calls'])) observation.calls = parseCallEvidence(item['calls']);
     out.push(observation);
   }
@@ -2141,8 +2144,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!found) return json(res, 200, { allowed: false }, origin);
     const [conversationId, repair] = found;
     const session = await getSession(repair.sessionId);
-    const current = session?.conversationId === conversationId && !isChatBlocked(conversationId) &&
-      !stopRequestedFor(conversationId) && await attributionRepairAllowed(repair, session) &&
+    const current = session?.conversationId === conversationId && providerHistoryBackoff(conversationId) === null &&
+      !isChatBlocked(conversationId) && !stopRequestedFor(conversationId) && await attributionRepairAllowed(repair, session) &&
       await assistantRepairCurrent(conversationId, repair) && await repairReasonCurrent(conversationId, repair);
     const allowed = current && repairsInFlight.get(conversationId) === repair && repair.state === 'handed' && !repair.claimed;
     if (allowed) {
@@ -7361,6 +7364,34 @@ interface Repair {
 const TURN_SCOPED_REPAIRS: ReadonlySet<Repair['reason']> = new Set(['unattributed', 'assistant-error']);
 
 const repairsInFlight = new Map<string, Repair>();
+/** Exact provider Retry-After deadline for conversation-history reads. Delays recovery; never creates one. */
+const providerHistoryBackoffUntil = new Map<string, number>();
+
+function providerHistoryBackoff(conversationId: string, now = Date.now()): number | null {
+  const until = providerHistoryBackoffUntil.get(conversationId);
+  if (!until) return null;
+  if (until <= now) {
+    providerHistoryBackoffUntil.delete(conversationId);
+    return null;
+  }
+  return until;
+}
+
+function noteProviderHistoryBackoff(conversationId: string, observations: readonly ChatObservation[]): void {
+  const now = Date.now();
+  for (const [id, deadline] of providerHistoryBackoffUntil) if (deadline <= now) providerHistoryBackoffUntil.delete(id);
+  let until = providerHistoryBackoff(conversationId, now) ?? 0;
+  for (const item of observations) {
+    if (item.kind !== 'chat_error' || item.blocking !== true || !Number.isFinite(item.retryAt) ||
+        item.retryAt! <= now || item.retryAt! - item.time > 24 * 60 * 60_000) continue;
+    until = Math.max(until, item.retryAt!);
+  }
+  if (!until) return;
+  providerHistoryBackoffUntil.set(conversationId, until);
+  const repair = repairsInFlight.get(conversationId);
+  if (repair && repair.state !== 'done') repair.notBefore = Math.max(repair.notBefore, until);
+  armSilenceSweep(now);
+}
 /** Last browser action per exact chat. Error/no-tab recovery shares a cooldown; owned schedules do not. */
 const lastBrowserRecoveryAt = new Map<string, number>();
 /** Provider-time budget anchor corresponding to the evidence timestamp above. */
@@ -7543,6 +7574,7 @@ async function noteRecoveryObservations(
   observations: readonly ChatObservation[],
   activity: { meaningful: boolean; working: boolean; terminal: boolean; at?: number; toolStartedAt?: number; endedTurnId?: string }
 ): Promise<void> {
+  noteProviderHistoryBackoff(conversationId, observations);
   const accessLimit = (item: ChatObservation): boolean => item.kind === 'chat_error' &&
     (item.blocking === true ||
       /^too many requests\b.*temporarily limited.*access.*few minutes/i.test((item.text ?? '').replace(/\s+/g, ' ')));
@@ -8894,7 +8926,7 @@ async function takePendingRepairs(
     if (goalPaused && repair.reason === 'goal') continue;
     const unclaimedError = repair.reason === 'assistant-error' && repair.state === 'handed' && !repair.claimed;
     if (repair.state !== 'queued' && !unclaimedError) continue;
-    if (now < repair.notBefore) continue;
+    if (now < repair.notBefore || providerHistoryBackoff(conversationId, now) !== null) continue;
     if (!unclaimedError) {
       repair.state = 'handed';
       repair.token = randomBytes(9).toString('base64url');
@@ -10909,6 +10941,7 @@ export function resetBridgeForTests(): void {
   transportRecoveryInFlight = null;
   softRecoveryTransportGrace.clear();
   clearUnattributedIncident();
+  providerHistoryBackoffUntil.clear();
   activeUntil.clear();
   awaitingReturn.clear();
   lastAttributedCallAt.clear();

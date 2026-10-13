@@ -20,7 +20,7 @@ function harness() {
     addEventListener(type: string, listener: (event: { data: string }) => void) { if (type === 'message') this.handlers.push(listener); }
     receive(data: unknown) { for (const listener of this.handlers) listener({ data: JSON.stringify(data) }); }
   }
-  const window = {
+  const window: any = {
     WebSocket: Socket,
     fetch: (..._args: unknown[]) => Promise.resolve(response),
     postMessage: (data: unknown) => posts.push(JSON.parse(JSON.stringify(data))),
@@ -28,6 +28,9 @@ function harness() {
       const rows = listeners.get(type) ?? [];
       rows.push({ handler, once: options?.once === true });
       listeners.set(type, rows);
+    },
+    removeEventListener: (type: string, handler: (event: unknown) => void) => {
+      listeners.set(type, (listeners.get(type) ?? []).filter(row => row.handler !== handler));
     }
   };
   const dispatch = (type: string, event: unknown) => {
@@ -35,23 +38,38 @@ function harness() {
     listeners.set(type, rows.filter(row => !row.once));
     for (const row of rows) row.handler(event);
   };
-  runInNewContext(script, { window, document, location: { origin: 'https://chatgpt.com' }, URL, Date: Clock, TextDecoder,
+  window.dispatchEvent = (event: { type: string }) => { dispatch(event.type, event); return true; };
+  class MessageEvent {
+    type: string;
+    constructor(type: string, init: Record<string, unknown>) { this.type = type; Object.assign(this, init); }
+  }
+  const evaluate = () => runInNewContext(script, {
+    window, document, location: { origin: 'https://chatgpt.com' }, URL, Date: Clock, TextDecoder, MessageEvent,
     setTimeout: (run: () => void, ms: number) => { timers.set(++timerId, { at: now + ms, run }); return timerId; },
-    clearTimeout: (id: number) => timers.delete(id) });
-  async function feed(data: unknown, url = 'https://chatgpt.com/backend-api/wham/usage', init: Record<string, unknown> = {}) {
+    clearTimeout: (id: number) => timers.delete(id)
+  });
+  evaluate();
+  async function feed(data: unknown, url = 'https://chatgpt.com/backend-api/wham/usage', init: Record<string, unknown> = {},
+                      responseInit: { status?: number; headers?: Record<string, string> } = {}) {
     let done: () => void = () => {};
     const inspected = new Promise<void>(resolve => { done = resolve; });
     let read = false;
     const bodyGate = nextBodyGate; nextBodyGate = null;
     const body = new TextEncoder().encode(JSON.stringify(data));
-    response = { url, ok: true, headers: { get: () => 'application/json' }, clone: () => ({ body: { getReader: () => ({
-      read: async () => { await bodyGate; return read ? { done: true } : (read = true, { done: false, value: body }); },
-      cancel: async () => { done(); }
-    }) } }) };
+    const status = responseInit.status ?? 200;
+    const headers = new Map(Object.entries({ 'content-type': 'application/json', ...(responseInit.headers ?? {}) })
+      .map(([key, value]) => [key.toLowerCase(), value]));
+    response = { url, status, ok: status >= 200 && status < 300,
+      headers: { get: (name: string) => headers.get(name.toLowerCase()) ?? null },
+      clone: () => ({ body: { getReader: () => ({
+        read: async () => { await bodyGate; return read ? { done: true } : (read = true, { done: false, value: body }); },
+        cancel: async () => { done(); }
+      }) } }) };
     const expectedResponse = response;
     const returned = await window.fetch('/endpoint', { headers: { Authorization: 'private-test-value' }, ...init });
     expect(returned).toBe(expectedResponse);
-    if (new URL(url).origin === 'https://chatgpt.com' && /^\/backend-api\/(wham\/usage|conversation\/init|conversation\/prepare|models)$/.test(new URL(url).pathname)) await inspected;
+    if (new URL(url).origin === 'https://chatgpt.com' && status >= 200 && status < 300 &&
+        /^\/backend-api\/(wham\/usage|conversation\/init|conversation\/prepare|models)$/.test(new URL(url).pathname)) await inspected;
     else await new Promise(resolve => setTimeout(resolve, 0));
   }
   async function feedSse(chunks: string[], init: Record<string, unknown> = { method: 'POST' }, url = 'https://chatgpt.com/backend-api/conversation') {
@@ -76,6 +94,14 @@ function harness() {
   }
   return {
     posts,
+    evaluate,
+    observer: () => window.__cosUsageObserver,
+    markLegacy: () => {
+      window.__cosUsageObserver?.dispose?.();
+      window.__cosUsageObserver = true;
+    },
+    needsReload: () => window.__cosUsageObserverNeedsReload === true,
+    askReplace: () => { window.__cosUsageReplace = true; },
     nativeSocket: Socket,
     socket: (url = 'wss://ws.chatgpt.com/ws') => new window.WebSocket(url),
     feed,
@@ -110,6 +136,42 @@ function harness() {
 }
 
 describe('MAIN-world usage projection', () => {
+  it('keeps one current observer when the same build is injected again', () => {
+    const h = harness();
+    const first = h.observer();
+    const fetch = h.currentFetch();
+    expect(first).toMatchObject({ version: 1 });
+    expect(first.current()).toBe(true);
+
+    h.evaluate();
+
+    expect(h.observer()).toBe(first);
+    expect(h.currentFetch()).toBe(fetch);
+    expect(first.current()).toBe(true);
+  });
+
+  it('disposes and replaces a current observer when the service worker requests an idle hot update', () => {
+    const h = harness();
+    const first = h.observer();
+    h.askReplace();
+    h.evaluate();
+    const second = h.observer();
+
+    expect(second).not.toBe(first);
+    expect(first.current()).toBe(false);
+    expect(second).toMatchObject({ version: 1 });
+    expect(second.current()).toBe(true);
+  });
+
+  it('requires only an ordinary page refresh when upgrading the pre-v6 boolean observer', () => {
+    const h = harness();
+    h.markLegacy();
+    h.evaluate();
+
+    expect(h.observer()).toBe(true);
+    expect(h.needsReload()).toBe(true);
+  });
+
   it('accepts an opaque UUID request id only with the exact same-event conversation proof', async () => {
     const h = harness();
     const conversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
@@ -225,6 +287,72 @@ describe('MAIN-world usage projection', () => {
       expect.objectContaining({ model: 'deep-research', scope: 'feature', remaining: 5 }),
       expect.objectContaining({ model: 'gpt-example', scope: 'model', remaining: 2 })
     ]);
+  });
+
+  it('projects a conversation-history 429 with Retry-After and replays only the bounded deadline', async () => {
+    const h = harness();
+    const id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    await h.feed({ private: 'NEVER_PROJECT_THIS_BODY' },
+      `https://chatgpt.com/backend-api/conversations/${id}?num_turns=10`, {},
+      { status: 429, headers: { 'Retry-After': '24' } });
+    expect(h.posts).toEqual([{
+      type: 'cos-history-rate-limit', conversationId: id,
+      observedAt: Date.parse('2026-09-05T12:00:00Z'),
+      retryAt: Date.parse('2026-09-05T12:00:24Z')
+    }]);
+    expect(JSON.stringify(h.posts)).not.toContain('NEVER_PROJECT_THIS_BODY');
+    h.request();
+    expect(h.posts).toHaveLength(2);
+    expect(h.posts[1]).toEqual(h.posts[0]);
+    h.advance(24_001);
+    h.request();
+    expect(h.posts).toHaveLength(2);
+  });
+
+  it('covers the observed singular history endpoint even when the 429 has no Retry-After header', async () => {
+    const h = harness();
+    const id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    await h.feed({ detail: 'Too many requests', private: 'NEVER_PROJECT_BODY' },
+      `https://chatgpt.com/backend-api/conversation/${id}?num_turns=10`, {}, { status: 429 });
+    expect(h.posts).toEqual([{
+      type: 'cos-history-rate-limit', conversationId: id,
+      observedAt: Date.parse('2026-09-05T12:00:00Z'),
+      retryAt: Date.parse('2026-09-05T12:01:00Z')
+    }]);
+    expect(JSON.stringify(h.posts)).not.toContain('NEVER_PROJECT_BODY');
+    h.request();
+    expect(h.posts).toHaveLength(2);
+    expect(h.posts[1]).toEqual(h.posts[0]);
+    h.advance(60_001);
+    h.request();
+    expect(h.posts).toHaveLength(2);
+  });
+
+  it('uses the history-specific Retry-After header fallback and bounds unusable header values', async () => {
+    const h = harness();
+    const id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    await h.feed({}, `https://chatgpt.com/backend-api/conversations/${id}`, {},
+      { status: 429, headers: { 'Retry-After': 'invalid', 'X-OAI-History-Initial-Retry-After': '31' } });
+    expect(h.posts.at(-1)?.retryAt).toBe(Date.parse('2026-09-05T12:00:31Z'));
+    const count = h.posts.length;
+    await h.feed({}, 'https://chatgpt.com/backend-api/conversations', {}, { status: 429, headers: { 'Retry-After': '30' } });
+    await h.feed({}, `https://chatgpt.com/backend-api/conversations/${id}`, {}, { status: 429, headers: { 'Retry-After': '999999' } });
+    expect(h.posts.at(-1)?.retryAt).toBe(Date.parse('2026-09-05T12:01:00Z'));
+    await h.feed({}, `https://example.test/backend-api/conversations/${id}`, {}, { status: 429, headers: { 'Retry-After': '30' } });
+    expect(h.posts).toHaveLength(count + 1);
+  });
+
+  it('accepts HTTP-date Retry-After and ignores non-GET history responses', async () => {
+    const h = harness();
+    const id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const retryAt = Date.parse('2026-09-05T12:00:45Z');
+    await h.feed({}, `https://chatgpt.com/backend-api/conversations/${id}`, {},
+      { status: 429, headers: { 'Retry-After': new Date(retryAt).toUTCString() } });
+    expect(h.posts.at(-1)).toMatchObject({ type: 'cos-history-rate-limit', conversationId: id, retryAt });
+    const count = h.posts.length;
+    await h.feed({}, `https://chatgpt.com/backend-api/conversations/${id}`, { method: 'POST' },
+      { status: 429, headers: { 'Retry-After': '30' } });
+    expect(h.posts).toHaveLength(count);
   });
 
   it('ignores foreign and unrelated responses, invalid counts and oversized payloads', async () => {

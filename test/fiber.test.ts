@@ -421,6 +421,140 @@ async function scan(
   };
 }
 
+function fiberPath(...props: Array<Record<string, unknown>>): Fiber {
+  let current: Fiber | null = null;
+  for (let index = props.length - 1; index >= 0; index--) {
+    current = { memoizedProps: props[index]!, return: current };
+  }
+  return current!;
+}
+
+async function scanModernTurn(options: { complete?: boolean; includeTool?: boolean } = {}): Promise<{
+  version: number;
+  turns: TurnEvidence[];
+  turnStamps: Array<string | null>;
+  messageStamps: Array<string | null>;
+  serialized: string;
+}> {
+  const complete = options.complete !== false;
+  const userId = 'b0a48f56-7492-475a-856e-37907fec8dba';
+  const assistantId = '63e65092-4ae4-4a7f-a1d1-effe2fee3067';
+  const reasoningSecret = 'PRIVATE_REASONING_MUST_NOT_CROSS';
+  const userItem = {
+    type: 'user-message',
+    messageId: userId,
+    serverMessageId: userId,
+    message: 'Modern user prompt.'
+  };
+  const reasoningItem = {
+    type: 'chatgpt-reasoning-group',
+    completed: complete,
+    items: [
+      { private: reasoningSecret },
+      ...(options.includeTool ? [{
+        type: 'mcp-tool-call',
+        callId: 'modern-call-1',
+        completed: complete,
+        invocation: {
+          server: 'Chat On Steroids Core',
+          tool: 'read_file',
+          arguments: { private: 'MCP_ARGUMENTS_MUST_NOT_CROSS' }
+        }
+      }] : [])
+    ]
+  };
+  const assistantItem = {
+    type: 'assistant-message',
+    messageId: assistantId,
+    latestMessageId: assistantId,
+    content: 'Modern assistant final.',
+    completed: complete,
+    phase: 'final_answer',
+    turnExchangeId: '3488732b-bfe3-4d52-b262-76d288d33adf'
+  };
+  const modernTurn = {
+    items: [userItem, reasoningItem, assistantItem],
+    messageIds: [userId, 'reasoning-private-id', assistantId],
+    firstServerMessageId: 'a920f379-f159-47db-bd53-33cf15a3f2d6',
+    logicalAnswerMessageId: null,
+    status: complete ? 'complete' : 'in_progress'
+  };
+
+  const dom = new JSDOM('<!doctype html><html><body></body></html>', {
+    url: 'https://chatgpt.com/c/' + THREAD,
+    runScripts: 'outside-only',
+    pretendToBeVisual: true
+  });
+  const window = dom.window as unknown as Window & typeof globalThis & Record<string, any>;
+  const document = window.document;
+  const transcript = document.createElement('div');
+  transcript.setAttribute('data-chatgpt-conversation-selection-target', 'true');
+  const host = document.createElement('div');
+  host.setAttribute('data-turn-key', userId);
+  const user = document.createElement('div');
+  user.setAttribute('data-chatgpt-search-unit-key', 'fallback-turn-1:0:user');
+  user.setAttribute('data-chatgpt-search-message-ids', userId);
+  const bubble = document.createElement('div');
+  bubble.setAttribute('data-user-message-bubble', 'true');
+  bubble.textContent = 'Modern user prompt.';
+  user.append(bubble);
+  const assistant = document.createElement('div');
+  assistant.setAttribute('data-chatgpt-search-unit-key', 'fallback-turn-1:2:assistant');
+  assistant.setAttribute('data-chatgpt-search-message-ids', assistantId);
+  const role = document.createElement('h4');
+  role.setAttribute('data-conversation-role', 'assistant');
+  role.textContent = 'ChatGPT says:';
+  assistant.append(role);
+  const markdown = document.createElement('div');
+  markdown.className = 'MarkdownRoot-modern';
+  markdown.textContent = 'Modern assistant final.';
+  assistant.append(markdown);
+  host.append(user, assistant);
+  transcript.append(host);
+  document.body.append(transcript);
+
+  const localId = 'local-chatgpt:cbd6ae01-afe2-4b69-875a-bc04e218f3aa';
+  const modelFiber = fiberPath(
+    {
+      item: assistantItem,
+      items: [userItem, reasoningItem, assistantItem],
+      conversationId: localId,
+      turnId: 'fallback-turn-1',
+      searchUnitKey: 'fallback-turn-1:2:assistant'
+    },
+    { conversationId: localId, turnId: 'fallback-turn-1', turn: modernTurn },
+    { conversationId: THREAD }
+  );
+  (assistant as unknown as Record<string, unknown>)['__reactFiber$modern'] = modelFiber;
+  (markdown as unknown as Record<string, unknown>)['__reactFiber$modern'] = modelFiber;
+
+  window.eval(source);
+  const nonce = 'modern-test-nonce';
+  const reply = new Promise<Record<string, any>>((resolve, reject) => {
+    const timer = globalThis.setTimeout(() => reject(new Error('modern helper never answered')), 2000);
+    window.addEventListener('message', (event: any) => {
+      if (!event.data || event.data.source !== 'clf-fiber-reply' || event.data.nonce !== nonce) return;
+      globalThis.clearTimeout(timer);
+      resolve(event.data);
+    });
+  });
+  window.dispatchEvent(
+    new window.MessageEvent('message', { data: { source: 'clf-fiber-ask', nonce }, source: window })
+  );
+  const data = await reply;
+  const turnStamps = [user, assistant].map(node => node.getAttribute('data-clf-fiber-turn'));
+  const messageStamps = [markdown.getAttribute('data-clf-fiber-message')];
+  const serialized = JSON.stringify(data);
+  dom.window.close();
+  return {
+    version: data.v as number,
+    turns: (data.turns ?? []) as TurnEvidence[],
+    turnStamps,
+    messageStamps,
+    serialized
+  };
+}
+
 /** One row whose group sits where the live page puts it. */
 const row = (messages: Message[], collapsed = 0) => chain(group(messages, collapsed) as unknown as Record<string, unknown>);
 const rowInTurn = (messages: Message[], turnMessages: Message[], collapsed = 0) =>
@@ -459,9 +593,62 @@ describe('reading a row out of the page', () => {
 
   it('keeps the version it was built for on the reply', async () => {
     const { version, rows } = await scan([row([request('req-1', 'read_file')])]);
-    expect(version).toBe(12);
-    expect(rows[0]!.v).toBe(12);
+    expect(version).toBe(13);
+    expect(rows[0]!.v).toBe(13);
   });
+  it('reads the October 2026 turn.items model and keeps private reasoning out of the reply', async () => {
+    const result = await scanModernTurn();
+    expect(result.version).toBe(13);
+    expect(result.turns).toHaveLength(1);
+    expect(result.turns[0]).toMatchObject({
+      turnId: 'b0a48f56-7492-475a-856e-37907fec8dba',
+      conversationId: THREAD,
+      conversationConflict: false,
+      endMessageId: '63e65092-4ae4-4a7f-a1d1-effe2fee3067'
+    });
+    expect(result.turns[0]!.messages).toEqual([
+      expect.objectContaining({
+        rawMessageId: 'b0a48f56-7492-475a-856e-37907fec8dba',
+        role: 'user',
+        rawText: 'Modern user prompt.'
+      }),
+      expect.objectContaining({
+        rawMessageId: '63e65092-4ae4-4a7f-a1d1-effe2fee3067',
+        role: 'assistant',
+        rawText: 'Modern assistant final.'
+      })
+    ]);
+    expect(result.turnStamps).toEqual(['modern-test-nonce:0', 'modern-test-nonce:0']);
+    expect(result.messageStamps[0]).toContain(encodeURIComponent('63e65092-4ae4-4a7f-a1d1-effe2fee3067'));
+    expect(result.serialized).not.toContain('PRIVATE_REASONING_MUST_NOT_CROSS');
+  });
+
+  it('keeps an incomplete modern assistant message non-terminal', async () => {
+    const result = await scanModernTurn({ complete: false });
+    expect(result.turns).toHaveLength(1);
+    expect(result.turns[0]!.endMessageId ?? null).toBeNull();
+    expect(result.turns[0]!.messages.find(message => message.role === 'assistant')).toMatchObject({
+      rawMessageId: '63e65092-4ae4-4a7f-a1d1-effe2fee3067',
+      rawText: 'Modern assistant final.'
+    });
+    expect(result.serialized).not.toContain('PRIVATE_REASONING_MUST_NOT_CROSS');
+  });
+
+  it('projects only identity for modern nested MCP calls and never their arguments', async () => {
+    const result = await scanModernTurn({ includeTool: true });
+    expect(result.turns).toHaveLength(1);
+    expect(result.turns[0]!.calls).toEqual([{
+      messageId: 'modern-call-1',
+      tool: 'read_file',
+      order: 0,
+      answered: true,
+      requestId: null,
+      createTime: null
+    }]);
+    expect(result.serialized).not.toContain('MCP_ARGUMENTS_MUST_NOT_CROSS');
+    expect(result.serialized).not.toContain('PRIVATE_REASONING_MUST_NOT_CROSS');
+  });
+
   it('counts only TobisComputer requests in the complete turn, not api_tool metadata calls', async () => {
     const mine1 = request('req-1', 'read_file');
     const mine2 = request('req-2', 'search_files');
