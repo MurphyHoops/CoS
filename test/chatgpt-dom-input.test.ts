@@ -60,6 +60,24 @@ describe('October 2026 native turn/message markup', () => {
       [userId, 'user', 'Exact sent user message']
     ]);
   });
+
+  it('records the current October 2026 assistant final from the provider-owned MarkdownRoot surface', () => {
+    const host = document.createElement('div');
+    host.setAttribute('data-turn-key', userId);
+    host.innerHTML = `<div data-chatgpt-search-unit-key="fallback-turn-0:0:user" data-chatgpt-search-message-ids="${userId}"><div data-user-message-bubble="true"><div class="text-size-chat whitespace-pre-wrap">Exact sent user message</div></div></div><div data-chatgpt-search-unit-key="fallback-turn-0:2:assistant" data-chatgpt-search-message-ids="${assistantId} ${assistantId}"><h4 class="sr-only" data-conversation-role="assistant">ChatGPT says:</h4><div><div class="group flex min-w-0 flex-col"><div class="MarkdownRoot-rZKhxa"><p>Recovered assistant final.</p><ul><li>Second block.</li></ul></div></div></div></div>`;
+    const transcript = document.createElement('div');
+    transcript.setAttribute('data-chatgpt-conversation-selection-target', 'true');
+    transcript.append(host); document.body.append(transcript);
+    expect(api.messages().map(row => [row.id, row.role, row.text])).toEqual([
+      [userId, 'user', 'Exact sent user message'],
+      [assistantId, 'assistant', 'Recovered assistant final.Second block.']
+    ]);
+  });
+
+  it('does not promote a modern assistant search unit without provider final prose', () => {
+    modern();
+    expect(api.messages().some(row => row.role === 'assistant')).toBe(false);
+  });
   it('witnesses the current collapsible Markdown renderer used for long app-framed user messages', () => {
     const host = document.createElement('div');
     host.setAttribute('data-turn-key', userId);

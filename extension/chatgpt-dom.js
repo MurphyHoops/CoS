@@ -571,26 +571,46 @@ var CLF_DOM = (() => {
       const out = [];
       const nodes = turnNodes(turn);
       if (turn?.modern) {
-        // Only a page-native user message with a cross-checked server UUID can
-        // confirm a submitted prompt. Search result text from an assistant unit
-        // combines commentary, tools and final output, so never promote it to a
-        // canonical assistant final or task completion.
-        if (turn.role !== 'user' || !turn.id || seen.has(turn.id)) return out;
-        const bubble = turn.node?.querySelector('[data-user-message-bubble]');
-        // ChatGPT uses the compact whitespace-pre-wrap renderer for short prompts, but
-        // long app-framed prompts now switch to a collapsible Markdown surface. Both are
-        // provider-owned children of this exact user search unit. Keeping the same UUID
-        // cross-check above preserves receipt identity while allowing long COS_CONTEXT
-        // sends to produce the native user row needed by the exact Fiber source reader.
-        const prose = bubble?.querySelector(
-          '.text-size-chat.whitespace-pre-wrap, [data-testid="collapsible-user-message-content"] .markdown'
-        );
-        if (!prose || prose.closest('[data-chatgpt-search-unit-key]') !== turn.node) return out;
-        const value = pageText(prose);
-        if (!value) return out;
-        seen.add(turn.id);
-        out.push({ id: turn.id, role: 'user', text: value, turnId: turn.id,
-          node: turn.node, interrupted: false });
+        if (!turn.id || seen.has(turn.id)) return out;
+        if (turn.role === 'user') {
+          const bubble = turn.node?.querySelector('[data-user-message-bubble]');
+          // ChatGPT uses the compact whitespace-pre-wrap renderer for short prompts, but
+          // long app-framed prompts now switch to a collapsible Markdown surface. Both are
+          // provider-owned children of this exact user search unit. Keeping the same UUID
+          // cross-check above preserves receipt identity while allowing long COS_CONTEXT
+          // sends to produce the native user row needed by the exact Fiber source reader.
+          const prose = bubble?.querySelector(
+            '.text-size-chat.whitespace-pre-wrap, [data-testid="collapsible-user-message-content"] .markdown'
+          );
+          if (!prose || prose.closest('[data-chatgpt-search-unit-key]') !== turn.node) return out;
+          const value = pageText(prose);
+          if (!value) return out;
+          seen.add(turn.id);
+          out.push({ id: turn.id, role: 'user', text: value, turnId: turn.id,
+            node: turn.node, interrupted: false });
+          return out;
+        }
+        if (turn.role === 'assistant') {
+          // October 2026 removed the older data-message-author-role/.markdown surface from
+          // completed assistant answers. A finished native search unit now owns one semantic
+          // MarkdownRoot-* subtree, while the accessible role marker remains on a sibling H4.
+          // Accept only that provider-owned prose root. Plain search text, commentary,
+          // interrupted output, tools and this extension's own surfaces remain ineligible.
+          const roleMarkers = [...(turn.node?.querySelectorAll('[data-conversation-role="assistant"]') || [])]
+            .filter(node => node.closest('[data-chatgpt-search-unit-key]') === turn.node);
+          if (roleMarkers.length !== 1) return out;
+          const roots = [...(turn.node?.querySelectorAll('[class*="MarkdownRoot-"]') || [])]
+            .filter(node => node.closest('[data-chatgpt-search-unit-key]') === turn.node)
+            .filter(node => !(node.closest && node.closest('[data-interrupted]')))
+            .filter(node => !(node.closest && node.closest(TOOL)))
+            .filter(node => !(node.closest && node.closest(OWN_SURFACES)));
+          if (roots.length === 0) return out;
+          const value = pageText(roots[roots.length - 1]);
+          if (!value || transportFailure(value)) return out;
+          seen.add(turn.id);
+          out.push({ id: turn.id, role: 'assistant', text: value, turnId: turn.id,
+            node: turn.node, interrupted: false });
+        }
         return out;
       }
       let explicit = 0;
