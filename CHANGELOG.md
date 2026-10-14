@@ -15,6 +15,16 @@ self-reloads once when it sees a newer expected build. Existing ChatGPT tabs are
 that reload; a normal page refresh is sufficient if a tab still shows stale UI. Manual
 chrome://extensions reload remains the fallback only for an intentionally different unpacked path.
 
+## [3.1.18] — 2026-10-14
+
+### Resilient pinned packaging downloads
+
+- Adapt the upstream 2.1.37 PR #1474 bounded HTTP downloader to the 3.x build: tunnel-client, ripgrep and locked native dependency archives retry transient network resets, timeouts, HTTP 429 and 5xx with a separate timeout per attempt. HTTP 404 and other permanent errors fail without retry.
+- Preserve package checksum/integrity verification and existing pinned download identities. The native-source license archive pipeline retains its separate existing reviewed-source retry logic.
+- App and companion version advance together to **3.1.18**; bridge protocol remains **15**, and 3.x Goal, Loop and Durable Runtime remain unchanged.
+
+Upstream #1475 long-turn reopened-after-stall semantics are **not** copied blindly: Classic's older completion timeline lacks the upstream `timelineTurns`/`questionId` response-equivalence proof, so joining two turns without first adding that evidence would risk approving the wrong answer. This needs its own proof-backed migration and tests.
+
 ## [3.1.17] — 2026-10-13
 
 ### Restart-safe ChatGPT history-limit recovery

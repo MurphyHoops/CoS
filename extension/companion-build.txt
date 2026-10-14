@@ -1,1 +1,1 @@
-cos-3.1.17-history-pressure-v1
+cos-3.1.18-packaging-retry-v1

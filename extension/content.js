@@ -41,7 +41,7 @@
   // the build id proves it is the recorder shipped with the currently running companion.
   // Both are required because a behavioral change can keep the same protocol surface while
   // still requiring already-open ChatGPT pages to replace their old isolated-world script.
-  const RECORDER_BUILD_ID = 'cos-3.1.17-history-pressure-v1';
+  const RECORDER_BUILD_ID = 'cos-3.1.18-packaging-retry-v1';
   const recorderHandle = {
     version: RECORDER_VERSION,
     buildId: RECORDER_BUILD_ID,

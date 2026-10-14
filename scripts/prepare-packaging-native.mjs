@@ -16,6 +16,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { nativePrebuildDir, parseTarget, sharpPackagesFor, tarExecutableForPlatform } from './packaging-targets.mjs';
 
+import { fetchWithRetry } from './fetch-retry.mjs';
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const cacheDir = path.join(root, 'node_modules', '.cache', 'packaging-native');
 const stagingRoot = path.join(root, 'resources', 'packaging', 'native');
@@ -30,7 +32,7 @@ function sha512FromIntegrity(integrity) {
 
 async function download(url, target) {
   if (existsSync(target)) return;
-  const response = await fetch(url, { headers: { 'user-agent': 'chat-on-steroids-build' } });
+  const response = await fetchWithRetry(url, { headers: { 'user-agent': 'chat-on-steroids-build' } });
   if (!response.ok) throw new Error(`${url} -> HTTP ${response.status}`);
   await writeFile(target, Buffer.from(await response.arrayBuffer()));
 }

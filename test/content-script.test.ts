@@ -14836,7 +14836,7 @@ describe('one live isolated-world recorder per document', () => {
     await expect(live.runtimeMessage({ type: 'clf-recorder-ping' })).resolves.toEqual({
       ok: true,
       recorderVersion: 14,
-      recorderBuildId: 'cos-3.1.17-history-pressure-v1'
+      recorderBuildId: 'cos-3.1.18-packaging-retry-v1'
     });
   });
 
