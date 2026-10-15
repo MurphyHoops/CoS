@@ -1968,7 +1968,7 @@ describe('extension command delivery', () => {
     worker.tabsSendMessage.mockResolvedValueOnce({
       ok: true,
       recorderVersion: 14,
-      recorderBuildId: 'cos-3.1.18-packaging-retry-v1'
+      recorderBuildId: 'cos-3.1.19-final-fence-v1'
     });
 
     await worker.installed('update');
@@ -1990,7 +1990,7 @@ describe('extension command delivery', () => {
         if (message.type === 'clf-recorder-ping') return {
           ok: true,
           recorderVersion: 14,
-          recorderBuildId: 'cos-3.1.18-packaging-retry-v1'
+          recorderBuildId: 'cos-3.1.19-final-fence-v1'
         };
         if (message.type === 'clf-page-status') return { ok: true, streaming: false };
         return { ok: true };
@@ -2016,7 +2016,7 @@ describe('extension command delivery', () => {
         if (message.type === 'clf-recorder-ping') return {
           ok: true,
           recorderVersion: 14,
-          recorderBuildId: 'cos-3.1.18-packaging-retry-v1'
+          recorderBuildId: 'cos-3.1.19-final-fence-v1'
         };
         if (message.type === 'clf-page-status') return { ok: true, streaming: true };
         return { ok: true };
@@ -2178,7 +2178,7 @@ describe('extension revival delivery', () => {
       ? {
           ok: true,
           recorderVersion: 14,
-          recorderBuildId: 'cos-3.1.18-packaging-retry-v1'
+          recorderBuildId: 'cos-3.1.19-final-fence-v1'
         }
       : { ok: true, claimed: true };
 

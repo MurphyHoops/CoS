@@ -15,6 +15,15 @@ self-reloads once when it sees a newer expected build. Existing ChatGPT tabs are
 that reload; a normal page refresh is sufficient if a tab still shows stale UI. Manual
 chrome://extensions reload remains the fallback only for an intentionally different unpacked path.
 
+## [3.1.19] — 2026-10-15
+
+### Audit: native final remains completed after a late same-turn stalled end
+
+- Fix `readCompletedFinal` so a delayed page watchdog `turn_end(stalled)` **for the exact same turn** cannot veto a provider-identified canonical `assistant_message(final)` already recorded. The existing final's message, Turn and user question remain the authority; this creates no new work or delivery.
+- Preserve strict refusal for a stalled **different** turn, unproven/non-native completion, Stop, actual failed/unknown outcomes or a new user question. No new automatic reload, hidden transport replay or inference-based conversation attribution.
+- Add fail-before-fix regression cases and full Bridge/input-policy integration check. Version app and companion together as 3.1.19; bridge protocol unchanged at 15.
+- Upstream 2.1.37 PR #1475's **different-Turn** question-equivalence rule still requires explicit durable question identity in Classic and is **not** backported without that proof.
+
 ## [3.1.18] — 2026-10-14
 
 ### Resilient pinned packaging downloads

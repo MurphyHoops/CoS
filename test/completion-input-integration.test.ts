@@ -93,6 +93,25 @@ it.each([false, true])('settles the final and sends once after tools drain (owne
   if (!owned) expect(await readEvents(session.id, { kinds: ['turn_end'] })).toEqual([]);
 });
 
+it('Goal/browser eligibility stays settled after a late same-turn watchdog stall', async () => {
+  const { appendEvent, findSessionByConversation, readCompletedFinal } = await import('../src/main/session/store.js');
+  const conversationId = randomUUID(), turnId = 'audit-integration-turn', at = Date.now();
+  const outcome = await post('/events', { conversationId, events: [
+    { kind: 'user_message', time: at, messageId: 'audit-question', text: 'Complete the audit' },
+    { kind: 'turn_start', time: at + 1, turnId },
+    { kind: 'assistant_message', time: at + 2, turnId, messageId: 'audit-final',
+      providerMessageId: '22222222-3333-4444-8555-666666666666',
+      text: 'Audit complete.', state: 'final', final: true }
+  ] });
+  expect(outcome.status).toBe(200);
+  const session = (await findSessionByConversation(conversationId, { requireUnique: true }))!;
+  expect((await readCompletedFinal(session.id, conversationId, turnId))?.messageId).toBe('audit-final');
+  await appendEvent(session.id, { kind: 'turn_end', source: 'extension', time: at + 3,
+    turnId, outcome: 'stalled' });
+  expect((await readCompletedFinal(session.id, conversationId, turnId))?.messageId).toBe('audit-final');
+  expect((await input.sessionInputPolicy(session.id, { possible: false, exact: false })).settled).toBe(true);
+});
+
 it('retires an unowned Pro final immediately across reloads without requiring a later tool result', async () => {
   const { recordToolCall } = await import('../src/main/session/recorder.js');
   const { findSessionByConversation, readEvents } = await import('../src/main/session/store.js');

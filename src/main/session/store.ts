@@ -1620,7 +1620,11 @@ export async function readCompletedFinal(sessionId: string, conversationId: stri
   if (recent.some(event => {
     if (event === final || workSequence(event) <= seq) return false;
     if (event.kind === 'tool_call') return event.time > completedAt;
-    if (event.kind === 'turn_end') return event.turnId !== final.turnId || event.outcome !== 'completed';
+    // A page watchdog can append a stale `stalled` end *after* ChatGPT has emitted its
+    // provider-identified final for that very same turn. It does not begin new work.
+    // Do not generalise this to other turn ids or unproven (non-native) finals.
+    if (event.kind === 'turn_end') return event.turnId !== final.turnId ||
+      (event.outcome !== 'completed' && !(event.outcome === 'stalled' && !!final.providerMessageId));
     if (event.kind === 'turn_start') return !(nativeReopen && event === last);
     if (event.kind === 'user_message') return !correction(event);
     return event.kind === 'assistant_message' || event.kind === 'page_tool';

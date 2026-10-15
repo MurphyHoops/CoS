@@ -12,9 +12,9 @@
  * extension does nothing" into a diagnosable mismatch.
  */
 
-export const APP_VERSION = '3.1.18';
+export const APP_VERSION = '3.1.19';
 /** Opaque companion release identity. Must match extension/background.js and companion-build.txt. */
-export const COMPANION_BUILD_ID = 'cos-3.1.18-packaging-retry-v1';
+export const COMPANION_BUILD_ID = 'cos-3.1.19-final-fence-v1';
 
 /**
  * Standalone extension recovery must stay on the app's own release. Using GitHub's moving

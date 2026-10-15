@@ -46,6 +46,7 @@ import {
   readAsset,
   readEvents,
   readRecentEvents,
+  readCompletedFinal,
   readLatestUserMessage,
   turnHasMcpCall,
   conversationHasMcpCallSince,
@@ -1033,6 +1034,45 @@ describe('session store', () => {
     expect(liveConversations().find(entry => entry.conversationId === conversationId)).toMatchObject({
       generating: true, activeTurnId: 'g-current'
     });
+  });
+
+  it('accepts a same-turn late stalled boundary only with a proven native final (audit 2026-10-15)', async () => {
+    const conversationId = 'c-audit-late-stalled-with-native-final';
+    const turnId = 'g-audit-final';
+    const now = Date.now();
+    const opened = await recordChatObservations(conversationId, [
+      { kind: 'user_message', time: now, messageId: 'q-audit', text: 'Run the audit' },
+      { kind: 'turn_start', time: now + 1, turnId },
+      { kind: 'assistant_message', time: now + 2, turnId,
+        messageId: 'final-audit', providerMessageId: '11111111-2222-4333-8444-555555555555',
+        text: 'The audit is complete.', state: 'final', final: true }
+    ]);
+    const sessionId = opened.sessionId!;
+    expect(await readCompletedFinal(sessionId, conversationId, turnId)).toMatchObject({ messageId: 'final-audit' });
+    // A delayed page watchdog can close the very same turn as stalled after a
+    // native final has already been recorded. This is not a fresh generation.
+    await appendEvent(sessionId, { kind: 'turn_end', source: 'extension', time: now + 3,
+      turnId, outcome: 'stalled' });
+    expect(await readCompletedFinal(sessionId, conversationId, turnId)).toMatchObject({ messageId: 'final-audit' });
+  });
+
+  it.each(['different-turn', 'non-native', 'stopped', 'failed', 'unknown'] as const)(
+    'never consumes an unrelated, unproven or non-stalled boundary as native completion: %s', async mode => {
+    const conversationId = `c-audit-late-stalled-${mode}`;
+    const turnId = 'g-audit-cautious';
+    const now = Date.now();
+    const opened = await recordChatObservations(conversationId, [
+      { kind: 'user_message', time: now, messageId: 'q-audit', text: 'Do not replay' },
+      { kind: 'turn_start', time: now + 1, turnId },
+      { kind: 'assistant_message', time: now + 2, turnId, messageId: 'final-audit',
+        ...(mode !== 'non-native' ? { providerMessageId: 'aaaaaaaa-2222-4333-8444-555555555555' } : {}),
+        text: 'One answer only.', state: 'final', final: true }
+    ]);
+    const sessionId = opened.sessionId!;
+    await appendEvent(sessionId, { kind: 'turn_end', source: 'extension', time: now + 3,
+      turnId: mode === 'different-turn' ? 'different-generation' : turnId,
+      outcome: mode === 'different-turn' || mode === 'non-native' ? 'stalled' : mode });
+    expect(await readCompletedFinal(sessionId, conversationId, turnId)).toBeNull();
   });
 
   it('offers a stable final reply to Goal after reload lost an uncertain turn identity', async () => {

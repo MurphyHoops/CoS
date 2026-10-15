@@ -40,7 +40,8 @@ An individual layer passing must never be presented as the other layers passing.
 - Browser-origin test chat `6acf8231-7834-83ec-aa1f-7990c71e7961`: unique prompt and matching visible final; CoS Session `2026-10-14-9476a24e` independently stored the canonical `user_message` and `assistant_message` with `state=final`, `final=true`.
 - That confirms browser → CoS recorder path **only**; CHAT-01 (native CoS desktop input) and full UI receipt remain **NOT VERIFIED**, partly because the desktop inspection tool reports `SCREEN_PERMISSION_REQUIRED`.
 - Some tool calls from unrelated existing chats still appear as `Unattributed activity` after 20s evidence grace. This is an open identity/transport issue, not proof that the stored browser-origin chat failed.
-- Do **not** mark ID-02, LONG-24 or LONG-72 passed until purpose-built identity tests and real endurance evidence exist. Upstream 2.1.37 PR #1475 fixes ID-02 using `timelineTurns/questionId`; Classic must first migrate an equally strict identity proof.
+- Do **not** mark ID-02, LONG-24 or LONG-72 passed until purpose-built identity tests and real endurance evidence exist.
+- Classic 3.1.19 independent audit adds same-turn native final / late `stalled` fence with red-before-green proof and five fail-closed cases. This narrows but does not close **ID-02** (different-turn same-question proof remains absent). Upstream 2.1.37 PR #1475 fixes ID-02 using `timelineTurns/questionId`; Classic must first migrate an equally strict identity proof.
 
 ## Promotion order
 
