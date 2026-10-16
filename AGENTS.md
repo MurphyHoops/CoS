@@ -21,9 +21,13 @@ changed lines before applying an older patch. Document the work and its actual v
 the code currently does it. Known implementation gaps are collected in §21 instead of being
 mixed into the happy path as features.
 
-Canonical source: **MurphyHoops/CoS**, independent runtime line, **2026-09-21**. App/extension **3.1.5**,
-bridge protocol **15** in the checked declarations (`package.json`, `src/main/version.ts`,
-`extension/manifest.json`). This does not prove release, installation or live Chrome behavior.
+Canonical source: **MurphyHoops/CoS**, independent runtime line. Do not treat a dated
+version in a worklog as the current release authority: check `package.json`,
+`src/main/version.ts` (`APP_VERSION`, `COMPANION_BUILD_ID`, `BRIDGE_PROTOCOL`),
+`extension/manifest.json`, and `extension/companion-build.txt` together. The app and
+manifest versions must agree; the companion build ID must match the extension build;
+the bridge protocol is a separate wire-compatibility gate. Matching source declarations
+alone do not prove a published release, local installation, or the Chrome build in use.
 
 **Repository policy.** `origin` is the standalone canonical repository and direct development line. Historical and external repositories are reference-only inputs, never branch authorities. Port a reviewed external change only when it preserves the durable-runtime invariants in this file and passes this repository's own validation.
 
